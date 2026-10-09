@@ -13,11 +13,23 @@ fn main() -> eframe::Result<()> {
     // readable.
     let font_path = platform::resolve_cjk_font(&config.cjk_font, config.cjk_font_path.as_deref());
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([960.0, 640.0])
+        .with_title("listenBli · 哔哩哔哩音乐");
+
+    // macOS takes a bundle's icon from `Contents/Resources/ListenBli.icns`, but
+    // eframe calls `setApplicationIconImage` at startup with its own placeholder
+    // whenever no icon is given, and that runtime image is what the Dock draws
+    // while the app runs. Finder keeps showing the .icns, so the two disagreed:
+    // pink squircle in Finder, eframe's black hexagon in the Dock. Handing eframe
+    // an empty icon is its signal to leave the icon alone, which leaves the
+    // bundle (and the system's own icon treatment) in charge.
+    #[cfg(target_os = "macos")]
+    let viewport = viewport.with_icon(egui::IconData::default());
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([960.0, 640.0])
-            .with_title("listenBli · 哔哩哔哩音乐"),
+        viewport,
         ..Default::default()
     };
 
