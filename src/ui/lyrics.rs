@@ -90,21 +90,50 @@ impl App {
                 t::FG,
             );
 
+            // NetEase only ships a translation for some songs. When this lyric
+            // has none the switch cannot change anything on screen, so the
+            // click says so instead of looking broken.
+            let has_lyrics = !self.lyrics.is_empty();
+            let has_translation = self
+                .lyrics
+                .lines
+                .iter()
+                .any(|line| line.translation.is_some());
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(18.0);
                 let mut show_translation = self.show_translation;
-                if mini_toggle(ui, "翻译", icons::translate, show_translation, accent).clicked() {
+                let translate = mini_toggle(ui, "翻译", icons::translate, show_translation, accent);
+                let translate = if has_translation {
+                    translate.on_hover_text("原文与译文")
+                } else if has_lyrics {
+                    translate.on_hover_text("这首歌的歌词没有翻译")
+                } else {
+                    translate.on_hover_text("还没有歌词")
+                };
+                if translate.clicked() {
                     show_translation = !show_translation;
                     self.show_translation = show_translation;
                     self.update_config(|config| config.prefer_translation = show_translation);
+                    if !has_translation {
+                        let message = if has_lyrics {
+                            "这首歌的歌词没有译文，切换不会改变显示"
+                        } else {
+                            "还没有歌词可显示翻译"
+                        };
+                        self.set_status(message, false);
+                    }
                 }
                 ui.add_space(4.0);
                 let follow = self.follow_lyrics;
-                if mini_toggle(ui, "跟随", icons::target, follow, accent).clicked() {
+                if mini_toggle(ui, "跟随", icons::target, follow, accent)
+                    .on_hover_text("自动高亮并居中当前歌词行")
+                    .clicked()
+                {
                     self.follow_lyrics = !follow;
-                    if !follow {
-                        self.manual_scroll_at = None;
-                    }
+                    // Either way the pause ends: switching follow on resumes at
+                    // once, switching it off must not leave a live timer behind.
+                    self.manual_scroll_at = None;
                 }
             });
         });
@@ -135,7 +164,8 @@ impl App {
     fn lyrics_body(&mut self, ui: &mut Ui, accent: Accent, lyric_size: f32) {
         let position = self.position();
         let current_index = self.lyrics.current_index(position);
-        let follow = self.follow_lyrics;
+        // The user's switch, minus any in-progress manual-scroll pause.
+        let follow = self.follow_lyrics && self.manual_scroll_at.is_none();
         let show_translation = self.show_translation;
         let lines = std::mem::take(&mut self.lyrics.lines);
 
@@ -146,6 +176,15 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Resolved before the lines are laid out, so the frame that
+                // carries the wheel does not also re-centre on the current line.
+                //
+                // `smooth_scroll_delta` is global input, so it has to be gated
+                // on the pointer being over the lyric body: scrolling the
+                // history list used to pause — and then re-enable — follow.
+                manual_scroll = ui.rect_contains_pointer(area)
+                    && ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5);
+
                 ui.add_space(36.0);
                 let width = ui.available_width();
                 for (index, line) in lines.iter().enumerate() {
@@ -236,15 +275,11 @@ impl App {
                     if response.clicked() {
                         seek_to = Some(line.time);
                     }
-                    if is_current && follow {
+                    if is_current && follow && !manual_scroll {
                         response.scroll_to_me(Some(Align::Center));
                     }
                 }
                 ui.add_space(120.0);
-
-                if ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5) {
-                    manual_scroll = true;
-                }
             });
 
         self.lyrics.lines = lines;
@@ -257,13 +292,15 @@ impl App {
         }
         if let Some(at) = self.manual_scroll_at {
             if at.elapsed() >= FOLLOW_SUSPEND {
+                // Look-ahead is over: resume centring. The user's own 跟随
+                // switch is deliberately left alone here — only the switch (or
+                // the resume pill) may turn following back on.
                 self.manual_scroll_at = None;
-                self.follow_lyrics = true;
             }
         }
 
         // The "follow paused" pill floats over the bottom of the body.
-        if !self.follow_lyrics {
+        if !self.follow_lyrics || self.manual_scroll_at.is_some() {
             let text = "跟随已暂停 · 点击恢复";
             let font = t::ui_font(12.0);
             let width = widgets::measure(ui, text, &font).x + 44.0;
@@ -403,6 +440,310 @@ fn source_badge(ui: &mut Ui, source: crate::lyrics::LyricsSource) {
             label,
             font,
             t::FG_3,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The lyrics panel is hand-painted, so these drive the real `App` inside a
+    //! real egui pass and inspect the state and the painted output afterwards —
+    //! the only way to catch "the switch looks fine but does nothing".
+
+    use super::*;
+    use crate::config::Config;
+    use crate::lyrics::{LyricLine, Lyrics, LyricsSource};
+    use egui::{Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, Vec2};
+
+    /// The 跟随 and 翻译 pills, in screen coordinates.
+    const FOLLOW_PILL: Pos2 = Pos2::new(1160.0, 86.0);
+    const TRANSLATE_PILL: Pos2 = Pos2::new(1230.0, 86.0);
+    /// Somewhere over the history list, well clear of the lyrics panel.
+    const HISTORY_PANE: Pos2 = Pos2::new(400.0, 400.0);
+    /// Over the lyric body.
+    const LYRIC_BODY: Pos2 = Pos2::new(1086.0, 300.0);
+
+    fn raw(events: Vec<Event>) -> RawInput {
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// One frame of the whole window, exactly as `App::ui` composes it.
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
+        let theme = app.theme;
+        let mut output = ctx.run_ui(raw(events), |ui| {
+            egui::Panel::top("top_bar")
+                .exact_size(crate::ui::theme::TOP_BAR_H)
+                .frame(crate::ui::frames::top_bar())
+                .show(ui, |ui| app.ui_top_bar(ui));
+            egui::Panel::bottom("status_bar")
+                .exact_size(crate::ui::theme::STATUS_BAR_H)
+                .frame(crate::ui::frames::status_bar())
+                .show(ui, |ui| app.ui_status_bar(ui));
+            egui::Panel::bottom("player_bar")
+                .frame(crate::ui::frames::player_bar(&theme))
+                .show(ui, |ui| app.ui_player_bar(ui));
+            egui::Panel::right("lyrics_panel")
+                .resizable(true)
+                .default_size(388.0)
+                .min_size(260.0)
+                .max_size(620.0)
+                .frame(crate::ui::frames::lyrics(&theme))
+                .show(ui, |ui| app.ui_lyrics_panel(ui));
+            egui::CentralPanel::default()
+                .frame(crate::ui::frames::list_pane())
+                .show(ui, |ui| app.ui_central(ui));
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn click(ctx: &egui::Context, app: &mut App, pos: Pos2) {
+        frame(ctx, app, vec![Event::PointerMoved(pos)]);
+        frame(
+            ctx,
+            app,
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            ctx,
+            app,
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        frame(ctx, app, vec![Event::PointerMoved(pos)]);
+    }
+
+    /// One trackpad scroll sample under the pointer, as the OS reports it.
+    fn wheel(pos: Pos2, dy: f32) -> Vec<Event> {
+        wheel_phase(pos, dy, egui::TouchPhase::Move)
+    }
+
+    /// The end of a trackpad gesture; egui clears its scroll smoothing here.
+    fn wheel_end(pos: Pos2) -> Vec<Event> {
+        wheel_phase(pos, 0.0, egui::TouchPhase::End)
+    }
+
+    fn wheel_phase(pos: Pos2, dy: f32, phase: egui::TouchPhase) -> Vec<Event> {
+        vec![
+            Event::PointerMoved(pos),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, dy),
+                modifiers: Modifiers::NONE,
+                phase,
+            },
+        ]
+    }
+
+    /// Scrolls, then lets egui's smoothing settle so later frames are quiet.
+    fn scroll(ctx: &egui::Context, app: &mut App, pos: Pos2, notches: usize) {
+        for _ in 0..notches {
+            frame(ctx, app, wheel(pos, -6.0));
+        }
+        for _ in 0..3 {
+            frame(ctx, app, vec![Event::PointerMoved(pos)]);
+        }
+        frame(ctx, app, wheel_end(pos));
+    }
+
+    /// Every string egui actually painted this frame.
+    fn painted_text(output: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted(output: &egui::FullOutput, needle: &str) -> bool {
+        painted_text(output)
+            .iter()
+            .any(|text| text.contains(needle))
+    }
+
+    fn app_with_lyrics(translated: bool) -> (App, egui::Context) {
+        std::env::set_var("HOME", "/tmp/listenbli-lyrics-tests");
+        let _ = std::fs::create_dir_all("/tmp/listenbli-lyrics-tests");
+        let mut app = App::new(Config::default());
+        app.lyrics = Lyrics {
+            lines: vec![
+                LyricLine {
+                    time: Duration::ZERO,
+                    text: "first line".to_owned(),
+                    translation: translated.then(|| "第一行译文".to_owned()),
+                },
+                LyricLine {
+                    time: Duration::from_secs(30),
+                    text: "second line".to_owned(),
+                    translation: None,
+                },
+                LyricLine {
+                    time: Duration::from_secs(60),
+                    text: "third line".to_owned(),
+                    translation: None,
+                },
+            ],
+            source: LyricsSource::Netease,
+        };
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx, None);
+        crate::ui::theme::install_style(&ctx, &app.theme);
+        for _ in 0..4 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        (app, ctx)
+    }
+
+    /// Both pills are hit-testable: each one flips its own switch.
+    #[test]
+    fn both_toggles_respond_to_clicks() {
+        let (mut app, ctx) = app_with_lyrics(true);
+
+        app.show_translation = true;
+        app.follow_lyrics = true;
+        click(&ctx, &mut app, FOLLOW_PILL);
+        assert!(!app.follow_lyrics, "跟随 should switch off");
+        assert!(app.show_translation, "跟随 must not touch 翻译");
+
+        app.show_translation = true;
+        app.follow_lyrics = true;
+        click(&ctx, &mut app, TRANSLATE_PILL);
+        assert!(!app.show_translation, "翻译 should switch off");
+        assert!(app.follow_lyrics, "翻译 must not touch 跟随");
+    }
+
+    /// 翻译 really adds and removes the translated line.
+    #[test]
+    fn translation_toggle_changes_the_rendered_text() {
+        let (mut app, ctx) = app_with_lyrics(true);
+
+        app.show_translation = true;
+        let shown = frame(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&shown, "第一行译文"),
+            "the translation should be painted while the switch is on"
+        );
+
+        app.show_translation = false;
+        let hidden = frame(&ctx, &mut app, vec![]);
+        assert!(
+            !painted(&hidden, "第一行译文"),
+            "the translation must disappear when the switch is off"
+        );
+    }
+
+    /// With no translation in the lyric data the switch cannot change the text,
+    /// so the click has to say so rather than look broken.
+    #[test]
+    fn a_lyric_without_translation_says_so() {
+        let (mut app, ctx) = app_with_lyrics(false);
+        app.show_translation = true;
+
+        click(&ctx, &mut app, TRANSLATE_PILL);
+
+        let status = app.status.as_ref().expect("a click must report itself");
+        assert!(
+            status.text.contains("译文"),
+            "unexpected status: {}",
+            status.text
+        );
+    }
+
+    /// Scrolling the history list is not a lyric scroll.
+    #[test]
+    fn scrolling_the_history_list_leaves_follow_alone() {
+        let (mut app, ctx) = app_with_lyrics(true);
+        scroll(&ctx, &mut app, HISTORY_PANE, 8);
+        assert!(
+            app.manual_scroll_at.is_none(),
+            "a scroll over the history list must not pause lyric follow"
+        );
+        assert!(app.follow_lyrics, "跟随 must stay on");
+
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(
+            !painted(&output, "跟随已暂停"),
+            "the resume pill must not appear for a scroll outside the lyrics"
+        );
+    }
+
+    /// Scrolling the lyric body itself pauses follow, then resumes by itself.
+    #[test]
+    fn a_lyric_scroll_pauses_follow_and_then_resumes() {
+        let (mut app, ctx) = app_with_lyrics(true);
+
+        scroll(&ctx, &mut app, LYRIC_BODY, 4);
+        assert!(
+            app.manual_scroll_at.is_some(),
+            "scrolling the lyric body should pause follow"
+        );
+        assert!(app.follow_lyrics, "a pause must not switch 跟随 off");
+        let output = frame(&ctx, &mut app, vec![Event::PointerMoved(LYRIC_BODY)]);
+        assert!(
+            painted(&output, "跟随已暂停"),
+            "the resume pill should offer a way back"
+        );
+
+        std::thread::sleep(Duration::from_millis(3_200));
+        frame(&ctx, &mut app, vec![Event::PointerMoved(LYRIC_BODY)]);
+        assert!(
+            app.manual_scroll_at.is_none(),
+            "follow should resume once the look-ahead window closes"
+        );
+    }
+
+    /// The switch the user flipped is the last word: it may not turn itself back
+    /// on, however much the reader scrolls.
+    #[test]
+    fn follow_stays_off_until_the_user_says_otherwise() {
+        let (mut app, ctx) = app_with_lyrics(true);
+        click(&ctx, &mut app, FOLLOW_PILL);
+        assert!(!app.follow_lyrics);
+
+        scroll(&ctx, &mut app, LYRIC_BODY, 8);
+        std::thread::sleep(Duration::from_millis(3_200));
+        for _ in 0..4 {
+            frame(&ctx, &mut app, vec![Event::PointerMoved(LYRIC_BODY)]);
+        }
+        assert!(
+            !app.follow_lyrics,
+            "跟随 was switched off by hand and must stay off"
+        );
+
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&output, "跟随已暂停"),
+            "the resume pill should still be offered"
         );
     }
 }
