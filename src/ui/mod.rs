@@ -1977,9 +1977,7 @@ mod tests {
                     let mut baselines = Vec::new();
                     for row in &text.galley.rows {
                         for glyph in &row.row.glyphs {
-                            if matches!(glyph.chr, '配' | 'L') {
-                                baselines.push((glyph.chr, row.pos.y + glyph.pos.y));
-                            }
+                            baselines.push((glyph.chr, row.pos.y + glyph.pos.y));
                         }
                     }
                     ink.push(Painted {
@@ -2020,15 +2018,22 @@ mod tests {
 
         // `配置：` rides the UI face and the path the monospace one; the label
         // must not float above the path the way it did inside a single mono
-        // string, so compare the two baselines.
-        let baseline = |item: &Painted, ch: char| {
-            item.pos.y
-                + item
-                    .baselines
-                    .iter()
-                    .find(|(glyph, _)| *glyph == ch)
-                    .map(|(_, y)| *y)
-                    .unwrap_or_else(|| panic!("{:?} should contain {ch:?}", item.text))
+        // string, so compare the two baselines. The deepest glyph of a row is
+        // the baseline of its tallest face, which is the line the Latin sits on
+        // — and unlike looking up `配` by character this works on a runner with
+        // no CJK font at all, where the glyph is a replacement.
+        let baseline = |item: &Painted| {
+            let deepest = item
+                .baselines
+                .iter()
+                .map(|(_, y)| *y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                deepest.is_finite(),
+                "{:?} should have been laid out with glyphs",
+                item.text
+            );
+            item.pos.y + deepest
         };
         let label = ink
             .iter()
@@ -2038,7 +2043,7 @@ mod tests {
             .iter()
             .find(|item| item.text.ends_with("config.json"))
             .expect("the config path should be painted");
-        let (label_base, path_base) = (baseline(label, '配'), baseline(path, 'L'));
+        let (label_base, path_base) = (baseline(label), baseline(path));
         assert!(
             (label_base - path_base).abs() <= 1.5,
             "配置 sits on baseline {label_base} but the path on {path_base}"
