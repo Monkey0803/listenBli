@@ -557,7 +557,8 @@ function ListPane({
 // -- lyrics -----------------------------------------------------------------
 
 function LyricsPanel({
-  track, lyrics, lyricsState, position, follow, setFollow, showTr, setShowTr, onSeek, onManualScroll, hue,
+  track, lyrics, lyricsState, position, follow, setFollow, followPaused, onResumeFollow,
+  showTr, setShowTr, onSeek, onManualScroll, hue,
 }) {
   const bodyRef = useRef(null);
   const lineRefs = useRef([]);
@@ -579,7 +580,7 @@ function LyricsPanel({
   // skipped in some compositor-less contexts (headless, offscreen), which would
   // leave the line stranded off-centre — so commit the position as a fallback.
   useLayoutEffect(() => {
-    if (!follow || currentIndex == null) return;
+    if (!follow || followPaused || currentIndex == null) return;
     const el = lineRefs.current[currentIndex];
     const body = bodyRef.current;
     if (!el || !body) return;
@@ -593,7 +594,7 @@ function LyricsPanel({
       }
     }, 420);
     return () => clearTimeout(scrollFallback.current);
-  }, [currentIndex, follow]);
+  }, [currentIndex, follow, followPaused]);
 
   useEffect(() => {
     if (lyricsState !== "ready") return;
@@ -695,8 +696,8 @@ function LyricsPanel({
         </div>
       )}
 
-      {!follow && lyricsState === "ready" ? (
-        <button className="lyr-resume" onClick={() => setFollow(true)}>
+      {(!follow || followPaused) && lyricsState === "ready" ? (
+        <button className="lyr-resume" onClick={onResumeFollow}>
           <span className="lyr-resume__dot"></span>
           跟随已暂停 · 点击恢复
         </button>

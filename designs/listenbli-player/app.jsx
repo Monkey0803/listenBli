@@ -42,6 +42,9 @@ function App() {
   const [follow, setFollow] = useState(true);
   const [showTr, setShowTr] = useState(true);
   const manualAt = useRef(0);
+  // 手动滚动造成的临时暂停。它和用户的「跟随」开关是两回事：暂停到点会自动
+  // 恢复居中，而开关只能由用户自己（或恢复胶囊）改变。
+  const [followPaused, setFollowPaused] = useState(false);
 
   // -- session / library --------------------------------------------------
   const [user, setUser] = useState(null);
@@ -197,16 +200,14 @@ function App() {
     return () => clearTimeout(id);
   }, [status]);
 
-  // -- follow resumes 3s after the last manual scroll ---------------------
+  // -- 手动滚动只暂停居中：3 秒后恢复，绝不改写「跟随」开关 ---------------
   useEffect(() => {
-    if (follow) return undefined;
+    if (!followPaused) return undefined;
     const id = setInterval(() => {
-      if (manualAt.current && Date.now() - manualAt.current >= FOLLOW_SUSPEND) {
-        setFollow(true);
-      }
+      if (Date.now() - manualAt.current >= FOLLOW_SUSPEND) setFollowPaused(false);
     }, 400);
     return () => clearInterval(id);
-  }, [follow]);
+  }, [followPaused]);
 
   // -- actions ------------------------------------------------------------
   const onSearch = useCallback((override) => {
@@ -260,12 +261,19 @@ function App() {
     setPosition(time);
     setPlaying(true);
     manualAt.current = 0;
-    setFollow(true);
+    // 跳到某一句只结束暂停，不替用户打开「跟随」。
+    setFollowPaused(false);
   }, []);
 
   const onManualScroll = useCallback(() => {
     manualAt.current = Date.now();
-    setFollow(false);
+    setFollowPaused(true);
+  }, []);
+
+  // 恢复胶囊：既打开开关，也取消当前的暂停。
+  const onResumeFollow = useCallback(() => {
+    setFollow(true);
+    setFollowPaused(false);
   }, []);
 
   const toggleFlac = useCallback((on) => {
@@ -447,6 +455,8 @@ function App() {
           position={position}
           follow={follow}
           setFollow={setFollow}
+          followPaused={followPaused}
+          onResumeFollow={onResumeFollow}
           showTr={showTr}
           setShowTr={setShowTr}
           onSeek={seekToTime}
