@@ -1,0 +1,23 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "listenBli 界面设计稿": {
+      "versions": [
+        {
+          "path": "ListenBli Player.html",
+          "createdAt": "2026-09-28T06:15:37.519Z",
+          "status": "needs-review",
+          "subtitle": "深夜电台 · 深色音乐播放器（搜索 / 收藏夹 / 历史 / 歌词 / 播放条 / 扫码登录 / 设置）",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-09-28T06:15:37.522Z",
+  "updatedAt": "2026-09-28T06:15:37.522Z"
+}

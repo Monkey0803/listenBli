@@ -1,0 +1,43 @@
+[package]
+name = "listenbli"
+version = "0.1.0"
+edition = "2021"
+description = "Bilibili music player with synced lyrics (macOS + Windows)"
+license = "MIT"
+repository = "https://github.com/local/listenBli"
+
+[dependencies]
+# GUI. Default features are used on purpose so that no required backend feature is
+# missed on either target OS (macOS -> Metal, Windows -> DX12/Vulkan via wgpu).
+# The `x11`/`wayland` features in the default set are inert on macOS/Windows.
+eframe = "0.36"
+egui = "0.36"
+
+# HTTP. `native-tls` (the default) maps to Security.framework on macOS and to
+# SChannel on Windows, so neither platform needs OpenSSL or any system package.
+reqwest = { version = "0.12", features = ["blocking", "json", "gzip", "brotli"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Audio output + decoding. Default features include `mp4`, which is
+# `symphonia-isomp4` + `symphonia-aac` -- exactly the DASH fMP4/AAC-LC that
+# Bilibili serves. 0.22.2 is the first release that fixes "audio output fallback
+# picked null device leading to no output", which matters on Windows.
+rodio = "0.22.2"
+
+crossbeam-channel = "0.5"
+md-5 = "0.10"
+hex = "0.4"
+percent-encoding = "2"
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+directories = "6"
+url = "2"
+thiserror = "2"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

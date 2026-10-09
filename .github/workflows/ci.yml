@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # macOS needs no extra system packages: native-tls uses Security.framework
+      # and cpal uses CoreAudio.
+      #
+      # Windows uses the MSVC toolchain, which the windows-latest image already
+      # provides (link.exe + Windows SDK). native-tls maps to SChannel and cpal
+      # to WASAPI, both without extra packages.
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The live integration tests are #[ignore]d, so this stays offline and
+      # deterministic. Run them explicitly with `cargo test -- --ignored`.
+      - name: Tests
+        run: cargo test
+
+      - name: Build (release)
+        run: cargo build --release

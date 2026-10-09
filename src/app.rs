@@ -1,0 +1,736 @@
+//! Application state, event pump and top-level layout.
+//!
+//! The rendering code for each panel lives in `crate::ui::*` as further
+//! `impl App` blocks, so this file stays about state and plumbing.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use egui::{ColorImage, TextureHandle, TextureOptions};
+
+use crate::api::client::Api;
+use crate::api::models::{AudioQuality, FavFolder, Track, UserInfo};
+use crate::audio::AudioEngine;
+use crate::config::{Config, SharedConfig};
+use crate::lyrics::Lyrics;
+use crate::net::{self, Cmd, Evt, Worker};
+use crate::ui::theme::Theme;
+
+/// How long a status message stays on screen.
+pub(crate) const STATUS_TTL: Duration = Duration::from_secs(6);
+/// How long the "copied" toast stays up.
+pub(crate) const TOAST_TTL: Duration = Duration::from_millis(1600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Search,
+    Favorites,
+    History,
+}
+
+pub struct Status {
+    pub text: String,
+    pub is_error: bool,
+    pub at: Instant,
+}
+
+/// State for the QR login modal.
+pub struct QrDialog {
+    pub key: String,
+    pub image: Option<ColorImage>,
+    pub texture: Option<TextureHandle>,
+    pub message: String,
+    pub last_poll: Instant,
+    pub finished: bool,
+}
+
+pub struct App {
+    pub(crate) worker: Worker,
+    pub(crate) config: SharedConfig,
+
+    pub(crate) engine: Option<AudioEngine>,
+    pub(crate) engine_error: Option<String>,
+
+    pub(crate) tab: Tab,
+
+    pub(crate) search_input: String,
+    pub(crate) searching: bool,
+    pub(crate) last_keyword: String,
+    pub(crate) results: Vec<Track>,
+
+    pub(crate) queue: Vec<Track>,
+    pub(crate) queue_pos: usize,
+    pub(crate) current: Option<Track>,
+    pub(crate) quality: Option<AudioQuality>,
+    /// True from the moment a track is picked until its audio is playable.
+    pub(crate) loading: bool,
+    /// `(track key, bytes downloaded, total bytes)` while a download runs.
+    pub(crate) download: Option<(String, u64, Option<u64>)>,
+
+    pub(crate) covers: HashMap<String, TextureHandle>,
+    pub(crate) requested_covers: HashSet<String>,
+
+    pub(crate) lyrics: Lyrics,
+    pub(crate) lyrics_for: Option<String>,
+    pub(crate) follow_lyrics: bool,
+    pub(crate) manual_scroll_at: Option<Instant>,
+    pub(crate) show_translation: bool,
+
+    pub(crate) user: Option<UserInfo>,
+    pub(crate) qr: Option<QrDialog>,
+
+    pub(crate) fav_folders: Vec<FavFolder>,
+    pub(crate) fav_items: Vec<Track>,
+    pub(crate) selected_folder: Option<i64>,
+    pub(crate) fav_has_more: bool,
+    pub(crate) fav_page: u32,
+    /// Distinguishes "still loading" from "genuinely empty".
+    pub(crate) fav_loaded: bool,
+    pub(crate) history: Vec<Track>,
+    pub(crate) history_loaded: bool,
+
+    pub(crate) status: Option<Status>,
+    pub(crate) volume: f32,
+
+    /// Design tokens derived from the config (accent, lyric size, density).
+    pub(crate) theme: Theme,
+    /// Which overlays are open. Only one sheet can be open at a time.
+    pub(crate) settings_open: bool,
+    pub(crate) account_menu_open: bool,
+    pub(crate) queue_open: bool,
+    /// A transient confirmation message, e.g. "已复制到剪贴板".
+    pub(crate) toast: Option<(String, Instant)>,
+    /// Set by ⌘K; consumed by the search field on the next frame.
+    pub(crate) focus_search: bool,
+    /// Identifies the installed font set so a settings change can be detected.
+    pub(crate) fonts_key: String,
+    /// Identifies the applied widget style, so it is only rebuilt on a change.
+    pub(crate) style_key: String,
+    /// In-progress text of the settings sheet's font-path field.
+    pub(crate) cjk_path_input: String,
+}
+
+impl App {
+    pub fn new(config: Config) -> Self {
+        let volume = config.volume;
+        let show_translation = config.prefer_translation;
+        let theme = Theme::from_config(&config);
+        let fonts_key = crate::ui::theme::fonts_key(&config);
+        let config_path_input = config
+            .cjk_font_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let shared: SharedConfig = Arc::new(std::sync::Mutex::new(config));
+
+        // Reuse the persisted cookie jar so a previous login survives restarts.
+        let jar = shared.lock().unwrap().cookies.clone();
+        let api = Arc::new(Api::new(jar));
+
+        let (engine, engine_error) = match AudioEngine::new(volume) {
+            Ok(engine) => (Some(engine), None),
+            Err(err) => (None, Some(err)),
+        };
+
+        let worker = net::spawn(Arc::clone(&api), Arc::clone(&shared));
+        // Ask the worker who we are; it also refreshes the WBI keys.
+        let _ = worker.cmd_tx.send(Cmd::RefreshLogin);
+
+        Self {
+            worker,
+            config: shared,
+            engine,
+            engine_error,
+            tab: Tab::Search,
+            search_input: String::new(),
+            searching: false,
+            last_keyword: String::new(),
+            results: Vec::new(),
+            queue: Vec::new(),
+            queue_pos: 0,
+            current: None,
+            quality: None,
+            loading: false,
+            download: None,
+            covers: HashMap::new(),
+            requested_covers: HashSet::new(),
+            lyrics: Lyrics::empty(crate::lyrics::LyricsSource::None),
+            lyrics_for: None,
+            follow_lyrics: true,
+            manual_scroll_at: None,
+            show_translation,
+            user: None,
+            qr: None,
+            fav_folders: Vec::new(),
+            fav_items: Vec::new(),
+            selected_folder: None,
+            fav_has_more: false,
+            fav_page: 1,
+            fav_loaded: false,
+            history: Vec::new(),
+            history_loaded: false,
+            status: None,
+            volume,
+            theme,
+            settings_open: false,
+            account_menu_open: false,
+            queue_open: false,
+            toast: None,
+            focus_search: false,
+            fonts_key,
+            style_key: String::new(),
+            cjk_path_input: config_path_input,
+        }
+    }
+
+    // -- helpers -----------------------------------------------------------
+
+    pub(crate) fn send(&self, cmd: Cmd) {
+        // A dead worker means the app is shutting down; nothing useful to do.
+        let _ = self.worker.cmd_tx.send(cmd);
+    }
+
+    /// Mutate the persisted configuration and write it back. Every settings
+    /// control funnels through here so nothing is saved twice.
+    pub(crate) fn update_config(&mut self, change: impl FnOnce(&mut Config)) {
+        let Ok(mut guard) = self.config.lock() else {
+            return;
+        };
+        change(&mut guard);
+        if let Err(err) = guard.save() {
+            eprintln!("saving config failed: {err}");
+        }
+    }
+
+    /// Mutate the in-memory configuration without touching the disk. Used for
+    /// live previews, which are persisted once the interaction ends.
+    pub(crate) fn set_config_in_memory(&mut self, change: impl FnOnce(&mut Config)) {
+        if let Ok(mut guard) = self.config.lock() {
+            change(&mut guard);
+        }
+    }
+
+    pub(crate) fn config_value<R>(&self, read: impl FnOnce(&Config) -> R) -> R {
+        let guard = self.config.lock().unwrap();
+        read(&guard)
+    }
+
+    pub(crate) fn is_playing(&self) -> bool {
+        self.current.is_some()
+            && !self.loading
+            && self
+                .engine
+                .as_ref()
+                .is_some_and(|engine| !engine.is_paused() && !engine.is_finished())
+    }
+
+    pub(crate) fn position(&self) -> Duration {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.position())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn duration(&self) -> Duration {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.duration())
+            .filter(|d| !d.is_zero())
+            .or_else(|| {
+                self.current
+                    .as_ref()
+                    .map(|t| Duration::from_secs(t.duration))
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn progress(&self) -> f32 {
+        let duration = self.duration().as_secs_f32();
+        if duration <= 0.0 {
+            0.0
+        } else {
+            (self.position().as_secs_f32() / duration).clamp(0.0, 1.0)
+        }
+    }
+
+    /// How much of the file is on disk, for the seek bar's buffered segment.
+    pub(crate) fn buffered(&self) -> Option<f32> {
+        let (_, got, total) = self.download.as_ref()?;
+        total
+            .filter(|total| *total > 0)
+            .map(|total| (*got as f32 / total as f32).clamp(0.0, 1.0))
+    }
+
+    pub(crate) fn notify(&mut self, text: impl Into<String>) {
+        self.toast = Some((text.into(), Instant::now()));
+    }
+
+    /// Open one of the app's overlays by name: `settings`, `queue` or `login`.
+    ///
+    /// Exposed for tooling (see `examples/ui_snapshot.rs`) rather than used by
+    /// the shipping UI, which opens them from their own controls.
+    pub fn open_overlay(&mut self, name: &str) {
+        match name {
+            "settings" => self.settings_open = true,
+            "queue" => self.queue_open = true,
+            "login" => self.open_login(),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn toggle_pause(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.toggle_pause();
+        }
+    }
+
+    pub(crate) fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
+        self.status = Some(Status {
+            text: text.into(),
+            is_error,
+            at: Instant::now(),
+        });
+    }
+
+    /// Make `track` the current one, queue it and start resolving it.
+    pub(crate) fn play_track(&mut self, track: Track, queue: Vec<Track>, position: usize) {
+        self.queue = queue;
+        self.queue_pos = position;
+        self.start_current(track);
+    }
+
+    fn start_current(&mut self, track: Track) {
+        self.lyrics = Lyrics::empty(crate::lyrics::LyricsSource::None);
+        self.lyrics_for = None;
+        self.follow_lyrics = true;
+        self.manual_scroll_at = None;
+        self.quality = None;
+        self.loading = true;
+        self.request_cover(&track);
+        self.current = Some(track.clone());
+        self.send(Cmd::LoadTrack(Box::new(track)));
+    }
+
+    pub(crate) fn play_next(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let next = (self.queue_pos + 1) % self.queue.len();
+        // Wrapping is only desirable for an explicit "next" click, not for
+        // auto-advance at the end of the queue.
+        if next == 0 && self.queue_pos + 1 >= self.queue.len() && self.queue.len() > 1 {
+            return;
+        }
+        self.queue_pos = next;
+        let track = self.queue[next].clone();
+        self.start_current(track);
+    }
+
+    pub(crate) fn play_prev(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        self.queue_pos = if self.queue_pos == 0 {
+            self.queue.len() - 1
+        } else {
+            self.queue_pos - 1
+        };
+        let track = self.queue[self.queue_pos].clone();
+        self.start_current(track);
+    }
+
+    pub(crate) fn request_cover(&mut self, track: &Track) {
+        let key = track.key();
+        if self.covers.contains_key(&key) || self.requested_covers.contains(&key) {
+            return;
+        }
+        if let Some(url) = track.cover.clone().filter(|u| !u.is_empty()) {
+            self.requested_covers.insert(key.clone());
+            self.worker.fetch_cover(key, url);
+        }
+    }
+
+    pub(crate) fn is_current(&self, track: &Track) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|c| c.key() == track.key())
+    }
+
+    /// Queue a whole list (search results / favourites / history) starting at
+    /// `index`.
+    pub(crate) fn play_from_list(&mut self, list: &[Track], index: usize) {
+        if let Some(track) = list.get(index).cloned() {
+            self.play_track(track, list.to_vec(), index);
+        }
+    }
+
+    /// Seek without ever freezing the UI thread.
+    ///
+    /// `Player::try_seek` blocks until the decoder has moved. For a track that is
+    /// still streaming, that means waiting on bytes that may not have arrived
+    /// yet, so a jump beyond the download frontier is refused instead of
+    /// hanging the window. The buffer fills within seconds, after which every
+    /// position is available.
+    pub(crate) fn try_seek(&mut self, target: Duration) {
+        let allowed = self
+            .engine
+            .as_ref()
+            .is_some_and(|engine| engine.can_seek_without_waiting(target));
+        if !allowed {
+            self.set_status("音频仍在缓冲，暂时无法跳转到该位置", false);
+            return;
+        }
+        let outcome = self.engine.as_ref().map(|engine| engine.seek(target));
+        if let Some(Err(err)) = outcome {
+            self.set_status(format!("跳转失败：{err}"), true);
+        }
+    }
+
+    pub(crate) fn try_seek_fraction(&mut self, fraction: f32) {
+        let Some(duration) = self.engine.as_ref().map(|engine| engine.duration()) else {
+            return;
+        };
+        let target = duration.mul_f32(fraction.clamp(0.0, 1.0));
+        self.try_seek(target);
+    }
+
+    // -- event pump --------------------------------------------------------
+
+    fn handle_events(&mut self, ctx: &egui::Context) {
+        while let Ok(evt) = self.worker.evt_rx.try_recv() {
+            self.handle_event(ctx, evt);
+        }
+    }
+
+    fn handle_event(&mut self, ctx: &egui::Context, evt: Evt) {
+        match evt {
+            Evt::SearchStarted { keyword } => {
+                self.searching = true;
+                self.last_keyword = keyword;
+                self.results.clear();
+            }
+            Evt::SearchResults {
+                keyword,
+                page,
+                tracks,
+            } => {
+                self.searching = false;
+                // Ignore a late response for a query the user already replaced.
+                if keyword != self.last_keyword {
+                    return;
+                }
+                if page <= 1 {
+                    self.results = tracks;
+                } else {
+                    self.results.extend(tracks);
+                }
+                let snapshot = self.results.clone();
+                for track in &snapshot {
+                    self.request_cover(track);
+                }
+                if self.results.is_empty() {
+                    self.set_status("没有找到结果", false);
+                }
+            }
+            Evt::TrackResolved(track) => {
+                // Show the title immediately; the audio may still be downloading.
+                self.current = Some(*track);
+            }
+            Evt::TrackReady {
+                track,
+                source,
+                quality,
+            } => {
+                self.loading = false;
+                self.quality = Some(quality);
+                let key = track.key();
+                self.current = Some(*track.clone());
+                match &mut self.engine {
+                    Some(engine) => {
+                        // Streaming sources start playing after only a fraction
+                        // of the segment has arrived; the decoder's reads block
+                        // until the rest lands.
+                        if let Err(err) =
+                            engine.play_stream(&source, Duration::from_secs(track.duration), key)
+                        {
+                            self.set_status(err, true);
+                        }
+                    }
+                    None => {
+                        self.set_status("音频输出不可用，无法播放", true);
+                    }
+                }
+            }
+            Evt::DownloadProgress { key, got, total } => {
+                // A finished download is not "progress" any more; dropping it
+                // clears the cache row and the seek bar's buffered segment.
+                self.download = match total {
+                    Some(total) if total > 0 && got >= total => None,
+                    _ => Some((key, got, total)),
+                };
+            }
+            Evt::LyricsReady { key, lyrics } => {
+                // Only apply lyrics that belong to the track still selected.
+                if self.current.as_ref().is_some_and(|t| t.key() == key) {
+                    self.lyrics = lyrics;
+                    self.lyrics_for = Some(key);
+                    self.follow_lyrics = true;
+                }
+            }
+            Evt::CoverReady { key, image } => {
+                let texture =
+                    ctx.load_texture(format!("cover-{key}"), image, TextureOptions::LINEAR);
+                self.covers.insert(key, texture);
+            }
+            Evt::QrCode { key, image } => {
+                if let Some(dialog) = &mut self.qr {
+                    dialog.key = key;
+                    dialog.texture =
+                        Some(ctx.load_texture("login-qr", image.clone(), TextureOptions::NEAREST));
+                    dialog.image = Some(image);
+                    dialog.last_poll = Instant::now();
+                    dialog.finished = false;
+                } else {
+                    let texture =
+                        ctx.load_texture("login-qr", image.clone(), TextureOptions::NEAREST);
+                    self.qr = Some(QrDialog {
+                        key,
+                        image: Some(image),
+                        texture: Some(texture),
+                        message: "请使用哔哩哔哩手机客户端扫码".into(),
+                        last_poll: Instant::now(),
+                        finished: false,
+                    });
+                }
+            }
+            Evt::LoginStatus { message, done } => {
+                if let Some(dialog) = &mut self.qr {
+                    dialog.message = message.clone();
+                    if done {
+                        dialog.finished = true;
+                    }
+                }
+                if done {
+                    if !message.contains("过期") {
+                        self.qr = None;
+                    }
+                    self.set_status(message, false);
+                }
+            }
+            Evt::LoginChanged { user } => {
+                let logged_in = user.is_some();
+                self.user = user;
+                if logged_in {
+                    self.set_status("已登录", false);
+                    self.refresh_library();
+                } else {
+                    self.fav_folders.clear();
+                    self.fav_items.clear();
+                    self.selected_folder = None;
+                    self.fav_loaded = false;
+                    self.history.clear();
+                    self.history_loaded = false;
+                }
+            }
+            Evt::FavFolders(folders) => {
+                self.selected_folder = folders.first().map(|f| f.id);
+                self.fav_folders = folders;
+                self.fav_page = 1;
+                if let Some(id) = self.selected_folder {
+                    self.send(Cmd::LoadFavItems {
+                        media_id: id,
+                        page: 1,
+                    });
+                }
+            }
+            Evt::FavItems {
+                media_id,
+                page,
+                tracks,
+                has_more,
+            } => {
+                if Some(media_id) != self.selected_folder {
+                    return;
+                }
+                if page <= 1 {
+                    self.fav_items = tracks;
+                } else {
+                    self.fav_items.extend(tracks);
+                }
+                self.fav_page = page.max(1);
+                self.fav_has_more = has_more;
+                self.fav_loaded = true;
+                let snapshot = self.fav_items.clone();
+                for track in &snapshot {
+                    self.request_cover(track);
+                }
+            }
+            Evt::History(tracks) => {
+                self.history = tracks;
+                self.history_loaded = true;
+                let snapshot = self.history.clone();
+                for track in &snapshot {
+                    self.request_cover(track);
+                }
+            }
+            Evt::Error { context, message } => {
+                self.loading = false;
+                self.download = None;
+                self.set_status(format!("{context}：{message}"), true);
+            }
+            Evt::Info(message) => {
+                self.set_status(message, false);
+            }
+        }
+    }
+
+    fn refresh_library(&mut self) {
+        if let Some(user) = &self.user {
+            self.send(Cmd::LoadFavFolders { mid: user.mid });
+            self.send(Cmd::LoadHistory);
+        }
+    }
+
+    /// Drive auto-advance and QR polling.
+    fn tick(&mut self) {
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|engine| engine.is_finished())
+        {
+            self.play_next();
+        }
+
+        // Poll the QR status from the UI thread so the API worker stays free.
+        if let Some(dialog) = &mut self.qr {
+            if !dialog.finished && dialog.last_poll.elapsed() >= net::QR_POLL_INTERVAL {
+                dialog.last_poll = Instant::now();
+                let key = dialog.key.clone();
+                self.send(Cmd::QrPoll { key });
+            }
+        }
+
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > TOAST_TTL)
+        {
+            self.toast = None;
+        }
+    }
+
+    /// Global shortcuts: `空格` play/pause, `←`/`→` ±5s, `⌘K` focus search,
+    /// `Esc` close overlays. Skipped while a text field owns the keyboard, so
+    /// typing a query never toggles playback.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // `Esc` closes overlays even while a text field owns the keyboard.
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.settings_open = false;
+            self.account_menu_open = false;
+            self.queue_open = false;
+            if self.qr.as_ref().is_some_and(|dialog| dialog.finished) {
+                self.qr = None;
+            }
+            return;
+        }
+        // Typing a query must never toggle playback or seek.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (space, left, right, focus) = ctx.input(|input| {
+            (
+                input.key_pressed(egui::Key::Space),
+                input.key_pressed(egui::Key::ArrowLeft),
+                input.key_pressed(egui::Key::ArrowRight),
+                input.modifiers.command && input.key_pressed(egui::Key::K),
+            )
+        });
+
+        if focus {
+            self.focus_search = true;
+            return;
+        }
+        if space && self.engine.is_some() && !self.loading {
+            self.toggle_pause();
+        }
+        if left || right {
+            let delta = Duration::from_secs(5);
+            let position = self.position();
+            let target = if right {
+                position.saturating_add(delta)
+            } else {
+                position.saturating_sub(delta)
+            };
+            let duration = self.duration();
+            if !duration.is_zero() && target <= duration {
+                self.try_seek(target);
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.36 hands us a root `Ui` rather than a `Context`, and panels
+        // are added to it. Cloning the context keeps the borrow checker happy
+        // and `Context` is just a handle.
+        let ctx = ui.ctx().clone();
+
+        self.handle_events(&ctx);
+        self.tick();
+        self.handle_keys(&ctx);
+
+        // Re-read the design tokens every frame: the settings sheet writes them
+        // to the config, and this is the cheapest place to notice.
+        self.theme = self.config_value(Theme::from_config);
+        let fonts_key = self.config_value(crate::ui::theme::fonts_key);
+        if self.fonts_key != fonts_key {
+            let font = self.config_value(|c| {
+                crate::platform::resolve_cjk_font(&c.cjk_font, c.cjk_font_path.as_deref())
+            });
+            crate::ui::theme::install_fonts(&ctx, font.as_deref());
+            self.fonts_key = fonts_key;
+        }
+        let style_key = self.theme.accent.id.to_owned();
+        if self.style_key != style_key {
+            crate::ui::theme::install_style(&ctx, &self.theme);
+            self.style_key = style_key;
+        }
+
+        // Panels are applied outermost-first: the first bottom panel added sits
+        // at the very bottom of the window.
+        egui::Panel::top("top_bar")
+            .exact_size(crate::ui::theme::TOP_BAR_H)
+            .frame(crate::ui::frames::top_bar())
+            .show(ui, |ui| self.ui_top_bar(ui));
+        egui::Panel::bottom("status_bar")
+            .exact_size(crate::ui::theme::STATUS_BAR_H)
+            .frame(crate::ui::frames::status_bar())
+            .show(ui, |ui| self.ui_status_bar(ui));
+        egui::Panel::bottom("player_bar")
+            .frame(crate::ui::frames::player_bar(&self.theme))
+            .show(ui, |ui| self.ui_player_bar(ui));
+        egui::Panel::right("lyrics_panel")
+            .resizable(true)
+            .default_size(388.0)
+            .min_size(260.0)
+            .max_size(620.0)
+            .frame(crate::ui::frames::lyrics(&self.theme))
+            .show(ui, |ui| self.ui_lyrics_panel(ui));
+        egui::CentralPanel::default()
+            .frame(crate::ui::frames::list_pane())
+            .show(ui, |ui| self.ui_central(ui));
+
+        if self.qr.is_some() {
+            self.ui_login_dialog(&ctx);
+        }
+        if self.settings_open {
+            self.ui_settings_sheet(&ctx);
+        }
+
+        // Keeps the progress bar, equalizer and lyric highlight moving while
+        // the app is otherwise idle.
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
