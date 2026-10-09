@@ -28,6 +28,16 @@ fn main() -> eframe::Result<()> {
     #[cfg(target_os = "macos")]
     let viewport = viewport.with_icon(egui::IconData::default());
 
+    // Everywhere else there is no bundle icon to defer to, so eframe gets the
+    // real artwork: otherwise the same placeholder would show up on the Windows
+    // taskbar and in alt-tab. The executable's own icon comes from the resource
+    // `build.rs` embeds.
+    #[cfg(not(target_os = "macos"))]
+    let viewport = match platform::app_icon() {
+        Some(icon) => viewport.with_icon(icon),
+        None => viewport,
+    };
+
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()

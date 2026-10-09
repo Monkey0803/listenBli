@@ -6,7 +6,7 @@ with three "on air" bars. macOS icons are drawn on a squircle that covers ~82%
 of the canvas with a soft drop shadow underneath, so the same shape is used here
 rather than a plain rounded rectangle.
 
-    python3 scripts/make-icns.py            # writes assets/icon.png + icns
+    python3 scripts/make-icns.py            # writes icon.png + icns + ico
 """
 
 from __future__ import annotations
@@ -128,7 +128,17 @@ def main() -> int:
         if result.returncode != 0:
             print(result.stderr, file=sys.stderr)
             return result.returncode
-    print(f"wrote {ASSETS / 'icon.png'} and {ASSETS / 'ListenBli.icns'}")
+
+    # Windows: the .ico goes into the executable's resource section (build.rs),
+    # and doubles as the artwork the window itself asks eframe for.
+    master.save(
+        ASSETS / "icon.ico",
+        sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+    )
+    print(
+        f"wrote {ASSETS / 'icon.png'}, {ASSETS / 'ListenBli.icns'} "
+        f"and {ASSETS / 'icon.ico'}"
+    )
     return 0
 
 

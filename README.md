@@ -103,6 +103,19 @@ open dist/ListenBli.app
 | `MIN_MACOS` | 覆盖 `LSMinimumSystemVersion`（默认 `11.0`） |
 | `CODESIGN_IDENTITY` | 用真实证书签名而不是临时签名 |
 
+### Windows 的图标
+
+两处来源，各管一半：
+
+- **exe 自身的图标**（资源管理器、快捷方式）：`assets/icon.ico`（由 `scripts/make-icns.py`
+  一并生成）在构建 Windows 目标时由 [`build.rs`](build.rs) 写进 PE 资源段。首选
+  `rc.exe`（Windows SDK，装了「使用 C++ 的桌面开发」自带），其次 `llvm-rc`、`windres`；
+  一个都找不到时只打 `cargo:warning`，不中断构建，所以 macOS 上做 Windows 目标的类型级
+  `cargo check` 依然可用，只是产不出图标。
+- **窗口与任务栏图标**：运行时由 `platform::app_icon()` 把 `assets/icon.png` 解成 `IconData`
+  交给 eframe；不给的话 eframe 会装上它内置的 egui 占位图标（黑六边形）。
+  macOS 反过来：什么都不设，交给 `Contents/Resources/ListenBli.icns`。
+
 ## 使用说明
 
 1. 在顶部搜索框输入歌名/关键词，回车或点「搜索」。搜索过的关键词会被记住：再次点开

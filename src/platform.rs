@@ -278,6 +278,24 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The app artwork, decoded from the PNG embedded at build time.
+///
+/// macOS does not need it — the Dock and Finder read
+/// `Contents/Resources/ListenBli.icns`, and the window hands eframe an empty
+/// icon so it leaves that alone. Windows has no bundle icon to fall back on:
+/// without this, eframe installs its own egui placeholder, which is what the
+/// taskbar and alt-tab would show. `assets/icon.ico` covers the executable's
+/// own icon, which Explorer reads (see `build.rs`).
+pub fn app_icon() -> Option<egui::IconData> {
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            eprintln!("内置应用图标无法解析：{err}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +332,24 @@ mod tests {
     fn config_and_cache_dirs_are_absolute() {
         assert!(config_dir().is_absolute());
         assert!(cache_dir().is_absolute());
+    }
+
+    /// The window icon is the artwork embedded at build time. If the asset moves
+    /// or stops being a PNG, `app_icon` returns `None` and eframe silently puts
+    /// its own placeholder on the taskbar — so check the decode.
+    #[test]
+    fn the_embedded_app_icon_decodes() {
+        let icon = app_icon().expect("assets/icon.png should decode as an icon");
+        assert_eq!(
+            icon.width, icon.height,
+            "the app icon should be square, got {}x{}",
+            icon.width, icon.height
+        );
+        assert!(icon.width >= 256, "the icon is too small: {}", icon.width);
+        assert_eq!(
+            icon.rgba.len(),
+            icon.width as usize * icon.height as usize * 4,
+            "RGBA buffer length must match the icon size"
+        );
     }
 }
