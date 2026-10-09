@@ -1586,7 +1586,7 @@ mod tests {
     fn focused_app(history: &[&str]) -> (App, egui::Context) {
         std::env::set_var("HOME", "/tmp/listenbli-search-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-search-tests");
-        let mut app = App::new(Config::default());
+        let mut app = App::new_for_tests(Config::default());
         let history: Vec<String> = history.iter().map(|entry| (*entry).to_owned()).collect();
         app.update_config(|config| config.search_history = history);
         app.search_input.clear();
@@ -1945,7 +1945,7 @@ mod tests {
     fn the_status_bar_centres_every_item_on_one_line() {
         std::env::set_var("HOME", "/tmp/listenbli-search-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-search-tests");
-        let mut app = App::new(Config::default());
+        let mut app = App::new_for_tests(Config::default());
         let ctx = egui::Context::default();
         // The same face the running app resolves, so the CJK metrics are real.
         let cjk = crate::config::with(&app.config, |c| {

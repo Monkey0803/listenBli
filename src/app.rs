@@ -124,6 +124,22 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
+        Self::build(config, true)
+    }
+
+    /// Build an app that never opens an audio output.
+    ///
+    /// The unit tests run in parallel, and several `AudioEngine`s asking Windows
+    /// for an output device at the same time takes the whole test binary down
+    /// (STATUS_ACCESS_VIOLATION) — the app itself only ever opens one engine, at
+    /// startup. Nothing the tests assert needs the device, so they take this
+    /// path and leave `engine_error` unset.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(config: Config) -> Self {
+        Self::build(config, false)
+    }
+
+    fn build(config: Config, with_audio: bool) -> Self {
         let volume = config.volume;
         let show_translation = config.prefer_translation;
         let theme = Theme::from_config(&config);
@@ -139,9 +155,13 @@ impl App {
         let jar = shared.lock().unwrap().cookies.clone();
         let api = Arc::new(Api::new(jar));
 
-        let (engine, engine_error) = match AudioEngine::new(volume) {
-            Ok(engine) => (Some(engine), None),
-            Err(err) => (None, Some(err)),
+        let (engine, engine_error) = if with_audio {
+            match AudioEngine::new(volume) {
+                Ok(engine) => (Some(engine), None),
+                Err(err) => (None, Some(err)),
+            }
+        } else {
+            (None, None)
         };
 
         let worker = net::spawn(Arc::clone(&api), Arc::clone(&shared));
@@ -814,7 +834,10 @@ mod tests {
     fn an_app() -> (App, egui::Context) {
         std::env::set_var("HOME", "/tmp/listenbli-paging-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-paging-tests");
-        (App::new(Config::default()), egui::Context::default())
+        (
+            App::new_for_tests(Config::default()),
+            egui::Context::default(),
+        )
     }
 
     fn track(bvid: &str) -> Track {

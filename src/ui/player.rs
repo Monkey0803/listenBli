@@ -683,7 +683,7 @@ mod tests {
     fn the_queue_header_shares_one_centre_line() {
         std::env::set_var("HOME", "/tmp/listenbli-queue-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-queue-tests");
-        let app = App::new(Config::default());
+        let app = App::new_for_tests(Config::default());
         let ctx = egui::Context::default();
         let cjk = crate::config::with(&app.config, |c| {
             crate::platform::resolve_cjk_font(&c.cjk_font, c.cjk_font_path.as_deref())

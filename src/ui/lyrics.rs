@@ -602,7 +602,7 @@ mod tests {
     fn app_with_lyrics(translated: bool) -> (App, egui::Context) {
         std::env::set_var("HOME", "/tmp/listenbli-lyrics-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-lyrics-tests");
-        let mut app = App::new(Config::default());
+        let mut app = App::new_for_tests(Config::default());
         app.lyrics = Lyrics {
             lines: vec![
                 LyricLine {
