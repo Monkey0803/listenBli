@@ -325,6 +325,21 @@ function ListPane({
   onOpenLogin, favFolders, selectedFolder, setSelectedFolder, favItems, favLoading, favHasMore, onLoadMore,
   onRefreshFav, history, historyLoading, onRefreshHistory, favCount, onSuggest,
 }) {
+  // Paging has no button: the tail of the list is watched and asks for the next
+  // page as it comes into view, which is what the app does too.
+  const tailRef = useRef(null);
+  useEffect(() => {
+    const tail = tailRef.current;
+    const box = tail && tail.closest(".scroll");
+    if (!tail || !box || !favHasMore || favLoading) return undefined;
+    const check = () => {
+      if (box.scrollHeight - box.scrollTop - box.clientHeight < 320) onLoadMore();
+    };
+    box.addEventListener("scroll", check);
+    check();
+    return () => box.removeEventListener("scroll", check);
+  }, [favHasMore, favLoading, favItems.length, onLoadMore]);
+
   if (tab === "favorites" && !loggedIn) {
     return (
       <section className="listpane" data-screen-label="收藏夹-未登录">
@@ -433,11 +448,8 @@ function ListPane({
               ))}
             </div>
             {favHasMore ? (
-              <div style={{ display: "flex", justifyContent: "center", padding: "4px 0 26px" }}>
-                <button className="btn-ghost" onClick={onLoadMore} disabled={favLoading}>
-                  <IconChevron size={13} />
-                  加载更多
-                </button>
+              <div ref={tailRef} style={{ display: "flex", justifyContent: "center", padding: "4px 0 26px" }}>
+                {favLoading ? <span className="spin" /> : null}
               </div>
             ) : null}
           </div>

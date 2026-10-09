@@ -91,7 +91,7 @@ fn search_returns_normalized_tracks() {
     println!("first result: {} ({})", first.title, first.bvid);
 }
 
-/// The UI's "加载更多" relies on `page` really changing the result set.
+/// The UI's automatic paging relies on `page` really changing the result set.
 #[test]
 #[ignore = "hits the live Bilibili API"]
 fn search_pages_return_different_results() {

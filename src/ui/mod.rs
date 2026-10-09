@@ -469,9 +469,13 @@ impl App {
         let accent = self.theme.accent;
         let cleared = self.search_input.is_empty();
         let mut focus_requested = false;
+        // Named so the focus state is known *before* the field is built: the
+        // icon and the fill change in the same frame the ring appears.
+        let field_id = egui::Id::new("search-field");
+        let focused = ui.ctx().memory(|memory| memory.focused()) == Some(field_id);
 
         let frame = egui::Frame::NONE
-            .fill(Color32::from_black_alpha(107))
+            .fill(Color32::from_black_alpha(if focused { 140 } else { 107 }))
             .stroke(Stroke::new(1.0, t::LINE))
             .corner_radius(18.0)
             .inner_margin(Margin {
@@ -483,13 +487,16 @@ impl App {
 
         let inner = frame.show(ui, |ui| {
             ui.set_min_width(318.0);
-            ui.set_min_height(36.0);
+            // Both bounds: the field is a 36px pill. A single `set_min_height`
+            // lets the text edit's growing atom stretch the frame to the whole
+            // top bar, which turns the pill into a bar-height slab.
+            ui.set_height(36.0);
 
             let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(15.0, 36.0), Sense::hover());
             icons::search(
                 ui.painter(),
                 Rect::from_center_size(icon_rect.center(), Vec2::splat(15.0)),
-                t::FG_4,
+                if focused { accent.accent } else { t::FG_4 },
             );
             ui.add_space(9.0);
 
@@ -501,6 +508,7 @@ impl App {
             };
             let edit = ui.add(
                 TextEdit::singleline(&mut self.search_input)
+                    .id(field_id)
                     .frame(egui::Frame::NONE)
                     // The default is LEFT_TOP, which floats the text above the
                     // middle of the pill.
@@ -559,9 +567,11 @@ impl App {
             edit
         });
 
-        let focused = inner.inner.has_focus();
         if focused {
             let painter = ui.painter().clone();
+            // The design's `focus-within`: a 1px accent ring with a 4px halo
+            // flush against it. Expanding the halo (or raising its radius) left
+            // a gap that read as a doubled, broken outline.
             painter.rect_stroke(
                 inner.response.rect,
                 18.0,
@@ -569,9 +579,9 @@ impl App {
                 egui::StrokeKind::Inside,
             );
             painter.rect_stroke(
-                inner.response.rect.expand(3.0),
-                21.0,
-                Stroke::new(3.0, accent.dim()),
+                inner.response.rect,
+                18.0,
+                Stroke::new(4.0, accent.dim()),
                 egui::StrokeKind::Outside,
             );
         }
@@ -969,7 +979,7 @@ impl App {
             PaneSource::History => false,
         };
 
-        egui::ScrollArea::vertical()
+        let scroll = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 column_head(ui, 24.0);
@@ -986,23 +996,13 @@ impl App {
                     });
                 });
                 ui.add_space(18.0);
-                if has_more || self.loading_more {
+                // Paging has no button: a page still in flight only shows this
+                // spinner, and reaching the tail of the list is what asks for
+                // the next one (see below).
+                if self.loading_more {
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
-                        if self.loading_more {
-                            spinner(ui, 15.0, accent);
-                        } else if ghost_button(
-                            ui,
-                            "加载更多",
-                            Some(icons::chevron),
-                            accent,
-                            false,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            load_more = true;
-                        }
+                        spinner(ui, 15.0, accent);
                     });
                 }
                 ui.add_space(22.0);
@@ -1022,15 +1022,37 @@ impl App {
             };
             self.play_from_list(&list, index);
         }
+
+        // Scrolling to the end fetches the next page by itself, so the rows are
+        // usually already laid out by the time the user gets there. A list
+        // shorter than its viewport counts as "at the end" too: there is
+        // nothing left to scroll, so waiting for a scroll would deadlock it.
+        if has_more
+            && !self.loading_more
+            && near_end(
+                scroll.state.offset.y,
+                scroll.inner_rect.height(),
+                scroll.content_size.y,
+            )
+        {
+            load_more = true;
+        }
+
         if load_more {
+            // Marked in flight *before* the command leaves, so the next frame
+            // cannot ask for the same page while the worker is still busy.
             match source {
                 // A later page of the query already on screen.
-                PaneSource::Search => self.send(crate::net::Cmd::Search {
-                    keyword: self.last_keyword.clone(),
-                    page: self.search_page + 1,
-                }),
+                PaneSource::Search => {
+                    self.loading_more = true;
+                    self.send(crate::net::Cmd::Search {
+                        keyword: self.last_keyword.clone(),
+                        page: self.search_page + 1,
+                    });
+                }
                 PaneSource::Favorites => {
                     if let Some(media_id) = self.selected_folder {
+                        self.loading_more = true;
                         let page = self.fav_page + 1;
                         self.send(crate::net::Cmd::LoadFavItems { media_id, page });
                     }
@@ -1039,6 +1061,18 @@ impl App {
             }
         }
     }
+}
+
+/// How close to the end of the list (in points) the next page is fetched. About
+/// the height of four rows, which leaves the in-flight spinner off screen until
+/// the user scrolls into it.
+const AUTO_LOAD_MARGIN: f32 = 320.0;
+
+/// Whether a list is close enough to its end to fetch more. `offset` is the
+/// vertical scroll offset, `viewport` the height of the visible window and
+/// `content` the height of everything laid out inside it.
+fn near_end(offset: f32, viewport: f32, content: f32) -> bool {
+    content - (offset + viewport) <= AUTO_LOAD_MARGIN
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1625,6 +1659,71 @@ mod tests {
         assert_eq!(app.search_history()[0], "晴天");
     }
 
+    /// Every rectangle egui painted, so a test can check the shape of the
+    /// hand-painted search pill instead of trusting the layout code.
+    fn painted_rects(output: &egui::FullOutput) -> Vec<egui::epaint::RectShape> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn search_pill(output: &egui::FullOutput) -> egui::epaint::RectShape {
+        painted_rects(output)
+            .into_iter()
+            .find(|rect| rect.corner_radius.nw == 18 && rect.rect.width() > 300.0)
+            .expect("the search pill should be painted")
+    }
+
+    /// The search field is a 36px pill centred in the top bar.
+    ///
+    /// It used to stretch to the whole bar: a single `set_min_height` let the
+    /// text edit's growing atom expand the frame, so the "pill" became a slab
+    /// and the focus ring hugged the bar's own edges.
+    #[test]
+    fn the_search_pill_keeps_its_height() {
+        let (mut app, ctx) = focused_app(&[]);
+        let output = frame(&ctx, &mut app, vec![]);
+
+        let pill = search_pill(&output);
+        assert!(
+            (34.0..=40.0).contains(&pill.rect.height()),
+            "the pill should stay ~36px tall, got {:?}",
+            pill.rect
+        );
+    }
+
+    /// The focus halo is flush against the pill and shares its radius: a gap
+    /// (or a different radius) reads as a broken, doubled outline.
+    #[test]
+    fn the_focus_halo_hugs_the_pill() {
+        let (mut app, ctx) = focused_app(&[]);
+        app.focus_search = true;
+        let accent = app.theme.accent;
+        let output = frame(&ctx, &mut app, vec![]);
+
+        let pill = search_pill(&output).rect;
+        let halo = painted_rects(&output)
+            .into_iter()
+            .find(|rect| rect.stroke.color == accent.dim() && rect.stroke.width > 0.0)
+            .expect("a focused field should paint an accent halo");
+
+        assert_eq!(halo.rect, pill, "the halo must sit on the pill itself");
+        assert_eq!(halo.corner_radius.nw, 18, "and share the pill's radius");
+    }
+
     /// Control case: a click on a row *inside a scroll area* must register.
     #[test]
     fn clicking_a_result_plays_it() {
@@ -1637,29 +1736,46 @@ mod tests {
         );
     }
 
-    /// The results list only offers "加载更多" while the server says so, and
-    /// swaps it for a spinner while the next page is in flight.
+    /// Paging has no button any more: the tail of the list asks for the next
+    /// page on its own, and the reply that says "nothing more" stops it.
     #[test]
-    fn the_results_list_offers_loading_more_pages() {
+    fn the_end_of_the_list_fetches_the_next_page() {
         let (mut app, ctx) = app_with_results();
         app.search_has_more = true;
-        let output = central(&ctx, &mut app, vec![]);
-        assert!(painted(&output, "加载更多"), "more pages should be offered");
+        app.search_page = 1;
 
-        app.loading_more = true;
+        // Two rows cannot fill the viewport, so the list is already at its end
+        // and the first frame asks for page 2.
         let output = central(&ctx, &mut app, vec![]);
         assert!(
+            app.loading_more,
+            "the last rows should pull in the next page on their own"
+        );
+        assert!(
             !painted(&output, "加载更多"),
-            "a page in flight replaces the button with a spinner"
+            "the manual button should be gone"
         );
 
-        app.loading_more = false;
+        // The last page reports nothing more, so nothing is asked for.
         app.search_has_more = false;
-        let output = central(&ctx, &mut app, vec![]);
-        assert!(
-            !painted(&output, "加载更多"),
-            "the last page should not offer more"
-        );
+        app.loading_more = false;
+        central(&ctx, &mut app, vec![]);
+        assert!(!app.loading_more, "the last page must not ask for more");
+    }
+
+    /// The tail-fetch trigger: only the last rows (or a list too short to
+    /// scroll) pull in the next page.
+    #[test]
+    fn the_next_page_is_only_fetched_near_the_end() {
+        // Mid-list, more than the margin above the end: wait for the scroll.
+        assert!(!near_end(0.0, 600.0, 4000.0));
+        assert!(!near_end(3000.0, 600.0, 4000.0));
+        // Inside the margin, and right at the end.
+        assert!(near_end(3081.0, 600.0, 4000.0));
+        assert!(near_end(3400.0, 600.0, 4000.0));
+        // Shorter than its viewport: there is nothing to scroll, so it counts
+        // as the end or it could never grow.
+        assert!(near_end(0.0, 600.0, 120.0));
     }
 
     /// The dropdown can be emptied, and closes itself once it is.

@@ -56,7 +56,9 @@ pub struct App {
 
     pub(crate) search_input: String,
     pub(crate) searching: bool,
-    /// A page *after* the first one is in flight, so the list stays put.
+    /// A page *after* the first one is in flight, so the list stays put. Set
+    /// the moment the request leaves the UI and cleared by the reply, so the
+    /// automatic "scrolled to the end" fetch cannot ask for one page twice.
     pub(crate) loading_more: bool,
     pub(crate) last_keyword: String,
     pub(crate) results: Vec<Track>,
@@ -440,6 +442,7 @@ impl App {
             Evt::SearchStarted { keyword, page } => {
                 if page <= 1 {
                     self.searching = true;
+                    self.loading_more = false;
                     self.last_keyword = keyword;
                     self.results.clear();
                     self.search_page = 1;
@@ -615,6 +618,7 @@ impl App {
                 if Some(media_id) != self.selected_folder {
                     return;
                 }
+                self.loading_more = false;
                 if page <= 1 {
                     self.fav_items = tracks;
                 } else {
@@ -801,8 +805,8 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    //! The search paging state machine. "加载更多" appends to the list, so a
-    //! later page must never trigger the skeleton or wipe what is on screen.
+    //! The search paging state machine. A later page is appended to the list,
+    //! so it must never trigger the skeleton or wipe what is on screen.
 
     use super::*;
     use crate::net::Evt;

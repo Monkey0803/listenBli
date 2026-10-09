@@ -105,6 +105,8 @@ impl App {
                 self.fav_items.clear();
                 self.fav_page = 1;
                 self.fav_loaded = false;
+                // Any page still in flight belongs to the folder just left.
+                self.loading_more = false;
                 self.send(crate::net::Cmd::LoadFavItems {
                     media_id: id,
                     page: 1,
