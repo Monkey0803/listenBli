@@ -136,26 +136,44 @@ pub fn parse_lrc(input: &str) -> Vec<(Duration, String)> {
 /// (`:` or `：`). A lyric that merely *mentions* songwriting ("他作了曲") has no
 /// colon and is kept.
 pub fn is_credit_line(text: &str) -> bool {
-    /// Tags are compared case-insensitively, so both scripts can share one list.
+    /// The vocabulary comes from the credits NetEase actually serves (see the
+    /// census-derived cases in `src/lyrics/mod.rs`), plus the romanised
+    /// instrument names that appear alongside the Chinese ones.
     const TAGS: &[&str] = &[
-        // 网易云与中文平台上常见的署名
+        // 中文署名
         "作词",
         "作曲",
-        "编曲",
         "词",
         "曲",
+        "词曲",
+        "编曲",
         "制作人",
         "制作",
+        "音乐制作",
+        "执行制作",
         "监制",
+        "监唱",
         "出品",
         "出品人",
         "混音",
+        "混音工程",
+        "混音助理",
+        "混音师",
         "母带",
+        "母带工程师",
+        "后期",
         "录音",
+        "录音工程",
+        "录音助理",
+        "录音师",
         "录音室",
         "混音室",
         "配唱",
+        "配唱制作",
         "和声",
+        "合声",
+        "和声编写",
+        "合声编写",
         "人声",
         "吉他",
         "贝斯",
@@ -163,13 +181,37 @@ pub fn is_credit_line(text: &str) -> bool {
         "钢琴",
         "键盘",
         "弦乐",
+        "弦乐编写",
+        "弦乐录音师",
+        "弦乐录音室",
+        "弦乐助理",
+        "小提琴",
+        "中提琴",
+        "大提琴",
+        "低音提琴",
+        "二胡",
+        "琵琶",
+        "笛箫",
+        "古琴",
+        "古筝",
+        "埙",
+        "口琴",
+        "长笛",
+        "萨克斯",
+        "打击乐",
+        "演唱",
+        "翻唱",
+        "念白",
+        "旁白",
         "企划",
         "统筹",
         "发行",
         "封面",
         "文案",
         "设计",
-        // 英文署名
+        "艺术总监",
+        "音乐总监",
+        // 英文署名（含与中文并列出现的形式，如「母带 Mastering」）
         "lyrics",
         "lyricist",
         "composer",
@@ -179,28 +221,97 @@ pub fn is_credit_line(text: &str) -> bool {
         "producer",
         "mixing",
         "mix",
+        "mixer",
         "mastering",
         "mastered",
         "recording",
+        "engineer",
+        "studio",
         "guitar",
         "bass",
+        "c.bass",
         "drums",
+        "drum",
         "piano",
         "strings",
+        "violin",
+        "violins",
+        "viola",
+        "violas",
+        "cello",
+        "cellos",
+        "erhu",
+        "pipa",
+        "dizi",
+        "di/xiao",
+        "xun",
+        "guqin",
+        "guzheng",
+        "suona",
+        "harmonica",
+        "flute",
+        "saxophone",
+        "trumpet",
+        "trombone",
+        "percussion",
+        "accordion",
+        "harp",
+        "organ",
+        "synthesizer",
+        "synth",
+        "programming",
+        "vocals",
+        "vocal",
+        "backing",
+        "harmony",
+        "choir",
         "op",
         "sp",
+        "isrc",
+        // 「1st Violin：…」这类声部行
+        "1st",
+        "2nd",
+        "3rd",
+        "4th",
     ];
 
+    if is_title_line(text) {
+        return true;
+    }
     let Some((tag, _)) = text.split_once([':', '：']) else {
         return false;
     };
     let tag = tag.trim();
     // Real credit tags are short; anything longer is far more likely to be a
-    // lyric that happens to carry a colon.
-    if tag.is_empty() || tag.chars().count() > 12 {
+    // lyric that happens to carry a colon ("我觉得是个好办法[：亲切教学]").
+    if tag.is_empty() || tag.chars().count() > 16 {
         return false;
     }
-    TAGS.iter().any(|known| tag.eq_ignore_ascii_case(known))
+    // Every word of the tag has to be a known credit word. That covers the
+    // bilingual forms ("编曲 Arranger", "母带 Mastering") without letting a
+    // lyric that merely contains a colon through.
+    tag.split_whitespace()
+        .all(|word| TAGS.iter().any(|known| word.eq_ignore_ascii_case(known)))
+}
+
+/// NetEase opens many lyric documents with `<歌名> - <歌手> (Latin name)`.
+///
+/// That is metadata as well, but it has to be matched narrowly: a census of the
+/// real caches found 27 lines containing " - ", nearly all of them genuine
+/// variety-show subtitles (`没举手啊[胜宽 - DINO组]`). Requiring a trailing
+/// round bracket that holds a Latin name keeps every one of those.
+fn is_title_line(text: &str) -> bool {
+    let Some(inside) = text.strip_suffix([')', '）']) else {
+        return false;
+    };
+    let Some((head, credits)) = inside.rsplit_once(['(', '（']) else {
+        return false;
+    };
+    head.contains(" - ")
+        && !credits.trim().is_empty()
+        && credits
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '&' | '\'' | '-'))
 }
 
 /// `mm:ss`, `mm:ss.xx` or `mm:ss.xxx` (also tolerates `hh:mm:ss.xx`).
@@ -273,6 +384,51 @@ pub fn from_subtitle(body: &[SubtitleLine]) -> Vec<LyricLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drops_the_whole_credit_block_netease_serves() {
+        // The real header of the NetEase match for 《晴天》.
+        let lrc = "[00:00.00]作词 : Chieh-lun Chou\n\
+                   [00:00.00]作曲 : Chieh-lun Chou\n\
+                   [00:00.00]晴天 - 周杰伦 (Jay Chou)\n\
+                   [00:02.25]词：周杰伦\n\
+                   [00:06.75]编曲：周杰伦\n\
+                   [00:11.25]合声：周杰伦\n\
+                   [00:15.00]吉他：蔡科俊Again\n\
+                   [00:22.50]录音助理：刘勇志\n\
+                   [00:27.00]混音工程：杨大纬（杨大纬录音工作室）\n\
+                   [00:29.00]故事的小黄花\n";
+        let lines = parse_lrc(lrc);
+        assert_eq!(lines.len(), 1, "only the lyric should survive: {lines:?}");
+        assert_eq!(lines[0].1, "故事的小黄花");
+    }
+
+    #[test]
+    fn bilingual_and_section_credits_are_dropped() {
+        for text in [
+            "母带 Mastering: 全相彦",
+            "编曲 Arranger:Terence teo",
+            "1st Violin：陈允、曾诚",
+            "C.Bass：劭士坆",
+            "ISRC: TW-C23-04-007-02",
+            "念白：",
+        ] {
+            assert!(is_credit_line(text), "{text:?} should be a credit");
+        }
+    }
+
+    #[test]
+    fn subtitle_text_with_dashes_and_brackets_is_kept() {
+        // Real variety-show subtitles: they contain " - " but are content.
+        for text in [
+            "没举手啊[胜宽 - DINO组]",
+            "我们选JOSHUA吧！[JOSHUA - DINO组]",
+            "我觉得是个好办法[：亲切教学]",
+            "- 轻一点的成员- 得选轻一点的组[圆佑 - THE 8组]",
+        ] {
+            assert!(!is_credit_line(text), "{text:?} is a lyric, not a credit");
+        }
+    }
 
     #[test]
     fn parses_basic_lrc() {
