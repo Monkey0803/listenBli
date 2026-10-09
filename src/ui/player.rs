@@ -365,52 +365,9 @@ impl App {
             .show(|ui| {
                 ui.vertical(|ui| {
                     ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(15.0);
-                        // Painted as one row: the icon, the title and the count
-                        // must all sit on the same optical centre.
-                        let title_font = t::ui_font(13.0);
-                        let count_font = t::mono_font(11.0);
-                        let count = format!("{} 首", queue.len());
-                        let title_width = widgets::measure(ui, "播放列表", &title_font).x;
-                        let width =
-                            19.0 + title_width + 2.0 + widgets::measure(ui, &count, &count_font).x;
-                        let (header, _) =
-                            ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
-                        let painter = ui.painter().clone();
-                        icons::queue(
-                            &painter,
-                            Rect::from_min_size(
-                                Pos2::new(header.left(), header.center().y - 7.0),
-                                Vec2::splat(14.0),
-                            ),
-                            accent.accent,
-                        );
-                        widgets::paint_label(
-                            &painter,
-                            Pos2::new(header.left() + 19.0, header.center().y),
-                            Align2::LEFT_CENTER,
-                            "播放列表",
-                            title_font,
-                            t::FG,
-                        );
-                        widgets::paint_label(
-                            &painter,
-                            Pos2::new(header.left() + 19.0 + title_width + 2.0, header.center().y),
-                            Align2::LEFT_CENTER,
-                            &count,
-                            count_font,
-                            t::FG_4,
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(8.0);
-                            if widgets::icon_button(ui, icons::close, 28.0, false, accent, "收起")
-                                .clicked()
-                            {
-                                close = true;
-                            }
-                        });
-                    });
+                    if queue_header(ui, accent, queue.len()) {
+                        close = true;
+                    }
                     ui.add_space(11.0);
                     super::hline(ui, ui.min_rect().bottom() - 0.5, t::LINE);
 
@@ -600,6 +557,73 @@ fn transport_button(
     }
 }
 
+/// The queue popup's header row, returning `true` when 收起 was clicked.
+///
+/// Everything here is painted as one row so the icon, the title, the count and
+/// the unit sit on one optical centre. The count is deliberately two labels:
+/// epaint positions a mixed Latin/CJK run by centring each face's ascent box,
+/// which floats 首 a couple of pixels above the mono digits and drags those
+/// digits below the centre line. Painted separately, each piece is centred on
+/// its own ink, like every other hand-painted label in the chrome.
+fn queue_header(ui: &mut Ui, accent: t::Accent, count: usize) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.add_space(15.0);
+
+        let title_font = t::ui_font(13.0);
+        let count_font = t::mono_font(11.0);
+        let count = count.to_string();
+        let unit = "首";
+        let title_width = widgets::measure(ui, "播放列表", &title_font).x;
+        let count_width = widgets::measure(ui, &count, &count_font).x;
+        let space = widgets::measure(ui, " ", &count_font).x;
+        let width = 19.0
+            + title_width
+            + 2.0
+            + count_width
+            + space
+            + widgets::measure(ui, unit, &count_font).x;
+        let (header, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
+        let painter = ui.painter().clone();
+        icons::queue(
+            &painter,
+            Rect::from_min_size(
+                Pos2::new(header.left(), header.center().y - 7.0),
+                Vec2::splat(14.0),
+            ),
+            accent.accent,
+        );
+        widgets::paint_label(
+            &painter,
+            Pos2::new(header.left() + 19.0, header.center().y),
+            Align2::LEFT_CENTER,
+            "播放列表",
+            title_font,
+            t::FG,
+        );
+        let mut x = header.left() + 19.0 + title_width + 2.0;
+        for text in [&count, unit] {
+            widgets::paint_label(
+                &painter,
+                Pos2::new(x, header.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                count_font.clone(),
+                t::FG_4,
+            );
+            x += widgets::measure(ui, text, &count_font).x + space;
+        }
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(8.0);
+            if widgets::icon_button(ui, icons::close, 28.0, false, accent, "收起").clicked() {
+                close = true;
+            }
+        });
+    });
+    close
+}
+
 /// Draws the rotating arc used on the play button while a track downloads.
 fn player_spinner(ui: &Ui, center: Pos2) {
     let painter = ui.painter().clone();
@@ -616,4 +640,83 @@ fn player_spinner(ui: &Ui, center: Pos2) {
         Stroke::new(2.0, Color32::from_rgb(0x2a, 0x0d, 0x18)),
     );
     ui.ctx().request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    //! The queue header is hand-painted, so this drives the real row and then
+    //! inspects what egui actually painted.
+
+    use super::*;
+    use crate::config::Config;
+    use egui::{RawInput, Rect, Vec2};
+
+    /// Every string egui painted, with the y of its glyph ink's centre.
+    fn painted_ink(output: &egui::FullOutput) -> Vec<(String, f32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.text().to_owned(),
+                    text.pos.y + text.galley.mesh_bounds.center().y,
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// The header's icon, title, count and unit must share one centre line.
+    ///
+    /// Painting "20 首" as a single label failed this: epaint centres a mixed
+    /// Latin/CJK run per font face, which floats 首 above the mono digits and
+    /// sinks the digits below the line.
+    #[test]
+    fn the_queue_header_shares_one_centre_line() {
+        std::env::set_var("HOME", "/tmp/listenbli-queue-tests");
+        let _ = std::fs::create_dir_all("/tmp/listenbli-queue-tests");
+        let app = App::new(Config::default());
+        let ctx = egui::Context::default();
+        let cjk = crate::config::with(&app.config, |c| {
+            crate::platform::resolve_cjk_font(&c.cjk_font, c.cjk_font_path.as_deref())
+        });
+        crate::ui::theme::install_fonts(&ctx, cjk.as_deref());
+        crate::ui::theme::install_style(&ctx, &app.theme);
+        let accent = app.theme.accent;
+
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 60.0))),
+                ..Default::default()
+            },
+            |ui| {
+                queue_header(ui, accent, 20);
+            },
+        );
+        output.textures_delta.clear();
+
+        let ink = painted_ink(&output);
+        let centre = |label: &str| {
+            ink.iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, y)| *y)
+                .unwrap_or_else(|| panic!("{label:?} should be painted: {ink:?}"))
+        };
+        let title = centre("播放列表");
+        for label in ["20", "首"] {
+            assert!(
+                (centre(label) - title).abs() < 0.5,
+                "{label:?} is centred at {}, but \"播放列表\" is at {title}",
+                centre(label)
+            );
+        }
+    }
 }
