@@ -486,10 +486,15 @@ impl App {
             });
 
         let inner = frame.show(ui, |ui| {
-            ui.set_min_width(318.0);
-            // Both bounds: the field is a 36px pill. A single `set_min_height`
-            // lets the text edit's growing atom stretch the frame to the whole
-            // top bar, which turns the pill into a bar-height slab.
+            // Both bounds on both axes: the field is a 318x36 pill, and every
+            // child that fills "the rest" would otherwise grow it. Height: the
+            // text edit's growing atom stretches the frame to the whole top
+            // bar, turning the pill into a bar-height slab. Width: the
+            // right-to-left run below lays the ⌘K chip against the end of
+            // whatever rect it is given, so an unbounded pill swallowed the
+            // 无损优先 / 设置 / 账号 cluster — the fill and the `focus-within`
+            // ring wrapped them, and the chip ended up under the account chip.
+            ui.set_width(318.0);
             ui.set_height(36.0);
 
             let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(15.0, 36.0), Sense::hover());
@@ -1880,6 +1885,50 @@ mod tests {
         assert!(
             !app.search_history_open,
             "an empty history should dismiss the dropdown"
+        );
+    }
+
+    /// The search pill is its own 318x36 box: it must not swallow the right
+    /// cluster. An unbounded pill let its right-to-left run lay the ⌘K chip
+    /// against the end of the top bar, which dragged the frame's fill — and the
+    /// `focus-within` ring — around 无损优先 / 设置 / 账号, and hid the chip
+    /// under the account chip.
+    #[test]
+    fn the_search_pill_does_not_swallow_the_top_right_cluster() {
+        let (mut app, ctx) = focused_app(&[]);
+        let output = frame(&ctx, &mut app, vec![]);
+
+        fn rounded(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        rounded(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        for clipped in &output.shapes {
+            rounded(&clipped.shape, &mut all);
+        }
+        // The pill: the 18px-radius rounded rect carrying the field's fill.
+        let pill = all
+            .iter()
+            .find(|rect| rect.corner_radius.nw == 18 && rect.fill != Color32::TRANSPARENT)
+            .map(|rect| rect.rect)
+            .expect("the search pill should be painted");
+
+        let chip = painted_rect(&output, "⌘K").expect("the ⌘K chip should be painted");
+        assert!(
+            pill.contains(chip.center()),
+            "the ⌘K chip at {chip:?} should sit inside the pill {pill:?}"
+        );
+        let cluster = painted_rect(&output, "无损优先").expect("the lossless chip is painted");
+        assert!(
+            pill.right() < cluster.left(),
+            "the pill {pill:?} should end before the right cluster at {cluster:?}"
         );
     }
 
