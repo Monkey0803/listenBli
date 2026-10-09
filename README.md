@@ -64,7 +64,7 @@ winget install Rustlang.Rustup
 ### 构建与运行
 
 ```bash
-git clone <repo> && cd listenBli
+git clone https://github.com/Monkey0803/listenBli.git && cd listenBli
 cargo run --release
 ```
 
