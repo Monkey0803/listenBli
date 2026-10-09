@@ -121,7 +121,86 @@ pub fn parse_lrc(input: &str) -> Vec<(Duration, String)> {
 
     raw.into_iter()
         .map(|(ms, text)| (Duration::from_millis(ms as u64), text))
+        .filter(|(_, text)| !is_credit_line(text))
         .collect()
+}
+
+/// Is this line the `作词 : …` / `Composer: …` credit block rather than a lyric?
+///
+/// Providers put their credits *inside* the LRC with timestamps of their own, so
+/// `parse_lrc` cannot tell them apart by tag alone. Left in place they own the
+/// top of the lyric panel — and the "follow" highlight — for the first seconds
+/// of every NetEase-matched song.
+///
+/// The rule is deliberately narrow: a known credit tag followed by a colon
+/// (`:` or `：`). A lyric that merely *mentions* songwriting ("他作了曲") has no
+/// colon and is kept.
+pub fn is_credit_line(text: &str) -> bool {
+    /// Tags are compared case-insensitively, so both scripts can share one list.
+    const TAGS: &[&str] = &[
+        // 网易云与中文平台上常见的署名
+        "作词",
+        "作曲",
+        "编曲",
+        "词",
+        "曲",
+        "制作人",
+        "制作",
+        "监制",
+        "出品",
+        "出品人",
+        "混音",
+        "母带",
+        "录音",
+        "录音室",
+        "混音室",
+        "配唱",
+        "和声",
+        "人声",
+        "吉他",
+        "贝斯",
+        "鼓",
+        "钢琴",
+        "键盘",
+        "弦乐",
+        "企划",
+        "统筹",
+        "发行",
+        "封面",
+        "文案",
+        "设计",
+        // 英文署名
+        "lyrics",
+        "lyricist",
+        "composer",
+        "music",
+        "arranger",
+        "arrangement",
+        "producer",
+        "mixing",
+        "mix",
+        "mastering",
+        "mastered",
+        "recording",
+        "guitar",
+        "bass",
+        "drums",
+        "piano",
+        "strings",
+        "op",
+        "sp",
+    ];
+
+    let Some((tag, _)) = text.split_once([':', '：']) else {
+        return false;
+    };
+    let tag = tag.trim();
+    // Real credit tags are short; anything longer is far more likely to be a
+    // lyric that happens to carry a colon.
+    if tag.is_empty() || tag.chars().count() > 12 {
+        return false;
+    }
+    TAGS.iter().any(|known| tag.eq_ignore_ascii_case(known))
 }
 
 /// `mm:ss`, `mm:ss.xx` or `mm:ss.xxx` (also tolerates `hh:mm:ss.xx`).
@@ -175,6 +254,7 @@ pub fn from_subtitle(body: &[SubtitleLine]) -> Vec<LyricLine> {
     let mut lines: Vec<LyricLine> = body
         .iter()
         .filter(|line| !line.content.trim().is_empty())
+        .filter(|line| !is_credit_line(&line.content))
         .map(|line| LyricLine {
             time: Duration::from_secs_f64(line.from.max(0.0)),
             // Subtitles wrap; collapse the newlines for a single lyric row.
