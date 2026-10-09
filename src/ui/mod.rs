@@ -601,6 +601,17 @@ impl App {
         }
         if self.search_history_open {
             self.search_history_popup(&inner.response);
+            // egui's `CloseOnClickOutside` forgives clicks that land on the
+            // popup, but not the mouse release that focuses the field: that one
+            // counts as clicking away and dismissed the list the frame after it
+            // appeared. A click on the field itself is not clicking away, so put
+            // the list back. (⌘K never suffered from this: it is not a click.)
+            if inner.inner.clicked()
+                && self.search_input.is_empty()
+                && !self.search_history().is_empty()
+            {
+                self.search_history_open = true;
+            }
         }
     }
 
@@ -1339,11 +1350,12 @@ impl App {
             match status {
                 Some((text, is_error)) => {
                     status_dot(ui, if is_error { t::ERR } else { t::OK });
-                    ui.label(RichText::new(text).size(11.5).color(if is_error {
-                        t::ERR
-                    } else {
-                        t::FG_2
-                    }));
+                    status_text(
+                        ui,
+                        &text,
+                        t::ui_font(11.5),
+                        if is_error { t::ERR } else { t::FG_2 },
+                    );
                 }
                 None => {
                     let logged_in = self.user.is_some();
@@ -1353,7 +1365,7 @@ impl App {
                     } else {
                         "未登录（可正常听歌；登录后可获取更高音质与「我的」内容）"
                     };
-                    ui.label(RichText::new(hint).size(11.5).color(t::FG_3));
+                    status_text(ui, hint, t::ui_font(11.5), t::FG_3);
                 }
             }
 
@@ -1371,14 +1383,28 @@ impl App {
                     ui.ctx().copy_text(crate::config::config_path_display());
                     self.notify("已复制到剪贴板");
                 }
-                ui.label(
-                    RichText::new(format!("配置：{}", crate::config::config_path_display()))
-                        .font(t::mono_font(10.5))
-                        .color(t::FG_3),
-                );
+                // `配置：` rides the UI face rather than the path's monospace
+                // one. Within the monospace family egui places a *fallback* face
+                // with its own ascent, which measured two to three pixels above
+                // the Latin baseline — so in one mono string the Chinese label
+                // floated above the path and the row looked ragged. The UI face
+                // is the one the hint on the left already uses, and there the
+                // label and the Latin sit on the same baseline. Zero spacing
+                // keeps the two pieces reading as the single line they are.
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    // Right-to-left: the path first so the label ends up left.
+                    status_text(
+                        ui,
+                        &crate::config::config_path_display(),
+                        t::mono_font(10.5),
+                        t::FG_3,
+                    );
+                    status_text(ui, "配置：", t::ui_font(10.5), t::FG_3);
+                });
                 if let Some(err) = &self.engine_error {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(err).size(11.0).color(t::ERR));
+                    status_text(ui, err, t::ui_font(11.0), t::ERR);
                 }
             });
         });
@@ -1431,6 +1457,24 @@ impl App {
 fn status_dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 2.5, color);
+}
+
+/// One status-bar label, centred on its glyph ink rather than on the font box.
+///
+/// A stock `Label` centres the ascent/descent box, and the CJK faces this app
+/// loads reserve far more room below the baseline than their glyphs actually
+/// use — so the dot and the config path beside the hint ended up a few pixels
+/// lower than the Chinese text. Painting the ink instead (the same rule
+/// `widgets::paint_label` follows) keeps every item on one centre line.
+fn status_text(ui: &mut Ui, text: &str, font: egui::FontId, color: Color32) {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    widgets::paint_galley_centred(
+        ui.painter(),
+        Pos2::new(rect.left(), rect.center().y),
+        galley,
+        color,
+    );
 }
 
 #[cfg(test)]
@@ -1583,6 +1627,21 @@ mod tests {
         render(ctx, app, vec![Event::PointerMoved(pos)]);
     }
 
+    /// Clicks an absolute position: for hitting empty space, where nothing is
+    /// painted to aim at.
+    fn click_at(ctx: &egui::Context, app: &mut App, pos: Pos2, render: Render) {
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        render(ctx, app, vec![Event::PointerMoved(pos)]);
+        render(ctx, app, vec![Event::PointerMoved(pos), button(true)]);
+        render(ctx, app, vec![Event::PointerMoved(pos), button(false)]);
+        render(ctx, app, vec![Event::PointerMoved(pos)]);
+    }
+
     /// Running a search writes it to the persisted history.
     #[test]
     fn a_search_is_remembered() {
@@ -1624,6 +1683,37 @@ mod tests {
         app.search_input = "晴".to_owned();
         let output = frame(&ctx, &mut app, vec![]);
         assert!(!painted(&output, "清空搜索记录"));
+    }
+
+    /// The mouse release that focuses the field must not dismiss the list that
+    /// same click just opened: egui forgives clicks landing on the popup, but
+    /// the release over the field counts as "clicked outside" and closed it the
+    /// frame after it appeared. ⌘K never showed it because it is not a click.
+    #[test]
+    fn clicking_the_search_field_keeps_the_history_up() {
+        let (mut app, ctx) = focused_app(&["米津玄師", "晴天"]);
+        // Back to the state before the user touches the field.
+        app.search_history_open = false;
+        app.focus_search = false;
+        ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("search-field")));
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(!painted(&output, "搜索记录"), "the list starts closed");
+
+        click_painted(&ctx, &mut app, "搜索歌曲 / 视频，如：周杰伦 晴天", frame);
+
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&output, "搜索记录"),
+            "the field's own click should leave the list up"
+        );
+
+        // A click on empty space, away from field and list, still dismisses it.
+        click_at(&ctx, &mut app, Pos2::new(900.0, 760.0), frame);
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(
+            !painted(&output, "搜索记录"),
+            "clicking away should still close the list"
+        );
     }
 
     /// Clicking an entry re-runs that search and promotes it to the top.
@@ -1790,6 +1880,119 @@ mod tests {
         assert!(
             !app.search_history_open,
             "an empty history should dismiss the dropdown"
+        );
+    }
+
+    /// The status bar's dot, hint and config path must share one centre line,
+    /// and the two halves of the config line one baseline.
+    ///
+    /// A stock `Label` centres the font's ascent/descent box, and the CJK faces
+    /// this app loads leave a few pixels of unused descent under the glyphs —
+    /// which left the Chinese hint visibly high next to the dot and the path.
+    /// The bar paints its text ink-centred instead; this keeps it that way, and
+    /// separately checks the `配置：` label against the path beside it, which is
+    /// the pair that shared a monospace family and drifted apart.
+    #[test]
+    fn the_status_bar_centres_every_item_on_one_line() {
+        std::env::set_var("HOME", "/tmp/listenbli-search-tests");
+        let _ = std::fs::create_dir_all("/tmp/listenbli-search-tests");
+        let mut app = App::new(Config::default());
+        let ctx = egui::Context::default();
+        // The same face the running app resolves, so the CJK metrics are real.
+        let cjk = crate::config::with(&app.config, |c| {
+            crate::platform::resolve_cjk_font(&c.cjk_font, c.cjk_font_path.as_deref())
+        });
+        crate::ui::theme::install_fonts(&ctx, cjk.as_deref());
+        crate::ui::theme::install_style(&ctx, &app.theme);
+
+        let mut output = ctx.run_ui(raw(vec![]), |ui| {
+            egui::Panel::bottom("status_bar")
+                .exact_size(theme::STATUS_BAR_H)
+                .frame(frames::status_bar())
+                .show(ui, |ui| app.ui_status_bar(ui));
+        });
+        output.textures_delta.clear();
+
+        /// One painted label: where it was drawn, and the baselines of the
+        /// glyphs this test looks at (relative to the shape's origin).
+        struct Painted {
+            text: String,
+            pos: Pos2,
+            ink_center: f32,
+            baselines: Vec<(char, f32)>,
+        }
+
+        fn walk(shape: &egui::Shape, ink: &mut Vec<Painted>, dot: &mut Option<f32>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut baselines = Vec::new();
+                    for row in &text.galley.rows {
+                        for glyph in &row.row.glyphs {
+                            if matches!(glyph.chr, '配' | 'L') {
+                                baselines.push((glyph.chr, row.pos.y + glyph.pos.y));
+                            }
+                        }
+                    }
+                    ink.push(Painted {
+                        text: text.galley.text().to_owned(),
+                        pos: text.pos,
+                        ink_center: text.galley.mesh_bounds.center().y,
+                        baselines,
+                    });
+                }
+                egui::Shape::Circle(circle) => *dot = Some(circle.center.y),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, ink, dot);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (mut ink, mut dot) = (Vec::new(), None);
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut ink, &mut dot);
+        }
+
+        let dot = dot.expect("the status dot should be painted");
+        assert!(
+            ink.len() >= 3,
+            "the bar should paint its hint, label and path: {:?}",
+            ink.iter().map(|item| &item.text).collect::<Vec<_>>()
+        );
+        for item in &ink {
+            let centre = item.pos.y + item.ink_center;
+            assert!(
+                (centre - dot).abs() < 0.5,
+                "{:?} is centred at {centre}, but the dot is at {dot}",
+                item.text
+            );
+        }
+
+        // `配置：` rides the UI face and the path the monospace one; the label
+        // must not float above the path the way it did inside a single mono
+        // string, so compare the two baselines.
+        let baseline = |item: &Painted, ch: char| {
+            item.pos.y
+                + item
+                    .baselines
+                    .iter()
+                    .find(|(glyph, _)| *glyph == ch)
+                    .map(|(_, y)| *y)
+                    .unwrap_or_else(|| panic!("{:?} should contain {ch:?}", item.text))
+        };
+        let label = ink
+            .iter()
+            .find(|item| item.text.starts_with("配置"))
+            .expect("the config label should be painted on its own");
+        let path = ink
+            .iter()
+            .find(|item| item.text.ends_with("config.json"))
+            .expect("the config path should be painted");
+        let (label_base, path_base) = (baseline(label, '配'), baseline(path, 'L'));
+        assert!(
+            (label_base - path_base).abs() <= 1.5,
+            "配置 sits on baseline {label_base} but the path on {path_base}"
         );
     }
 }
