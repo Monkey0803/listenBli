@@ -72,11 +72,14 @@ pub enum Cmd {
 pub enum Evt {
     SearchStarted {
         keyword: String,
+        page: u32,
     },
     SearchResults {
         keyword: String,
         page: u32,
         tracks: Vec<Track>,
+        /// Whether the server says another page can be requested.
+        has_more: bool,
     },
     /// The track's `cid`/duration are now known; the download may still be running.
     TrackResolved(Box<Track>),
@@ -262,13 +265,15 @@ fn dispatch(
         Cmd::Search { keyword, page } => {
             let _ = evt_tx.send(Evt::SearchStarted {
                 keyword: keyword.clone(),
+                page,
             });
             match search::search(api, &keyword, page) {
-                Ok(tracks) => {
+                Ok(results) => {
                     let _ = evt_tx.send(Evt::SearchResults {
                         keyword,
                         page,
-                        tracks,
+                        tracks: results.tracks,
+                        has_more: results.has_more,
                     });
                 }
                 Err(err) => send_error(evt_tx, "搜索失败", err),

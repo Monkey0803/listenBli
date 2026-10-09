@@ -154,6 +154,9 @@ pub struct ViewOwner {
 pub struct SearchTypeData {
     #[serde(default)]
     pub result: Vec<SearchItem>,
+    /// Total pages the query has; 0 when the server does not say.
+    #[serde(rename = "numPages", default)]
+    pub num_pages: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +180,9 @@ pub struct SearchItem {
 pub struct SearchAllData {
     #[serde(default)]
     pub result: Vec<SearchAllGroup>,
+    /// Total pages the query has; 0 when the server does not say.
+    #[serde(rename = "numPages", default)]
+    pub num_pages: u32,
 }
 
 #[derive(Debug, Deserialize)]

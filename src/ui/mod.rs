@@ -651,6 +651,9 @@ impl App {
             return;
         }
         self.tab = Tab::Search;
+        self.search_page = 1;
+        self.search_has_more = false;
+        self.loading_more = false;
         // Every search the user actually runs is remembered, whichever control
         // started it (Enter, ⌘K, a suggestion chip or the history dropdown).
         self.remember_search(&keyword);
@@ -960,7 +963,11 @@ impl App {
             PaneSource::Favorites => std::mem::take(&mut self.fav_items),
             PaneSource::History => std::mem::take(&mut self.history),
         };
-        let has_more = self.fav_has_more && matches!(source, PaneSource::Favorites);
+        let has_more = match source {
+            PaneSource::Search => self.search_has_more,
+            PaneSource::Favorites => self.fav_has_more,
+            PaneSource::History => false,
+        };
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -979,11 +986,20 @@ impl App {
                     });
                 });
                 ui.add_space(18.0);
-                if has_more {
+                if has_more || self.loading_more {
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
-                        if ghost_button(ui, "加载更多", Some(icons::chevron), accent, false, true)
-                            .clicked()
+                        if self.loading_more {
+                            spinner(ui, 15.0, accent);
+                        } else if ghost_button(
+                            ui,
+                            "加载更多",
+                            Some(icons::chevron),
+                            accent,
+                            false,
+                            true,
+                        )
+                        .clicked()
                         {
                             load_more = true;
                         }
@@ -1007,9 +1023,19 @@ impl App {
             self.play_from_list(&list, index);
         }
         if load_more {
-            if let Some(media_id) = self.selected_folder {
-                let page = self.fav_page + 1;
-                self.send(crate::net::Cmd::LoadFavItems { media_id, page });
+            match source {
+                // A later page of the query already on screen.
+                PaneSource::Search => self.send(crate::net::Cmd::Search {
+                    keyword: self.last_keyword.clone(),
+                    page: self.search_page + 1,
+                }),
+                PaneSource::Favorites => {
+                    if let Some(media_id) = self.selected_folder {
+                        let page = self.fav_page + 1;
+                        self.send(crate::net::Cmd::LoadFavItems { media_id, page });
+                    }
+                }
+                PaneSource::History => {}
             }
         }
     }
@@ -1452,6 +1478,27 @@ mod tests {
             .map(|(_, rect)| rect)
     }
 
+    /// An app showing a finished search of two results.
+    fn app_with_results() -> (App, egui::Context) {
+        let (mut app, ctx) = focused_app(&[]);
+        app.search_history_open = false;
+        app.searching = false;
+        app.last_keyword = "周杰伦".to_owned();
+        app.results = ["BV1demo0001", "BV1demo0002"]
+            .iter()
+            .map(|bvid| Track {
+                bvid: (*bvid).to_owned(),
+                aid: 0,
+                cid: 0,
+                title: format!("【无损音质】盘点{bvid}首经典歌曲"),
+                author: "华语音乐馆".to_owned(),
+                duration: 271,
+                cover: None,
+            })
+            .collect();
+        (app, ctx)
+    }
+
     /// An app whose search field is focused, with `history` as its search log.
     fn focused_app(history: &[&str]) -> (App, egui::Context) {
         std::env::set_var("HOME", "/tmp/listenbli-search-tests");
@@ -1576,6 +1623,31 @@ mod tests {
         click_painted(&ctx, &mut app, "晴天", central);
         assert_eq!(app.search_input, "晴天", "a chip should re-run that search");
         assert_eq!(app.search_history()[0], "晴天");
+    }
+
+    /// The results list only offers "加载更多" while the server says so, and
+    /// swaps it for a spinner while the next page is in flight.
+    #[test]
+    fn the_results_list_offers_loading_more_pages() {
+        let (mut app, ctx) = app_with_results();
+        app.search_has_more = true;
+        let output = central(&ctx, &mut app, vec![]);
+        assert!(painted(&output, "加载更多"), "more pages should be offered");
+
+        app.loading_more = true;
+        let output = central(&ctx, &mut app, vec![]);
+        assert!(
+            !painted(&output, "加载更多"),
+            "a page in flight replaces the button with a spinner"
+        );
+
+        app.loading_more = false;
+        app.search_has_more = false;
+        let output = central(&ctx, &mut app, vec![]);
+        assert!(
+            !painted(&output, "加载更多"),
+            "the last page should not offer more"
+        );
     }
 
     /// The dropdown can be emptied, and closes itself once it is.

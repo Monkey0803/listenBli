@@ -56,8 +56,13 @@ pub struct App {
 
     pub(crate) search_input: String,
     pub(crate) searching: bool,
+    /// A page *after* the first one is in flight, so the list stays put.
+    pub(crate) loading_more: bool,
     pub(crate) last_keyword: String,
     pub(crate) results: Vec<Track>,
+    /// Highest result page loaded for `last_keyword`.
+    pub(crate) search_page: u32,
+    pub(crate) search_has_more: bool,
 
     pub(crate) queue: Vec<Track>,
     pub(crate) queue_pos: usize,
@@ -149,8 +154,11 @@ impl App {
             tab: Tab::Search,
             search_input: String::new(),
             searching: false,
+            loading_more: false,
             last_keyword: String::new(),
             results: Vec::new(),
+            search_page: 1,
+            search_has_more: false,
             queue: Vec::new(),
             queue_pos: 0,
             current: None,
@@ -429,26 +437,56 @@ impl App {
 
     fn handle_event(&mut self, ctx: &egui::Context, evt: Evt) {
         match evt {
-            Evt::SearchStarted { keyword } => {
-                self.searching = true;
-                self.last_keyword = keyword;
-                self.results.clear();
+            Evt::SearchStarted { keyword, page } => {
+                if page <= 1 {
+                    self.searching = true;
+                    self.last_keyword = keyword;
+                    self.results.clear();
+                    self.search_page = 1;
+                    self.search_has_more = false;
+                } else {
+                    // Appending: the rows already on screen must stay there.
+                    self.loading_more = true;
+                }
             }
             Evt::SearchResults {
                 keyword,
                 page,
                 tracks,
+                has_more,
             } => {
                 self.searching = false;
+                self.loading_more = false;
                 // Ignore a late response for a query the user already replaced.
                 if keyword != self.last_keyword {
                     return;
                 }
+                let mut has_more = has_more;
                 if page <= 1 {
                     self.results = tracks;
                 } else {
-                    self.results.extend(tracks);
+                    // Bilibili's ranking is not stable between requests: live
+                    // runs showed page 2 repeating several of page 1's videos,
+                    // so appending has to skip what is already listed.
+                    let before = self.results.len();
+                    for track in tracks {
+                        let already_listed = self
+                            .results
+                            .iter()
+                            .any(|listed| listed.key() == track.key());
+                        if !already_listed {
+                            self.results.push(track);
+                        }
+                    }
+                    // The server clamps an out-of-range page rather than
+                    // returning an empty one, so "this page added nothing" is
+                    // the reliable end-of-list signal.
+                    if self.results.len() == before {
+                        has_more = false;
+                    }
                 }
+                self.search_page = page.max(1);
+                self.search_has_more = has_more;
                 let snapshot = self.results.clone();
                 for track in &snapshot {
                     self.request_cover(track);
@@ -600,6 +638,8 @@ impl App {
             }
             Evt::Error { context, message } => {
                 self.loading = false;
+                self.searching = false;
+                self.loading_more = false;
                 self.download = None;
                 self.set_status(format!("{context}：{message}"), true);
             }
@@ -756,5 +796,188 @@ impl eframe::App for App {
         // Keeps the progress bar, equalizer and lyric highlight moving while
         // the app is otherwise idle.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The search paging state machine. "加载更多" appends to the list, so a
+    //! later page must never trigger the skeleton or wipe what is on screen.
+
+    use super::*;
+    use crate::net::Evt;
+
+    fn an_app() -> (App, egui::Context) {
+        std::env::set_var("HOME", "/tmp/listenbli-paging-tests");
+        let _ = std::fs::create_dir_all("/tmp/listenbli-paging-tests");
+        (App::new(Config::default()), egui::Context::default())
+    }
+
+    fn track(bvid: &str) -> Track {
+        Track {
+            bvid: bvid.to_owned(),
+            aid: 0,
+            cid: 0,
+            title: format!("标题 {bvid}"),
+            author: "音乐无限".to_owned(),
+            duration: 200,
+            cover: None,
+        }
+    }
+
+    fn results(keyword: &str, page: u32, ids: &[&str], has_more: bool) -> Evt {
+        Evt::SearchResults {
+            keyword: keyword.to_owned(),
+            page,
+            tracks: ids.iter().map(|id| track(id)).collect(),
+            has_more,
+        }
+    }
+
+    #[test]
+    fn a_later_page_is_appended_without_clearing_the_list() {
+        let (mut app, ctx) = an_app();
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "周杰伦".into(),
+                page: 1,
+            },
+        );
+        assert!(app.searching, "page 1 drives the skeleton");
+        app.handle_event(&ctx, results("周杰伦", 1, &["BV1", "BV2"], true));
+        assert!(!app.searching);
+        assert_eq!((app.search_page, app.search_has_more), (1, true));
+
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "周杰伦".into(),
+                page: 2,
+            },
+        );
+        assert!(app.loading_more, "page 2 is an append, not a fresh search");
+        assert!(!app.searching, "page 2 must not show the skeleton");
+        assert_eq!(app.results.len(), 2, "page 2 must not clear the list");
+
+        app.handle_event(&ctx, results("周杰伦", 2, &["BV3"], false));
+        assert_eq!(app.results.len(), 3);
+        assert_eq!((app.search_page, app.search_has_more), (2, false));
+        assert!(!app.loading_more);
+    }
+
+    #[test]
+    fn appending_a_page_skips_results_already_listed() {
+        let (mut app, ctx) = an_app();
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "周杰伦".into(),
+                page: 1,
+            },
+        );
+        app.handle_event(&ctx, results("周杰伦", 1, &["BV1", "BV2"], true));
+        // B 站第 2 页实测会重复第 1 页的部分视频。
+        app.handle_event(&ctx, results("周杰伦", 2, &["BV2", "BV3"], true));
+
+        let listed: Vec<&str> = app.results.iter().map(|t| t.bvid.as_str()).collect();
+        assert_eq!(listed, ["BV1", "BV2", "BV3"]);
+    }
+
+    #[test]
+    fn a_page_that_adds_nothing_ends_the_paging() {
+        let (mut app, ctx) = an_app();
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "周杰伦".into(),
+                page: 1,
+            },
+        );
+        app.handle_event(&ctx, results("周杰伦", 1, &["BV1", "BV2"], true));
+        // 越界页被服务端收敛：返回的还是那两首，且声称还有下一页。
+        app.handle_event(&ctx, results("周杰伦", 9, &["BV1", "BV2"], true));
+
+        assert_eq!(app.results.len(), 2);
+        assert!(
+            !app.search_has_more,
+            "a page with nothing new means the list is complete"
+        );
+    }
+
+    #[test]
+    fn a_new_query_restarts_at_page_one() {
+        let (mut app, ctx) = an_app();
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "周杰伦".into(),
+                page: 1,
+            },
+        );
+        app.handle_event(&ctx, results("周杰伦", 3, &["BV1"], true));
+        assert_eq!(app.results.len(), 1);
+        assert_eq!((app.search_page, app.search_has_more), (3, true));
+
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "米津玄師".into(),
+                page: 1,
+            },
+        );
+        assert!(
+            app.results.is_empty(),
+            "a new query starts from a clean list"
+        );
+        assert_eq!((app.search_page, app.search_has_more), (1, false));
+
+        app.handle_event(&ctx, results("米津玄師", 1, &["BV9"], true));
+        assert_eq!(app.results.len(), 1);
+        assert!(app.search_has_more);
+    }
+
+    #[test]
+    fn a_late_page_for_a_replaced_query_is_ignored() {
+        let (mut app, ctx) = an_app();
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "新查询".into(),
+                page: 1,
+            },
+        );
+
+        // The user typed a new keyword while page 2 of the old one was in flight.
+        app.handle_event(&ctx, results("旧查询", 2, &["BV1"], true));
+        assert!(
+            app.results.is_empty(),
+            "an outdated page must not be appended"
+        );
+        assert_eq!(app.search_page, 1);
+        assert!(!app.search_has_more);
+    }
+
+    #[test]
+    fn a_failed_page_stops_the_spinner() {
+        let (mut app, ctx) = an_app();
+        app.handle_event(
+            &ctx,
+            Evt::SearchStarted {
+                keyword: "周杰伦".into(),
+                page: 2,
+            },
+        );
+        assert!(app.loading_more);
+
+        app.handle_event(
+            &ctx,
+            Evt::Error {
+                context: "搜索失败".into(),
+                message: "网络错误".into(),
+            },
+        );
+        assert!(!app.loading_more, "the button must not spin forever");
+        assert!(!app.searching);
     }
 }

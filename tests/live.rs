@@ -59,8 +59,10 @@ fn wbi_signed_request_is_accepted() {
 #[ignore = "hits the live Bilibili API"]
 fn search_returns_normalized_tracks() {
     let api = api();
-    let tracks = search::search(&api, "周杰伦 晴天", 1).expect("search should succeed");
+    let page = search::search(&api, "周杰伦 晴天", 1).expect("search should succeed");
+    let tracks = page.tracks;
     assert!(!tracks.is_empty(), "expected results");
+    assert!(page.has_more, "a broad query should have a second page");
 
     let first = &tracks[0];
     assert!(
@@ -87,6 +89,56 @@ fn search_returns_normalized_tracks() {
         first.cover
     );
     println!("first result: {} ({})", first.title, first.bvid);
+}
+
+/// The UI's "加载更多" relies on `page` really changing the result set.
+#[test]
+#[ignore = "hits the live Bilibili API"]
+fn search_pages_return_different_results() {
+    let api = api();
+    let first = search::search(&api, "周杰伦", 1).expect("page 1 should succeed");
+    assert!(first.has_more, "expected a second page for a broad query");
+
+    let second = search::search(&api, "周杰伦", 2).expect("page 2 should succeed");
+    assert!(!second.tracks.is_empty(), "page 2 should have results");
+
+    let first_ids: std::collections::HashSet<&str> =
+        first.tracks.iter().map(|t| t.bvid.as_str()).collect();
+    let overlap = second
+        .tracks
+        .iter()
+        .filter(|t| first_ids.contains(t.bvid.as_str()))
+        .count();
+    let fresh = second.tracks.len() - overlap;
+    println!(
+        "page 1 = {} results, page 2 = {} results, {overlap} repeated, {fresh} new",
+        first.tracks.len(),
+        second.tracks.len()
+    );
+    // B 站的分页排序不稳定：实测第 2 页会重复第 1 页里的 4 首。App 在追加时按
+    // bvid 去重，所以这里只要求第 2 页确实带来了新结果。
+    assert!(
+        fresh >= second.tracks.len() / 2,
+        "page 2 should mostly be new results, only {fresh} of {} were",
+        second.tracks.len()
+    );
+
+    assert!(
+        first.num_pages > 1,
+        "the server should report its page count, got {}",
+        first.num_pages
+    );
+
+    // Far past the end: Bilibili clamps the page (it answers with videos rather
+    // than an empty page), but it must stop advertising a next page. The app
+    // additionally stops when a page adds nothing new.
+    let beyond = search::search(&api, "周杰伦", 9999).expect("a far page should still answer");
+    println!(
+        "page 9999 = {} results, has_more = {} (clamped, not empty)",
+        beyond.tracks.len(),
+        beyond.has_more
+    );
+    assert!(!beyond.has_more, "no page beyond the end may offer another");
 }
 
 #[test]
@@ -169,7 +221,9 @@ fn lyrics_fall_back_to_netease() {
 #[ignore = "hits the live Bilibili and NetEase APIs"]
 fn lyrics_match_a_chinese_song_whose_title_carries_the_artist() {
     let api = api();
-    let tracks = search::search(&api, "周杰伦 晴天", 1).expect("search should succeed");
+    let tracks = search::search(&api, "周杰伦 晴天", 1)
+        .expect("search should succeed")
+        .tracks;
     let mut track = tracks
         .into_iter()
         .find(|t| t.title.contains("晴天"))
