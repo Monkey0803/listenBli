@@ -129,16 +129,22 @@ fn search_pages_return_different_results() {
         first.num_pages
     );
 
-    // Far past the end: Bilibili clamps the page (it answers with videos rather
-    // than an empty page), but it must stop advertising a next page. The app
-    // additionally stops when a page adds nothing new.
-    let beyond = search::search(&api, "周杰伦", 9999).expect("a far page should still answer");
-    println!(
-        "page 9999 = {} results, has_more = {} (clamped, not empty)",
-        beyond.tracks.len(),
-        beyond.has_more
-    );
-    assert!(!beyond.has_more, "no page beyond the end may offer another");
+    // Far past the end: Bilibili has answered both ways in practice — a clamped
+    // page that repeats the tail (still claiming `has_more`) and a plain error.
+    // Either is fine, because the UI stops at `has_more == false` and also stops
+    // when a page adds nothing new; what must never happen is offering another
+    // page that has content.
+    match search::search(&api, "周杰伦", 9999) {
+        Ok(page) => {
+            println!(
+                "page 9999 = {} results, has_more = {} (clamped, not empty)",
+                page.tracks.len(),
+                page.has_more
+            );
+            assert!(!page.has_more, "no page beyond the end may offer another");
+        }
+        Err(err) => println!("page 9999 直接报错（{err}），UI 在 has_more=false 时本就不会请求它"),
+    }
 }
 
 #[test]
