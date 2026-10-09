@@ -1625,6 +1625,18 @@ mod tests {
         assert_eq!(app.search_history()[0], "晴天");
     }
 
+    /// Control case: a click on a row *inside a scroll area* must register.
+    #[test]
+    fn clicking_a_result_plays_it() {
+        let (mut app, ctx) = app_with_results();
+        click_painted(&ctx, &mut app, "BV1demo0001", central);
+        assert_eq!(
+            app.current.as_ref().map(|t| t.bvid.as_str()),
+            Some("BV1demo0001"),
+            "点击结果行应开始播放"
+        );
+    }
+
     /// The results list only offers "加载更多" while the server says so, and
     /// swaps it for a spinner while the next page is in flight.
     #[test]

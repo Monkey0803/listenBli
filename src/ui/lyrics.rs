@@ -182,8 +182,16 @@ impl App {
                 // `smooth_scroll_delta` is global input, so it has to be gated
                 // on the pointer being over the lyric body: scrolling the
                 // history list used to pause — and then re-enable — follow.
-                manual_scroll = ui.rect_contains_pointer(area)
-                    && ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5);
+                //
+                // A drag counts too, which is what makes the scroll bar (and
+                // egui's drag-to-scroll) pause follow instead of fighting it.
+                // The left edge is excluded because that is the panel's own
+                // resize handle.
+                let body = area.shrink2(Vec2::new(6.0, 0.0));
+                let over_body = ui.rect_contains_pointer(body);
+                let wheel = ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5);
+                let dragging = ui.ctx().dragged_id().is_some();
+                manual_scroll = over_body && (wheel || dragging);
 
                 ui.add_space(36.0);
                 let width = ui.available_width();
@@ -622,6 +630,110 @@ mod tests {
             frame(&ctx, &mut app, vec![]);
         }
         (app, ctx)
+    }
+
+    /// Enough lyrics that the body scrolls, so there is a scroll bar to grab.
+    fn app_with_long_lyrics() -> (App, egui::Context) {
+        let (mut app, ctx) = app_with_lyrics(true);
+        app.lyrics.lines = (0..40)
+            .map(|index| LyricLine {
+                time: Duration::from_secs(index * 5),
+                text: format!("第 {index} 行歌词"),
+                translation: None,
+            })
+            .collect();
+        for _ in 0..2 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        (app, ctx)
+    }
+
+    /// Dragging the scroll bar is a manual scroll too: it must pause follow
+    /// rather than be yanked back by the auto-centring every frame.
+    #[test]
+    fn dragging_the_lyric_scroll_bar_pauses_follow() {
+        let (mut app, ctx) = app_with_long_lyrics();
+        assert!(app.follow_lyrics);
+
+        let press = |pos: Pos2| {
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        let release = |pos: Pos2| {
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+
+        // The bar hugs the right edge of the lyric body; find it.
+        let mut grabbed = None;
+        'scan: for x in (1250..1280).rev() {
+            let from = Pos2::new(x as f32, 320.0);
+            let to = Pos2::new(x as f32, 220.0);
+            app.manual_scroll_at = None;
+            frame(&ctx, &mut app, vec![Event::PointerMoved(from)]);
+            frame(&ctx, &mut app, press(from));
+            frame(&ctx, &mut app, vec![Event::PointerMoved(to)]);
+            let paused = app.manual_scroll_at.is_some();
+            frame(&ctx, &mut app, release(to));
+            frame(&ctx, &mut app, vec![]);
+            if paused {
+                grabbed = Some(x);
+                break 'scan;
+            }
+        }
+
+        let x = grabbed.expect("no drag reached the lyric scroll bar (tried x = 1250..1280)");
+        println!("scroll bar grab hit x = {x}");
+        assert!(
+            x >= 1260,
+            "the drag should land on the bar at the right edge, not on a lyric line (x = {x})"
+        );
+        assert!(app.follow_lyrics, "a pause must not switch 跟随 off");
+    }
+
+    /// Clicking a lyric line still seeks, and is not mistaken for a scroll.
+    #[test]
+    fn clicking_a_lyric_line_seeks_without_pausing_follow() {
+        let (mut app, ctx) = app_with_long_lyrics();
+        // An engine seek without a loaded stream is silent, so dropping the
+        // engine is what makes the click observable: every seek then reports
+        // itself through the status line.
+        app.engine = None;
+
+        let mut seeked = Vec::new();
+        for y in (150..620).step_by(8) {
+            let pos = Pos2::new(1100.0, y as f32);
+            app.status = None;
+            click(&ctx, &mut app, pos);
+            assert!(
+                app.manual_scroll_at.is_none(),
+                "a click is not a manual scroll (y = {y})"
+            );
+            if app.status.is_some() {
+                seeked.push(y);
+            }
+        }
+
+        println!("点击歌词行命中的 y: {seeked:?}");
+        assert!(
+            seeked.len() > 5,
+            "clicking a lyric line should seek; only {} of the probed rows reacted",
+            seeked.len()
+        );
     }
 
     /// Both pills are hit-testable: each one flips its own switch.
