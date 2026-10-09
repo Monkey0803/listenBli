@@ -103,6 +103,10 @@ pub struct App {
     pub(crate) toast: Option<(String, Instant)>,
     /// Set by ⌘K; consumed by the search field on the next frame.
     pub(crate) focus_search: bool,
+    /// Whether the recent-search dropdown under the search field is showing.
+    /// Kept here rather than derived from focus, so clicking an entry does not
+    /// dismiss the list before the click is resolved.
+    pub(crate) search_history_open: bool,
     /// Identifies the installed font set so a settings change can be detected.
     pub(crate) fonts_key: String,
     /// Identifies the applied widget style, so it is only rebuilt on a change.
@@ -178,6 +182,7 @@ impl App {
             queue_open: false,
             toast: None,
             focus_search: false,
+            search_history_open: false,
             fonts_key,
             style_key: String::new(),
             cjk_path_input: config_path_input,
@@ -214,6 +219,25 @@ impl App {
     pub(crate) fn config_value<R>(&self, read: impl FnOnce(&Config) -> R) -> R {
         let guard = self.config.lock().unwrap();
         read(&guard)
+    }
+
+    // -- search history ----------------------------------------------------
+
+    /// The recent search keywords, newest first.
+    ///
+    /// The configuration is the only place they live, so the list the panel
+    /// shows can never drift from the one on disk.
+    pub(crate) fn search_history(&self) -> Vec<String> {
+        self.config_value(|config| config.search_history.clone())
+    }
+
+    /// Record a search the user actually ran.
+    pub(crate) fn remember_search(&mut self, keyword: &str) {
+        self.update_config(|config| config.remember_search(keyword));
+    }
+
+    pub(crate) fn clear_search_history(&mut self) {
+        self.update_config(|config| config.search_history.clear());
     }
 
     pub(crate) fn is_playing(&self) -> bool {

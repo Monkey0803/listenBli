@@ -468,6 +468,7 @@ impl App {
     fn search_field(&mut self, ui: &mut Ui) {
         let accent = self.theme.accent;
         let cleared = self.search_input.is_empty();
+        let mut focus_requested = false;
 
         let frame = egui::Frame::NONE
             .fill(Color32::from_black_alpha(107))
@@ -525,6 +526,7 @@ impl App {
             if self.focus_search {
                 edit.request_focus();
                 self.focus_search = false;
+                focus_requested = true;
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -579,6 +581,68 @@ impl App {
         if submitted && !self.search_input.trim().is_empty() {
             self.start_search();
         }
+
+        // The dropdown follows the field: it appears when the empty field takes
+        // focus and steps aside as soon as there is a query to run.
+        if !self.search_input.is_empty() {
+            self.search_history_open = false;
+        } else if focus_requested || inner.inner.gained_focus() {
+            self.search_history_open = true;
+        }
+        if self.search_history_open {
+            self.search_history_popup(&inner.response);
+        }
+    }
+
+    /// The recent-search dropdown: the last few queries, click to run one again.
+    fn search_history_popup(&mut self, anchor: &egui::Response) {
+        let history = self.search_history();
+        if history.is_empty() {
+            self.search_history_open = false;
+            return;
+        }
+
+        let mut picked: Option<String> = None;
+        let mut clear = false;
+        egui::Popup::from_response(anchor)
+            .open_bool(&mut self.search_history_open)
+            .align(egui::emath::RectAlign::BOTTOM_START)
+            .gap(8.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .frame(
+                egui::Frame::NONE
+                    .fill(t::INK_3)
+                    .corner_radius(t::R_LG)
+                    .inner_margin(Margin::same(6))
+                    .stroke(Stroke::new(1.0, t::LINE_2)),
+            )
+            .show(|ui| {
+                ui.set_min_width(anchor.rect.width().max(240.0));
+                ui.vertical(|ui| {
+                    ui.add_space(7.0);
+                    ui.label(RichText::new("搜索记录").size(11.0).color(t::FG_4));
+                    ui.add_space(3.0);
+                    for keyword in &history {
+                        if menu_item(ui, keyword, icons::clock, false) {
+                            picked = Some(keyword.clone());
+                        }
+                    }
+                    ui.add_space(6.0);
+                    hline(ui, ui.min_rect().bottom(), t::LINE);
+                    ui.add_space(6.0);
+                    if menu_item(ui, "清空搜索记录", icons::close, true) {
+                        clear = true;
+                    }
+                });
+            });
+
+        if let Some(keyword) = picked {
+            self.search_input = keyword;
+            self.start_search();
+        }
+        if clear {
+            self.clear_search_history();
+        }
     }
 
     pub(crate) fn start_search(&mut self) {
@@ -587,6 +651,9 @@ impl App {
             return;
         }
         self.tab = Tab::Search;
+        // Every search the user actually runs is remembered, whichever control
+        // started it (Enter, ⌘K, a suggestion chip or the history dropdown).
+        self.remember_search(&keyword);
         self.send(crate::net::Cmd::Search { keyword, page: 1 });
     }
 
@@ -845,11 +912,25 @@ impl App {
         }
 
         if self.results.is_empty() {
-            let suggestions: &[&str] = &["周杰伦 晴天", "米津玄師", "七里香"];
-            let desc = if keyword.is_empty() {
-                "listenBli 会把 B 站上的音乐/视频下载成音轨后直接播放，不需要登录即可获得 192K 音质。"
+            let examples: &[&str] = &["周杰伦 晴天", "米津玄師", "七里香"];
+            // The user's own recent searches are more useful than the built-in
+            // examples, but a first run still needs somewhere to start from.
+            let history = self.search_history();
+            let recent: Vec<&str> = history.iter().map(String::as_str).collect();
+            let (desc, suggestions): (&str, &[&str]) = if keyword.is_empty() && !recent.is_empty() {
+                (
+                    "下面是最近的搜索记录，点击即可重新搜索；也可以直接输入新的关键词。",
+                    &recent,
+                )
             } else {
-                "试试换一个关键词，或者用「歌手 + 歌名」的形式，例如「周杰伦 晴天」或「米津玄師 Lemon」。"
+                (
+                    if keyword.is_empty() {
+                        "listenBli 会把 B 站上的音乐/视频下载成音轨后直接播放，不需要登录即可获得 192K 音质。"
+                    } else {
+                        "试试换一个关键词，或者用「歌手 + 歌名」的形式，例如「周杰伦 晴天」或「米津玄師 Lemon」。"
+                    },
+                    examples,
+                )
             };
             let empty_title = if keyword.is_empty() {
                 "输入关键词开始搜索".to_owned()
@@ -1290,4 +1371,225 @@ impl App {
 fn status_dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 2.5, color);
+}
+
+#[cfg(test)]
+mod tests {
+    //! The search field is hand-painted, so these drive the real top bar and
+    //! then inspect both the state and what egui actually painted.
+
+    use super::*;
+    use crate::config::Config;
+    use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
+
+    fn raw(events: Vec<Event>) -> RawInput {
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+            events,
+            ..Default::default()
+        }
+    }
+
+    type Render = fn(&egui::Context, &mut App, Vec<Event>) -> egui::FullOutput;
+
+    /// The top bar, where the search field lives.
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
+        let mut output = ctx.run_ui(raw(events), |ui| {
+            egui::Panel::top("top_bar")
+                .exact_size(theme::TOP_BAR_H)
+                .frame(frames::top_bar())
+                .show(ui, |ui| app.ui_top_bar(ui));
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    /// The central pane, where the empty search state lives.
+    fn central(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
+        let mut output = ctx.run_ui(raw(events), |ui| {
+            egui::CentralPanel::default()
+                .frame(frames::list_pane())
+                .show(ui, |ui| app.ui_central(ui));
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    /// Every string egui painted, with the rect it was painted into.
+    fn painted_text(output: &egui::FullOutput) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let rect = Rect::from_min_size(text.pos, text.galley.size());
+                    out.push((text.galley.text().to_owned(), rect));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted(output: &egui::FullOutput, needle: &str) -> bool {
+        painted_text(output)
+            .iter()
+            .any(|(text, _)| text.contains(needle))
+    }
+
+    /// The rect `label` was painted into.
+    fn painted_rect(output: &egui::FullOutput, label: &str) -> Option<Rect> {
+        painted_text(output)
+            .into_iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, rect)| rect)
+    }
+
+    /// An app whose search field is focused, with `history` as its search log.
+    fn focused_app(history: &[&str]) -> (App, egui::Context) {
+        std::env::set_var("HOME", "/tmp/listenbli-search-tests");
+        let _ = std::fs::create_dir_all("/tmp/listenbli-search-tests");
+        let mut app = App::new(Config::default());
+        let history: Vec<String> = history.iter().map(|entry| (*entry).to_owned()).collect();
+        app.update_config(|config| config.search_history = history);
+        app.search_input.clear();
+        app.focus_search = true;
+
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx, None);
+        crate::ui::theme::install_style(&ctx, &app.theme);
+        // One frame to hand the field focus, one to draw the dropdown.
+        for _ in 0..2 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        (app, ctx)
+    }
+
+    /// Clicks whatever `label` was painted at.
+    fn click_painted(ctx: &egui::Context, app: &mut App, label: &str, render: Render) {
+        let listed = render(ctx, app, vec![]);
+        let target =
+            painted_rect(&listed, label).unwrap_or_else(|| panic!("{label} should be on screen"));
+        let pos = target.center();
+        let press = vec![
+            Event::PointerMoved(pos),
+            Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        let release = vec![
+            Event::PointerMoved(pos),
+            Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        render(ctx, app, vec![Event::PointerMoved(pos)]);
+        render(ctx, app, press);
+        render(ctx, app, release);
+        render(ctx, app, vec![Event::PointerMoved(pos)]);
+    }
+
+    /// Running a search writes it to the persisted history.
+    #[test]
+    fn a_search_is_remembered() {
+        let (mut app, _ctx) = focused_app(&[]);
+        app.search_input = "周杰伦 晴天".to_owned();
+        app.start_search();
+        assert_eq!(app.search_history(), ["周杰伦 晴天"]);
+
+        app.search_input = "  ".to_owned();
+        app.start_search();
+        assert_eq!(app.search_history(), ["周杰伦 晴天"]);
+    }
+
+    /// An empty, focused field offers the recent searches.
+    #[test]
+    fn the_search_field_offers_the_recent_searches() {
+        let (_app, ctx) = focused_app(&["米津玄師", "晴天"]);
+        let mut app = _app;
+
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&output, "搜索记录"),
+            "the dropdown should be titled"
+        );
+        assert!(
+            painted(&output, "米津玄師"),
+            "the newest entry should be listed"
+        );
+        assert!(
+            painted(&output, "晴天"),
+            "older entries should be listed too"
+        );
+        assert!(
+            painted(&output, "清空搜索记录"),
+            "the history should be clearable"
+        );
+
+        // Typing narrows the field to a search, so the history steps aside.
+        app.search_input = "晴".to_owned();
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(!painted(&output, "清空搜索记录"));
+    }
+
+    /// Clicking an entry re-runs that search and promotes it to the top.
+    #[test]
+    fn clicking_a_recent_search_runs_it_again() {
+        let (mut app, ctx) = focused_app(&["米津玄師", "晴天"]);
+
+        click_painted(&ctx, &mut app, "晴天", frame);
+
+        assert_eq!(
+            app.search_input, "晴天",
+            "the entry should re-run as a search"
+        );
+        // Running it moved it back to the top of the list.
+        assert_eq!(app.search_history()[0], "晴天");
+    }
+
+    /// The empty search pane offers the same log as chips.
+    #[test]
+    fn the_empty_pane_lists_the_recent_searches() {
+        let (mut app, ctx) = focused_app(&["米津玄師", "晴天"]);
+        app.search_history_open = false;
+
+        let output = central(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&output, "最近的搜索记录"),
+            "the pane should explain the chips"
+        );
+        assert!(painted(&output, "米津玄師") && painted(&output, "晴天"));
+
+        click_painted(&ctx, &mut app, "晴天", central);
+        assert_eq!(app.search_input, "晴天", "a chip should re-run that search");
+        assert_eq!(app.search_history()[0], "晴天");
+    }
+
+    /// The dropdown can be emptied, and closes itself once it is.
+    #[test]
+    fn the_recent_searches_can_be_cleared() {
+        let (mut app, ctx) = focused_app(&["米津玄師", "晴天"]);
+        assert!(app.search_history_open);
+
+        click_painted(&ctx, &mut app, "清空搜索记录", frame);
+
+        assert!(app.search_history().is_empty(), "the log should be cleared");
+        assert!(
+            !app.search_history_open,
+            "an empty history should dismiss the dropdown"
+        );
+    }
 }

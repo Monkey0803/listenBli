@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::api::cookie::CookieJar;
 use crate::platform;
 
+/// How many recent search keywords are kept.
+pub const MAX_SEARCH_HISTORY: usize = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_version")]
@@ -20,6 +23,9 @@ pub struct Config {
     /// Show the NetEase translation line under the original when available.
     #[serde(default = "default_true")]
     pub prefer_translation: bool,
+    /// Recent search keywords, most recent first.
+    #[serde(default)]
+    pub search_history: Vec<String>,
     /// Override the auto-detected system CJK font.
     #[serde(default)]
     pub cjk_font_path: Option<PathBuf>,
@@ -74,6 +80,7 @@ impl Default for Config {
             volume: default_volume(),
             prefer_flac: false,
             prefer_translation: true,
+            search_history: Vec::new(),
             cjk_font_path: None,
             cjk_font: default_cjk_font(),
             accent: default_accent(),
@@ -91,6 +98,22 @@ impl Config {
 
     /// Never fails: a corrupt or absent file yields defaults so that a bad
     /// config can not stop the application from starting.
+    /// Record `keyword` as the most recent search.
+    ///
+    /// Searching something twice moves it back to the top instead of adding a
+    /// duplicate, and the list never grows past [`MAX_SEARCH_HISTORY`].
+    pub fn remember_search(&mut self, keyword: &str) {
+        let keyword = keyword.trim();
+        if keyword.is_empty() {
+            return;
+        }
+        let lower = keyword.to_lowercase();
+        self.search_history
+            .retain(|older| older.to_lowercase() != lower);
+        self.search_history.insert(0, keyword.to_owned());
+        self.search_history.truncate(MAX_SEARCH_HISTORY);
+    }
+
     pub fn load() -> Self {
         let path = Self::path();
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -155,6 +178,7 @@ mod tests {
         assert_eq!(config.density, "comfortable");
         assert_eq!(config.cjk_font, "auto");
         assert!((config.lyric_size - 15.5).abs() < f32::EPSILON);
+        assert!(config.search_history.is_empty());
     }
 
     #[test]
@@ -166,6 +190,54 @@ mod tests {
         let back: Config = serde_json::from_str(&text).unwrap();
         assert!(back.prefer_flac);
         assert_eq!(back.cookies.get("bilibili.com", "SESSDATA"), Some("secret"));
+    }
+
+    #[test]
+    fn search_history_keeps_the_newest_first() {
+        let mut config = Config::default();
+        config.remember_search("周杰伦 晴天");
+        config.remember_search("米津玄師");
+        assert_eq!(config.search_history, ["米津玄師", "周杰伦 晴天"]);
+    }
+
+    #[test]
+    fn searching_again_moves_a_keyword_back_to_the_top() {
+        let mut config = Config::default();
+        for keyword in ["a", "b", "c"] {
+            config.remember_search(keyword);
+        }
+        // Re-searching an old keyword promotes it instead of duplicating it,
+        // and matching ignores case.
+        config.remember_search("A");
+        assert_eq!(config.search_history, ["A", "c", "b"]);
+    }
+
+    #[test]
+    fn search_history_is_capped_and_trims_blank_queries() {
+        let mut config = Config::default();
+        for index in 0..MAX_SEARCH_HISTORY + 4 {
+            config.remember_search(&format!("query {index}"));
+        }
+        assert_eq!(config.search_history.len(), MAX_SEARCH_HISTORY);
+        assert_eq!(
+            config.search_history[0],
+            format!("query {}", MAX_SEARCH_HISTORY + 3)
+        );
+
+        config.remember_search("   ");
+        assert_eq!(config.search_history.len(), MAX_SEARCH_HISTORY);
+        assert!(!config
+            .search_history
+            .iter()
+            .any(|entry| entry.trim().is_empty()));
+    }
+
+    #[test]
+    fn search_history_round_trips_through_json() {
+        let mut config = Config::default();
+        config.remember_search("晴天");
+        let back: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(back.search_history, ["晴天"]);
     }
 
     #[test]
