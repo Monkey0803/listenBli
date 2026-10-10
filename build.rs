@@ -1,4 +1,5 @@
-//! Embed `assets/icon.ico` as the Windows executable's icon resource.
+//! Embed `assets/icon.ico` and the crate's version metadata as the Windows
+//! executable's resources.
 //!
 //! The window icon is set at runtime (`platform::app_icon`, passed to eframe), but
 //! Explorer, "Send to" and the shortcut-creator read the icon out of the PE
@@ -35,7 +36,8 @@ fn main() {
     // The resource script is generated so the icon path can be absolute: neither
     // rc.exe nor windres resolves a relative .ico against the script's directory.
     let script = out.join("listenbli.rc");
-    if let Err(err) = std::fs::write(&script, format!("IDI_ICON1 ICON \"{}\"\n", ico.display())) {
+    let contents = format!("IDI_ICON1 ICON \"{}\"\n{}", ico.display(), version_info());
+    if let Err(err) = std::fs::write(&script, contents) {
         println!("cargo:warning=写入 {script:?} 失败：{err}");
         return;
     }
@@ -98,6 +100,61 @@ fn main() {
          exe 图标资源不会嵌入：{}",
         errors.join("；")
     );
+}
+
+/// The `VERSIONINFO` block behind 属性 → 详细信息.
+///
+/// Without it the exe carries no product name, version or copyright at all. The
+/// values come from `CARGO_PKG_*`, which cargo exports to build scripts, so the
+/// crate stays the single source of truth — the same fields the macOS bundle
+/// fills into `Info.plist` from `Cargo.toml`.
+///
+/// The strings are deliberately ASCII: rc.exe reads the script in the system
+/// code page unless it carries a BOM, so a middle dot here would turn into
+/// mojibake (or a compile error) depending on the machine's locale.
+fn version_info() -> String {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let description = std::env::var("CARGO_PKG_DESCRIPTION").unwrap_or_default();
+    let repository = std::env::var("CARGO_PKG_REPOSITORY").unwrap_or_default();
+    let copyright = if repository.is_empty() {
+        "MIT licensed".to_owned()
+    } else {
+        format!("MIT licensed - {repository}")
+    };
+    // FILEVERSION wants four numbers, so "0.1.0" becomes "0,1,0,0".
+    let mut parts: Vec<u16> = version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+    parts.resize(4, 0);
+    let numeric = format!("{},{},{},{}", parts[0], parts[1], parts[2], parts[3]);
+
+    format!(
+        "\
+1 VERSIONINFO\n\
+FILEVERSION {numeric}\n\
+PRODUCTVERSION {numeric}\n\
+FILEOS 0x40004L\n\
+FILETYPE 0x1L\n\
+BEGIN\n\
+  BLOCK \"StringFileInfo\"\n\
+  BEGIN\n\
+    BLOCK \"080404B0\"\n\
+    BEGIN\n\
+      VALUE \"FileDescription\", \"{description}\"\n\
+      VALUE \"FileVersion\", \"{version}\"\n\
+      VALUE \"LegalCopyright\", \"{copyright}\"\n\
+      VALUE \"OriginalFilename\", \"listenbli.exe\"\n\
+      VALUE \"ProductName\", \"listenBli\"\n\
+      VALUE \"ProductVersion\", \"{version}\"\n\
+    END\n\
+  END\n\
+  BLOCK \"VarFileInfo\"\n\
+  BEGIN\n\
+    VALUE \"Translation\", 0x0804, 1200\n\
+  END\n\
+END\n"
+    )
 }
 
 fn path(p: &Path) -> String {

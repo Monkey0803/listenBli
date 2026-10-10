@@ -43,8 +43,23 @@ APP_NAME="ListenBli"
 BUNDLE_ID="${BUNDLE_ID:-com.listenbli.app}"
 EXECUTABLE="listenBli"
 MIN_MACOS="${MIN_MACOS:-11.0}"
+
+# Cargo.toml is the single source of truth for the version and the project URL,
+# so the About panel cannot drift from the crate.
 VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
 VERSION="${VERSION:-0.0.0}"
+REPOSITORY="$(sed -n 's/^repository *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+
+# macOS prints `CFBundleVersion` in parentheses in the About panel, so filling it
+# with the version again would read "0.1.0 (0.1.0)". The commit count is the
+# monotonic build number that key is meant to hold.
+BUILD="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || true)"
+BUILD="${BUILD:-1}"
+
+COPYRIGHT="MIT licensed"
+if [ -n "$REPOSITORY" ]; then
+  COPYRIGHT="$COPYRIGHT · $REPOSITORY"
+fi
 
 APP="dist/$APP_NAME.app"
 
@@ -105,6 +120,8 @@ cp "assets/ListenBli.icns" "$APP/Contents/Resources/ListenBli.icns"
 sed -e "s|@EXECUTABLE@|$EXECUTABLE|g" \
     -e "s|@BUNDLE_ID@|$BUNDLE_ID|g" \
     -e "s|@VERSION@|$VERSION|g" \
+    -e "s|@BUILD@|$BUILD|g" \
+    -e "s|@COPYRIGHT@|$COPYRIGHT|g" \
     -e "s|@MIN_MACOS@|$MIN_MACOS|g" \
     packaging/macos/Info.plist.in > "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
@@ -124,6 +141,7 @@ codesign --verify --strict "$APP"
 
 echo
 echo "built $ROOT/$APP"
-echo "  version : $VERSION"
+echo "  version : $VERSION (build $BUILD)"
+echo "  repo    : ${REPOSITORY:-（未在 Cargo.toml 里写 repository）}"
 echo "  arch    : $(lipo -archs "$APP/Contents/MacOS/$EXECUTABLE" 2>/dev/null || echo unknown)"
 echo "  open it : open \"$ROOT/$APP\""
