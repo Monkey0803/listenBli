@@ -724,7 +724,7 @@ mod tests {
 
     /// App a queue and render the player bar with the popup open, then report
     /// what is visible: the header's y and every queue row's y.
-    fn queue_popup(count: usize) -> (Vec<(String, f32)>, f32, f32) {
+    fn queue_popup(count: usize) -> (Vec<(String, f32)>, f32, f32, Vec<egui::epaint::RectShape>) {
         std::env::set_var("HOME", "/tmp/listenbli-queue-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-queue-tests");
 
@@ -776,12 +776,54 @@ mod tests {
             .find(|(text, _)| text == "播放列表")
             .map(|(_, y)| *y)
             .expect("the popup header is painted");
-        let rows: Vec<(String, f32)> = ink
-            .iter()
+        (ink, chip_y, header_y, painted_rects(&out))
+    }
+
+    /// Filled rects, clip-aware like `painted_ink` (the one in `ui::tests` is
+    /// private to that module).
+    fn painted_rects(output: &egui::FullOutput) -> Vec<egui::epaint::RectShape> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            if !clipped
+                .clip_rect
+                .intersects(clipped.shape.visual_bounding_rect())
+            {
+                continue;
+            }
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// The queue rows among the painted strings.
+    fn queue_rows(ink: &[(String, f32)]) -> Vec<(String, f32)> {
+        ink.iter()
             .filter(|(text, _)| text.starts_with("队列曲目"))
             .cloned()
-            .collect();
-        (rows, chip_y, header_y)
+            .collect()
+    }
+
+    /// Filled rects small enough to be the meter's bars.
+    fn meter_bars(rects: &[egui::epaint::RectShape]) -> usize {
+        rects
+            .iter()
+            .filter(|shape| {
+                shape.rect.width() <= 4.0
+                    && shape.rect.height() <= 12.0
+                    && shape.rect.height() >= 3.0
+            })
+            .count()
     }
 
     /// The popup used to shrink to its content, so a three-song queue came out a
@@ -793,12 +835,37 @@ mod tests {
     /// against the 198 asked for here).
     #[test]
     fn a_short_queue_still_gets_a_full_height_panel() {
-        let (rows, chip_y, header_y) = queue_popup(3);
+        let (ink, chip_y, header_y, _) = queue_popup(3);
+        let rows = queue_rows(&ink);
         assert_eq!(rows.len(), 3, "all three rows should be visible: {rows:?}");
         let panel_h = chip_y - header_y;
         assert!(
             panel_h >= QUEUE_LIST_MIN_H,
             "a three-song queue left only {panel_h:.0}px of panel, want >= {QUEUE_LIST_MIN_H}"
+        );
+    }
+
+    /// The queue's playing row must not carry a play glyph.
+    ///
+    /// It used to paint the text character `▶`, which reads as "press to play" on
+    /// the row that is already playing — and, being a font glyph, sat oddly beside
+    /// a hand-painted icon set. It shows the level meter instead.
+    #[test]
+    fn the_queue_playing_row_offers_to_play_nowhere() {
+        let (ink, _, _, rects) = queue_popup(3);
+        let glyphs: Vec<&String> = ink
+            .iter()
+            .map(|(text, _)| text)
+            .filter(|text| text.contains('▶') || text.contains('⏸'))
+            .collect();
+        assert!(
+            glyphs.is_empty(),
+            "no transport glyph belongs on a queue row: {glyphs:?}"
+        );
+        assert!(
+            meter_bars(&rects) >= 4,
+            "the four meter bars should be painted for the playing row, found {}",
+            meter_bars(&rects)
         );
     }
 
@@ -810,7 +877,8 @@ mod tests {
     /// and that the rest scroll — never that rows are painted out of sight.
     #[test]
     fn a_long_queue_fills_the_panel_without_spilling_behind_the_bar() {
-        let (rows, chip_y, _) = queue_popup(20);
+        let (ink, chip_y, _, _) = queue_popup(20);
+        let rows = queue_rows(&ink);
         assert!(
             rows.len() >= 9,
             "a 20-song queue should fill the panel, got {} rows: {rows:?}",
