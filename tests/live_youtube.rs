@@ -136,6 +136,52 @@ fn a_resolved_stream_is_a_fragmented_mp4_in_reach() {
     );
 }
 
+/// The case that broke on a real desktop: a long music compilation that the
+/// headset client answers with "Sign in to confirm you're not a bot".
+///
+/// The chain has to fall through to another client, so this asserts on the chain —
+/// what any single client does is logged, not asserted, because the gate moves
+/// between videos and over time.
+#[test]
+#[ignore = "hits the live YouTube service"]
+fn a_gated_music_compilation_still_resolves() {
+    use listenbli::api::youtube::{ClientKind, InnerTube};
+
+    // Measured: the headset client refuses these with LOGIN_REQUIRED, the phone
+    // client answers with two AAC streams.
+    const GATED: &str = "9mplI5qEhxk";
+
+    let http = InnerTube::new();
+    match listenbli::api::youtube::player::resolve(&http, ClientKind::AndroidVr, GATED) {
+        Ok(playable) => println!(
+            "note: AndroidVr now answers for this video ({} picks) — the gate moved",
+            playable.picks.len()
+        ),
+        Err(err) => println!("AndroidVr refused as expected: {err}"),
+    }
+
+    let youtube = Youtube::new();
+    let playable = youtube
+        .resolve(GATED)
+        .expect("the fallback chain should resolve a gated video");
+    println!(
+        "resolved via the chain: {} — {}s, {} decodable stream(s)",
+        playable.title,
+        playable.duration,
+        playable.picks.len()
+    );
+    assert!(!playable.title.is_empty());
+    assert!(
+        playable.duration > 600,
+        "a long compilation: {}",
+        playable.duration
+    );
+    assert!(
+        playable.best_audio().is_some(),
+        "the fallback must yield something the decoder can open"
+    );
+}
+
 /// Searching YouTube through the worker, exactly as the UI does it.
 ///
 /// This is the milestone-5 wiring check: the app sends one command with a platform

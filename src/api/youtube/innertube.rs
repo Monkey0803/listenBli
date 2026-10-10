@@ -11,16 +11,22 @@
 //! | client | search | playback |
 //! |---|---|---|
 //! | `WEB` | works, 18 results a page | `playabilityStatus: UNPLAYABLE` — playback now needs a PoToken |
-//! | `ANDROID_VR` | returns `sectionListRenderer` with no videos | `OK`, direct URLs, no cipher |
+//! | `ANDROID_VR` | returns `sectionListRenderer` with no videos | `OK`, direct URLs — but **only for some videos** |
+//! | `IOS` | — | `OK`, direct URLs, and it answers where `ANDROID_VR` refuses |
 //! | `TVHTML5_SIMPLY_EMBEDDED_PLAYER` | — | "YouTube is no longer supported in this application or device" |
 //!
 //! So searching asks `WEB` and resolving a stream asks `ANDROID_VR`. Both are
 //! allowed to stop working at any release; [`ClientKind::PLAYBACK_FALLBACKS`] is
 //! the list to try, in order, when one does.
 //!
-//! `IOS` is deliberately absent: the context fields that make it answer were not
-//! established here (a partial context got an HTTP 400), and a client that is only
-//! *believed* to work is worse than a list that says what was measured.
+//!
+//! `ANDROID_VR` is gated per video, not globally: `dQw4w9WgXcQ` resolved fine while
+//! long Chinese music compilations came back `LOGIN_REQUIRED` — "Sign in to confirm
+//! you're not a bot". `IOS` returned `OK` with two AAC streams for both of those,
+//! and its stream is the same shape (`contentLength`, `initRange`, a 206 ranged GET
+//! whose head is `ftyp`+`moov`+`sidx`), so it is the fallback. A `visitorData` was
+//! tried and did *not* lift the gate. `IOS` answers 400 to a partial context: the
+//! device fields *and* a `userAgent`, both inside `context.client`, are required.
 
 use std::time::Duration;
 
@@ -41,13 +47,22 @@ const WEB_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKi
 const VR_UA: &str =
     "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; GB) gzip";
 
+/// The version `IOS` claims. It is its identity and its user agent, and the two
+/// must agree.
+const IOS_VERSION: &str = "20.10.4";
+const IOS_UA: &str = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)";
+
 /// Which client identity a request claims to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
     /// The web player. Search works here; playback does not.
     Web,
-    /// The Quest headset client. Returns direct, un-ciphered audio URLs.
+    /// The Quest headset client. Returns direct, un-ciphered audio URLs, but is
+    /// gated per video.
     AndroidVr,
+    /// The iPhone client. Answers with direct URLs for the videos `ANDROID_VR`
+    /// refuses.
+    Ios,
 }
 
 impl ClientKind {
@@ -56,7 +71,7 @@ impl ClientKind {
     /// One entry today because it is the one that was verified. The list exists so
     /// that adding a fallback — or removing a dead one — is a one-line change in
     /// the place that documents why.
-    pub const PLAYBACK_FALLBACKS: &'static [ClientKind] = &[ClientKind::AndroidVr];
+    pub const PLAYBACK_FALLBACKS: &'static [ClientKind] = &[ClientKind::AndroidVr, ClientKind::Ios];
 
     /// The `context.client` object this identity sends.
     ///
@@ -77,6 +92,17 @@ impl ClientKind {
                 "osVersion": "12",
                 "androidSdkVersion": 32,
             }),
+            // A partial context gets a 400: the device fields *and* the user agent
+            // are required, and the user agent belongs inside the context too.
+            ClientKind::Ios => json!({
+                "clientName": "IOS",
+                "clientVersion": IOS_VERSION,
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22D82",
+                "userAgent": IOS_UA,
+            }),
         }
     }
 
@@ -84,6 +110,7 @@ impl ClientKind {
         match self {
             ClientKind::Web => WEB_UA,
             ClientKind::AndroidVr => VR_UA,
+            ClientKind::Ios => IOS_UA,
         }
     }
 }
@@ -204,11 +231,38 @@ mod tests {
     }
 
     #[test]
-    fn the_two_identities_do_not_share_a_user_agent() {
-        assert_ne!(
-            ClientKind::Web.user_agent(),
-            ClientKind::AndroidVr.user_agent()
+    fn every_identity_has_its_own_user_agent() {
+        let mut agents: Vec<&str> = [ClientKind::Web, ClientKind::AndroidVr, ClientKind::Ios]
+            .iter()
+            .map(|client| client.user_agent())
+            .collect();
+        let before = agents.len();
+        agents.sort_unstable();
+        agents.dedup();
+        assert_eq!(agents.len(), before, "agents must differ");
+    }
+
+    /// The gate is per video, so the list has to have somewhere to fall through to.
+    #[test]
+    fn playback_has_a_fallback_for_gated_videos() {
+        assert_eq!(
+            ClientKind::PLAYBACK_FALLBACKS.first(),
+            Some(&ClientKind::AndroidVr)
         );
-        assert!(!ClientKind::PLAYBACK_FALLBACKS.is_empty());
+        assert!(
+            ClientKind::PLAYBACK_FALLBACKS.contains(&ClientKind::Ios),
+            "IOS is what answers when AndroidVr says LOGIN_REQUIRED"
+        );
+        // A partial IOS context is a 400, so the fields that lift it must be there.
+        let ios = ClientKind::Ios.context();
+        for field in [
+            "deviceMake",
+            "deviceModel",
+            "osName",
+            "osVersion",
+            "userAgent",
+        ] {
+            assert!(ios.get(field).is_some(), "IOS needs {field}: {ios}");
+        }
     }
 }
