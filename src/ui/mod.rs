@@ -1004,8 +1004,8 @@ impl App {
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
                         for (index, track) in tracks.iter().enumerate() {
-                            if track_row(ui, self, track, index).clicked() {
-                                clicked = Some(index);
+                            if let Some(action) = track_row(ui, self, track, index) {
+                                clicked = Some((index, action));
                             }
                             ui.add_space(1.0);
                         }
@@ -1030,13 +1030,54 @@ impl App {
             PaneSource::History => self.history = tracks,
         }
 
-        if let Some(index) = clicked {
+        if let Some((index, action)) = clicked {
             let list = match source {
                 PaneSource::Search => self.results.clone(),
                 PaneSource::Favorites => self.fav_items.clone(),
                 PaneSource::History => self.history.clone(),
             };
-            self.play_from_list(&list, index);
+            let track = list.get(index).cloned();
+            match action {
+                RowAction::Play => self.play_from_list(&list, index),
+                RowAction::CopyLink => {
+                    if let Some(track) = &track {
+                        ui.ctx().copy_text(util::video_url(&track.bvid));
+                        self.notify("已复制视频链接");
+                    }
+                }
+                RowAction::OpenInBrowser => {
+                    if let Some(track) = &track {
+                        if let Err(err) = crate::platform::open_url(&util::video_url(&track.bvid)) {
+                            self.set_status(err, true);
+                        }
+                    }
+                }
+                RowAction::Enqueue | RowAction::EnqueueNext => {
+                    let next = action == RowAction::EnqueueNext;
+                    if let Some(track) = track {
+                        let title = track.title.clone();
+                        if self.enqueue(track, next) {
+                            self.notify(if next {
+                                format!("已排在下一首：{title}")
+                            } else {
+                                format!("已加入播放列表：{title}")
+                            });
+                        } else {
+                            self.notify("已经在播放列表里了");
+                        }
+                    }
+                }
+                RowAction::Cache => {
+                    if let Some(track) = track {
+                        let title = track.title.clone();
+                        if self.cache_track(&track) {
+                            self.notify(format!("正在缓存：{title}"));
+                        } else {
+                            self.notify("这首正在播放，音频已经在缓存了");
+                        }
+                    }
+                }
+            }
         }
 
         // Scrolling to the end fetches the next page by itself, so the rows are
@@ -1135,8 +1176,28 @@ fn spinner(ui: &mut Ui, size: f32, accent: Accent) {
     ui.ctx().request_repaint();
 }
 
-/// One row of the list. Clicking anywhere on it plays that track.
-pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> egui::Response {
+/// What a row was asked to do. The row cannot run any of it itself: it is painted
+/// while the list is borrowed out of `App`, so the click travels back to the pane
+/// that owns the `&mut App`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowAction {
+    /// The row body: make this the current track and start it.
+    Play,
+    /// `⋯` menu: put the video's page URL on the clipboard.
+    CopyLink,
+    /// `⋯` menu: hand that URL to the system browser.
+    OpenInBrowser,
+    /// `⋯` menu: append to the play queue.
+    Enqueue,
+    /// `⋯` menu: play it right after the current track.
+    EnqueueNext,
+    /// `⋯` menu: download it into the audio cache without playing it.
+    Cache,
+}
+
+/// One row of the list. Clicking anywhere on it plays that track; the `⋯` button
+/// opens the per-row menu instead, and both come back as a [`RowAction`].
+pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> Option<RowAction> {
     let accent = app.theme.accent;
     let row_h = app.theme.row_h;
     let compact = app.theme.compact();
@@ -1252,10 +1313,50 @@ pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> 
         t::mono_font(11.5),
         t::FG_3,
     );
-    if hovered {
+    // The `⋯` is its own widget, so clicking it opens the menu instead of
+    // playing: registered after the row, it wins the hit test on its own rect.
+    let more = ui.interact(
+        more_rect.expand(5.0),
+        ui.make_persistent_id(("track-more", track.key())),
+        Sense::click(),
+    );
+    if hovered || more.hovered() || more.has_focus() {
         painter.rect_filled(more_rect.expand(4.0), t::R_SM, t::white(0.07));
         icons::more(&painter, more_rect, t::FG);
     }
+    if more.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let mut action = None;
+    egui::Popup::menu(&more)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+        .align(egui::emath::RectAlign::BOTTOM_END)
+        .gap(4.0)
+        .frame(
+            egui::Frame::NONE
+                .fill(t::INK_3)
+                .corner_radius(t::R_LG)
+                .inner_margin(Margin::same(5))
+                .stroke(Stroke::new(1.0, t::LINE_2)),
+        )
+        .show(|ui| {
+            ui.set_min_width(186.0);
+            if menu_item(ui, "复制视频链接", icons::copy, false) {
+                action = Some(RowAction::CopyLink);
+            }
+            if menu_item(ui, "在浏览器打开", icons::external, false) {
+                action = Some(RowAction::OpenInBrowser);
+            }
+            if menu_item(ui, "加入播放列表", icons::queue, false) {
+                action = Some(RowAction::Enqueue);
+            }
+            if menu_item(ui, "下一首播放", icons::next, false) {
+                action = Some(RowAction::EnqueueNext);
+            }
+            if menu_item(ui, "缓存到本地", icons::download, false) {
+                action = Some(RowAction::Cache);
+            }
+        });
     if current {
         widgets::paint_badge(ui, badge_rect, &Badge::quality(app.quality));
     }
@@ -1330,7 +1431,10 @@ pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> 
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    response
+    if action.is_some() {
+        return action;
+    }
+    response.clicked().then_some(RowAction::Play)
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,6 +1736,40 @@ mod tests {
         render(ctx, app, vec![Event::PointerMoved(pos)]);
     }
 
+    /// Like [`click_painted`], but returns the frame the release landed in, so a
+    /// test can read what the app asked the platform to do (clipboard, opener).
+    fn click_painted_capturing(
+        ctx: &egui::Context,
+        app: &mut App,
+        label: &str,
+        render: Render,
+    ) -> egui::FullOutput {
+        let listed = render(ctx, app, vec![]);
+        let target =
+            painted_rect(&listed, label).unwrap_or_else(|| panic!("{label} should be on screen"));
+        click_at_capturing(ctx, app, target.center(), render)
+    }
+
+    /// Clicks an absolute position and returns the output of the release frame.
+    fn click_at_capturing(
+        ctx: &egui::Context,
+        app: &mut App,
+        pos: Pos2,
+        render: Render,
+    ) -> egui::FullOutput {
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        render(ctx, app, vec![Event::PointerMoved(pos)]);
+        render(ctx, app, vec![Event::PointerMoved(pos), button(true)]);
+        let release = render(ctx, app, vec![Event::PointerMoved(pos), button(false)]);
+        render(ctx, app, vec![Event::PointerMoved(pos)]);
+        release
+    }
+
     /// Clicks an absolute position: for hitting empty space, where nothing is
     /// painted to aim at.
     fn click_at(ctx: &egui::Context, app: &mut App, pos: Pos2, render: Render) {
@@ -1829,6 +1967,119 @@ mod tests {
             Some("BV1demo0001"),
             "点击结果行应开始播放"
         );
+    }
+
+    /// Where a row's `⋯` sits: the button is 12+42px clear of the duration
+    /// column and its own centre is 8px in, so it is 41px right of the centred
+    /// duration text. Aiming from painted geometry keeps the test honest — if
+    /// the row layout moves the button, the click misses and this fails.
+    fn more_button_of(painted: &[(String, Rect)], row: usize) -> Pos2 {
+        let durations: Vec<Rect> = painted
+            .iter()
+            .filter(|(text, _)| text == "04:31")
+            .map(|(_, rect)| *rect)
+            .collect();
+        let rect = durations
+            .get(row)
+            .unwrap_or_else(|| panic!("row {row} should paint its duration: {durations:?}"));
+        Pos2::new(rect.center().x + 41.0, rect.center().y)
+    }
+
+    /// Clicking `⋯` must open the row menu, not start the track: the button owns
+    /// its own rect, registered after the row's.
+    #[test]
+    fn the_row_menu_button_does_not_play_the_track() {
+        let (mut app, ctx) = app_with_results();
+        let listed = painted_text(&central(&ctx, &mut app, vec![]));
+        let target = more_button_of(&listed, 0);
+
+        click_at(&ctx, &mut app, target, central);
+
+        assert!(
+            app.current.is_none(),
+            "点 ⋯ 不应该开始播放，当前却变成了 {:?}",
+            app.current.as_ref().map(|t| t.bvid.as_str())
+        );
+        let output = central(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&output, "复制视频链接"),
+            "菜单应该弹出来：{:?}",
+            painted_text(&output)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every entry the menu promises is really there.
+    #[test]
+    fn the_row_menu_lists_its_actions() {
+        let (mut app, ctx) = app_with_results();
+        let listed = painted_text(&central(&ctx, &mut app, vec![]));
+        let target = more_button_of(&listed, 0);
+        click_at(&ctx, &mut app, target, central);
+
+        let output = central(&ctx, &mut app, vec![]);
+        for label in [
+            "复制视频链接",
+            "在浏览器打开",
+            "加入播放列表",
+            "下一首播放",
+            "缓存到本地",
+        ] {
+            assert!(painted(&output, label), "菜单里应该有 {label}");
+        }
+    }
+
+    /// 复制视频链接 hands the bilibili page URL to the clipboard.
+    #[test]
+    fn copying_a_video_link_reaches_the_clipboard() {
+        let (mut app, ctx) = app_with_results();
+        let listed = painted_text(&central(&ctx, &mut app, vec![]));
+        let target = more_button_of(&listed, 0);
+        click_at(&ctx, &mut app, target, central);
+
+        let output = click_painted_capturing(&ctx, &mut app, "复制视频链接", central);
+
+        let wanted = util::video_url("BV1demo0001");
+        let copied = output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &wanted),
+        );
+        assert!(
+            copied,
+            "应该把 {wanted} 交给剪贴板，实际是 {:?}",
+            output.platform_output.commands
+        );
+    }
+
+    /// The two queue entries differ: one appends, one goes right after the
+    /// current track.
+    #[test]
+    fn the_row_menu_queues_append_or_jump_the_line() {
+        let (mut app, ctx) = app_with_results();
+        let listed = painted_text(&central(&ctx, &mut app, vec![]));
+        let target = more_button_of(&listed, 0);
+        click_at(&ctx, &mut app, target, central);
+        click_painted(&ctx, &mut app, "加入播放列表", central);
+
+        let queued: Vec<&str> = app.queue.iter().map(|t| t.bvid.as_str()).collect();
+        assert_eq!(queued, ["BV1demo0001"], "加入播放列表应该把它排到队尾");
+
+        // The same row again: a duplicate is refused instead of queued twice.
+        let listed = painted_text(&central(&ctx, &mut app, vec![]));
+        let target = more_button_of(&listed, 0);
+        click_at(&ctx, &mut app, target, central);
+        click_painted(&ctx, &mut app, "加入播放列表", central);
+        assert_eq!(app.queue.len(), 1, "同一首不应该被排队两次");
+
+        // 下一首播放 on the *second* row inserts right after the first.
+        let listed = painted_text(&central(&ctx, &mut app, vec![]));
+        let target = more_button_of(&listed, 1);
+        click_at(&ctx, &mut app, target, central);
+        click_painted(&ctx, &mut app, "下一首播放", central);
+
+        let queued: Vec<&str> = app.queue.iter().map(|t| t.bvid.as_str()).collect();
+        assert_eq!(queued, ["BV1demo0001", "BV1demo0002"]);
     }
 
     /// Paging has no button any more: the tail of the list asks for the next

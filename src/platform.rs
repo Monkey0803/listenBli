@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use directories::ProjectDirs;
 
@@ -248,6 +249,56 @@ pub fn cjk_font_hint() -> String {
         .unwrap_or_else(|| "/path/to/font.ttc".to_owned())
 }
 
+/// Hand `url` to whatever the system uses for `https` links.
+///
+/// The URL is checked first: the Windows path goes through `cmd /C start`, and a
+/// string built from a network response is the last thing that should reach a
+/// shell unexamined. Only `https://` with characters a bilibili URL can contain
+/// gets through, so `javascript:` and friends are refused rather than launched.
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !is_safe_https(url) {
+        return Err(format!("拒绝打开可疑链接：{url}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    // `start` needs its own title argument, otherwise it treats a quoted URL as
+    // the window title.
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("打开浏览器失败：{err}"))
+}
+
+/// Whether `url` is an `https` URL made only of characters that can appear in
+/// one, which is what makes it safe to pass to a shell.
+fn is_safe_https(url: &str) -> bool {
+    const ALLOWED: &str = "-._~:/?#[]@!$&'()*+,;=%";
+    url.strip_prefix("https://").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ALLOWED.contains(c))
+    })
+}
+
 /// Best-effort tightening of file permissions for credential files.
 ///
 /// Unix gets `0600`. On Windows we do nothing: the file already lives under the
@@ -332,6 +383,30 @@ mod tests {
     fn config_and_cache_dirs_are_absolute() {
         assert!(config_dir().is_absolute());
         assert!(cache_dir().is_absolute());
+    }
+
+    /// `open_url` is the one place a URL from the network reaches a shell, so the
+    /// filter is what stands between a `javascript:` link and the system opener.
+    #[test]
+    fn only_plain_https_urls_are_opened() {
+        assert!(is_safe_https("https://www.bilibili.com/video/BV1fx411N7bU"));
+        assert!(is_safe_https("https://example.com/a?b=c&d=e#f"));
+
+        for rejected in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "http://www.bilibili.com/video/BV1",
+            "https://example.com/$(rm -rf ~)",
+            "https://example.com/`id`",
+            "https://example.com/\"quoted\"",
+            "https://",
+        ] {
+            assert!(!is_safe_https(rejected), "{rejected} should be refused");
+            assert!(
+                open_url(rejected).is_err(),
+                "{rejected} should not reach the opener"
+            );
+        }
     }
 
     /// The window icon is the artwork embedded at build time. If the asset moves

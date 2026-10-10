@@ -419,6 +419,40 @@ impl App {
         }
     }
 
+    /// Put `track` in the play queue: at the end, or right after the current one.
+    ///
+    /// Returns `false` when the queue already holds it — asking twice for the
+    /// same song should not queue it twice.
+    pub(crate) fn enqueue(&mut self, track: Track, next: bool) -> bool {
+        if self.queue.iter().any(|queued| queued.key() == track.key()) {
+            return false;
+        }
+        if next && !self.queue.is_empty() {
+            let at = (self.queue_pos + 1).min(self.queue.len());
+            self.queue.insert(at, track);
+        } else {
+            self.queue.push(track);
+        }
+        true
+    }
+
+    /// Ask the worker to cache `track` without touching playback.
+    ///
+    /// Refuses while the same track is being streamed into the cache: two
+    /// writers on one cache file would corrupt it, and the stream already ends
+    /// up cached anyway.
+    pub(crate) fn cache_track(&mut self, track: &Track) -> bool {
+        let streaming = self
+            .download
+            .as_ref()
+            .is_some_and(|(key, ..)| *key == track.key());
+        if streaming {
+            return false;
+        }
+        self.send(Cmd::CacheTrack(Box::new(track.clone())));
+        true
+    }
+
     /// Seek without ever freezing the UI thread.
     ///
     /// `Player::try_seek` blocks until the decoder has moved. For a track that is
@@ -661,6 +695,15 @@ impl App {
                 for track in &snapshot {
                     self.request_cover(track);
                 }
+            }
+            Evt::Cached { title, already } => {
+                // A cache-only download finished in the background: nothing on
+                // screen depended on it, so a toast is the whole reaction.
+                self.notify(if already {
+                    format!("已在缓存中：{title}")
+                } else {
+                    format!("已缓存：{title}")
+                });
             }
             Evt::Error { context, message } => {
                 self.loading = false;
@@ -1021,5 +1064,62 @@ mod tests {
         );
         assert!(!app.loading_more, "the button must not spin forever");
         assert!(!app.searching);
+    }
+
+    /// The row menu's queue entries: append at the end, or jump the line.
+    #[test]
+    fn enqueue_appends_and_refuses_duplicates() {
+        let (mut app, _ctx) = an_app();
+        assert!(app.enqueue(track("BV1"), false));
+        assert!(app.enqueue(track("BV2"), false));
+        assert_eq!(
+            app.queue
+                .iter()
+                .map(|t| t.bvid.as_str())
+                .collect::<Vec<_>>(),
+            ["BV1", "BV2"]
+        );
+
+        assert!(!app.enqueue(track("BV1"), false), "同一首不该排队两次");
+        assert_eq!(app.queue.len(), 2);
+    }
+
+    #[test]
+    fn enqueue_next_lands_right_after_the_current_track() {
+        let (mut app, _ctx) = an_app();
+        app.queue = vec![track("BV1"), track("BV3")];
+        app.queue_pos = 0;
+
+        assert!(app.enqueue(track("BV2"), true));
+
+        assert_eq!(
+            app.queue
+                .iter()
+                .map(|t| t.bvid.as_str())
+                .collect::<Vec<_>>(),
+            ["BV1", "BV2", "BV3"]
+        );
+    }
+
+    /// A cache-only request must never point a second writer at the file the
+    /// player is already streaming into.
+    #[test]
+    fn caching_is_refused_while_that_track_is_streaming() {
+        let (mut app, _ctx) = an_app();
+        let streaming = track("BV1");
+        assert!(
+            app.cache_track(&streaming),
+            "idle tracks should be accepted"
+        );
+
+        app.download = Some((streaming.key(), 128, Some(256)));
+        assert!(
+            !app.cache_track(&streaming),
+            "the streaming file must not get a second writer"
+        );
+        assert!(
+            app.cache_track(&track("BV2")),
+            "another track is unaffected"
+        );
     }
 }

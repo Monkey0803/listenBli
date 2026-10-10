@@ -135,6 +135,11 @@ pub fn format_duration(seconds: u64) -> String {
     }
 }
 
+/// The bilibili page a track was played from: `https://www.bilibili.com/video/BV…`.
+pub fn video_url(bvid: &str) -> String {
+    format!("https://www.bilibili.com/video/{bvid}")
+}
+
 /// Noise that uploaders prepend/append to song titles, which we must remove
 /// before querying a third-party lyrics provider.
 const NOISE_TOKENS: &[&str] = &[
@@ -425,6 +430,14 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_url_points_at_the_bilibili_page() {
+        assert_eq!(
+            video_url("BV1fx411N7bU"),
+            "https://www.bilibili.com/video/BV1fx411N7bU"
+        );
+    }
 
     #[test]
     fn strips_tags_and_entities() {

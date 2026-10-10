@@ -52,6 +52,8 @@ pub enum Cmd {
     },
     /// Resolve, download (if not cached) and hand back a playable file.
     LoadTrack(Box<Track>),
+    /// Download into the cache without touching playback.
+    CacheTrack(Box<Track>),
     QrStart,
     QrPoll {
         key: String,
@@ -93,6 +95,11 @@ pub enum Evt {
         key: String,
         got: u64,
         total: Option<u64>,
+    },
+    /// A cache-only download finished (or found the track already cached).
+    Cached {
+        title: String,
+        already: bool,
     },
     LyricsReady {
         key: String,
@@ -140,9 +147,13 @@ pub struct Worker {
 struct DownloadJob {
     track: Track,
     source: AudioSource,
+    /// Whether the UI wants to *play* this track once bytes are on disk. A
+    /// cache-only job just fills the cache and reports back.
+    play: bool,
     /// Which `LoadTrack` request this job belongs to; a job is abandoned as soon
-    /// as a newer request arrives.
-    generation: u64,
+    /// as a newer request arrives. Cache-only jobs carry `None`: they must never
+    /// supersede a playback request, and playback must not cancel them.
+    generation: Option<u64>,
 }
 
 /// Where the API worker fans its results out to.
@@ -281,7 +292,11 @@ fn dispatch(
         }
 
         Cmd::LoadTrack(track) => {
-            load_track(api, config, *track, sinks, request_id, cache);
+            load_track(api, config, *track, sinks, request_id, cache, true);
+        }
+
+        Cmd::CacheTrack(track) => {
+            load_track(api, config, *track, sinks, request_id, cache, false);
         }
 
         Cmd::QrStart => match login::generate(api) {
@@ -447,6 +462,7 @@ fn load_track(
     sinks: &Sinks,
     request_id: &Arc<AtomicU64>,
     cache: &AudioCache,
+    play: bool,
 ) {
     let evt_tx = &sinks.events;
     let job_tx = &sinks.downloads;
@@ -464,7 +480,10 @@ fn load_track(
     }
 
     let key = track.key();
-    let _ = evt_tx.send(Evt::TrackResolved(Box::new(track.clone())));
+    if play {
+        // Cache-only jobs must not disturb what the list shows as playing.
+        let _ = evt_tx.send(Evt::TrackResolved(Box::new(track.clone())));
+    }
 
     let prefer_flac = config.lock().unwrap().prefer_flac;
     let playurl = match video::playurl(api, &track.bvid, track.cid) {
@@ -496,16 +515,24 @@ fn load_track(
 
     // Newest request wins; lets the download worker abandon older segments.
     // A generation counter rather than the cid, so re-clicking the same song
-    // also supersedes its earlier download.
-    let generation = request_id.fetch_add(1, Ordering::SeqCst) + 1;
+    // also supersedes its earlier download. Cache-only jobs stay out of that
+    // race in both directions.
+    let generation = play.then(|| request_id.fetch_add(1, Ordering::SeqCst) + 1);
 
     if let Some(path) = cache.get(track.cid, source.quality) {
-        // Fully cached: plain, non-blocking playback.
-        let _ = evt_tx.send(Evt::TrackReady {
-            track: Box::new(track.clone()),
-            source: PlaybackSource::Complete(path),
-            quality: source.quality,
-        });
+        if play {
+            // Fully cached: plain, non-blocking playback.
+            let _ = evt_tx.send(Evt::TrackReady {
+                track: Box::new(track.clone()),
+                source: PlaybackSource::Complete(path),
+                quality: source.quality,
+            });
+        } else {
+            let _ = evt_tx.send(Evt::Cached {
+                title: track.title.clone(),
+                already: true,
+            });
+        }
     } else {
         let _ = evt_tx.send(Evt::DownloadProgress {
             key: key.clone(),
@@ -515,13 +542,17 @@ fn load_track(
         let _ = job_tx.send(DownloadJob {
             track: track.clone(),
             source,
+            play,
             generation,
         });
     }
 
     // Lyrics are looked up on their own thread: they must not delay the next
-    // click, and they must not queue behind a screen full of cover art.
-    let _ = lyrics_tx.send(Box::new(track));
+    // click, and they must not queue behind a screen full of cover art. A
+    // cache-only job has nothing to show them in.
+    if play {
+        let _ = lyrics_tx.send(Box::new(track));
+    }
 }
 
 fn send_error(evt_tx: &Sender<Evt>, context: &str, err: ApiError) {
@@ -598,8 +629,8 @@ fn download_loop(
 /// Sentinel for "a newer request replaced this one"; not a user-facing failure.
 const SUPERSEDED: &str = "__superseded__";
 
-fn is_superseded(request_id: &AtomicU64, generation: u64) -> bool {
-    request_id.load(Ordering::SeqCst) != generation
+fn is_superseded(request_id: &AtomicU64, generation: Option<u64>) -> bool {
+    generation.is_some_and(|generation| request_id.load(Ordering::SeqCst) != generation)
 }
 
 /// True once the file's first bytes look like an ISO-BMFF container.
@@ -727,7 +758,7 @@ fn stream_segment(
         // never observe data that is not yet readable.
         state.publish(written);
 
-        if !announced && written >= ANNOUNCE_AFTER_BYTES.min(total) {
+        if job.play && !announced && written >= ANNOUNCE_AFTER_BYTES.min(total) {
             if !head_is_iso_bmff(&path) {
                 return Err(abort(
                     "CDN 返回的不是有效音频数据（可能已过期或被拦截）".to_string(),
@@ -753,14 +784,17 @@ fn stream_segment(
         )));
     }
 
-    // Very short segments may never reach the announce threshold.
+    // Very short segments may never reach the announce threshold. A cache-only
+    // job never announced, so its bytes are validated here.
     if !announced {
         if !head_is_iso_bmff(&path) {
             return Err(abort(
                 "CDN 返回的不是有效音频数据（可能已过期或被拦截）".to_string(),
             ));
         }
-        announce(evt_tx, job, &path, total, &state, quality);
+        if job.play {
+            announce(evt_tx, job, &path, total, &state, quality);
+        }
     }
 
     let _ = file.sync_all();
@@ -771,6 +805,12 @@ fn stream_segment(
         got: written,
         total: Some(total),
     });
+    if !job.play {
+        let _ = evt_tx.send(Evt::Cached {
+            title: job.track.title.clone(),
+            already: false,
+        });
+    }
     Ok(())
 }
 
@@ -874,11 +914,21 @@ mod tests {
     #[test]
     fn a_job_is_superseded_by_any_newer_request() {
         let request_id = AtomicU64::new(1);
-        assert!(!is_superseded(&request_id, 1));
+        assert!(!is_superseded(&request_id, Some(1)));
         // A newer request (including one for the *same* song) invalidates it.
         request_id.store(2, Ordering::SeqCst);
-        assert!(is_superseded(&request_id, 1));
-        assert!(!is_superseded(&request_id, 2));
+        assert!(is_superseded(&request_id, Some(1)));
+        assert!(!is_superseded(&request_id, Some(2)));
+    }
+
+    /// Cache-only jobs carry no generation: playing another song must not cancel
+    /// them, and asking for one must not cancel the song that is playing.
+    #[test]
+    fn a_cache_only_job_is_never_superseded() {
+        let request_id = AtomicU64::new(7);
+        assert!(!is_superseded(&request_id, None));
+        request_id.store(9, Ordering::SeqCst);
+        assert!(!is_superseded(&request_id, None));
     }
 
     #[test]
