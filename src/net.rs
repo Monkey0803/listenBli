@@ -244,11 +244,13 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
 
     {
         let api = Arc::clone(&api);
+        let youtube = Arc::clone(&youtube);
+        let config = Arc::clone(&config);
         let evt_tx = evt_tx.clone();
         let cache = Arc::clone(&cache);
         let _ = std::thread::Builder::new()
             .name("listenbli-download".into())
-            .spawn(move || download_loop(api, job_rx, evt_tx, request_id, cache));
+            .spawn(move || download_loop(api, youtube, config, job_rx, evt_tx, request_id, cache));
     }
 
     // A cache built before the app stored playable files holds fragments only, and
@@ -867,6 +869,23 @@ fn lyrics_loop(
 // Download worker
 // ---------------------------------------------------------------------------
 
+/// A fresh stream URL for a track whose signed one stopped working.
+///
+/// Only the ranged sources need this: their URL is signed and expires, while a
+/// Bilibili CDN URL is re-fetched by the caller's own retry loop.
+fn refresh_stream_url(sources: &Sources<'_>, track: &Track) -> Option<String> {
+    let Source::Youtube = track.source else {
+        return None;
+    };
+    match sources.youtube.resolve(&track.bvid) {
+        Ok(playable) => playable.best_audio().map(|pick| pick.url.clone()),
+        Err(err) => {
+            eprintln!("re-resolving {} failed: {err}", track.bvid);
+            None
+        }
+    }
+}
+
 /// Remux a cached segment into a normal audio file on its own thread.
 ///
 /// The copy is hundreds of megabytes and must not stall the worker that serves
@@ -900,6 +919,8 @@ fn spawn_export(cache: Arc<AudioCache>, track: Track, quality: AudioQuality, evt
 
 fn download_loop(
     api: Arc<Api>,
+    youtube: Arc<Youtube>,
+    config: SharedConfig,
     job_rx: Receiver<DownloadJob>,
     evt_tx: Sender<Evt>,
     request_id: Arc<AtomicU64>,
@@ -910,7 +931,14 @@ fn download_loop(
         if is_superseded(&request_id, job.generation) {
             continue;
         }
-        if let Err(message) = run_download(&api, &job, &evt_tx, &request_id, &cache) {
+        // Built per job: `Sources` borrows, and the borrows must not outlive the
+        // loop body that uses them.
+        let sources = Sources {
+            api: &api,
+            youtube: &youtube,
+            config: &config,
+        };
+        if let Err(message) = run_download(&sources, &job, &evt_tx, &request_id, &cache) {
             if message == SUPERSEDED {
                 continue;
             }
@@ -945,7 +973,7 @@ fn head_is_iso_bmff(path: &Path) -> bool {
 }
 
 fn run_download(
-    api: &Api,
+    sources: &Sources<'_>,
     job: &DownloadJob,
     evt_tx: &Sender<Evt>,
     request_id: &AtomicU64,
@@ -957,7 +985,7 @@ fn run_download(
     // Primary URL first, then the CDN backups. The first attempt covers the
     // common case; a second only happens when the primary is rejected.
     for url in job.source.urls.iter().take(2) {
-        match stream_segment(api, url, job, evt_tx, request_id, cache) {
+        match stream_segment(sources, url, job, evt_tx, request_id, cache) {
             Ok(()) => {
                 // Opportunistic housekeeping; never blocks playback.
                 let _ = cache.evict_to_fit();
@@ -986,13 +1014,14 @@ fn run_download(
 /// rather than after the whole song. The cache sidecar records the expected
 /// size so a partial file is never later mistaken for a complete one.
 fn stream_segment(
-    api: &Api,
+    sources: &Sources<'_>,
     url: &str,
     job: &DownloadJob,
     evt_tx: &Sender<Evt>,
     request_id: &AtomicU64,
     cache: &Arc<AudioCache>,
 ) -> Result<(), String> {
+    let api = sources.api;
     let key = job.track.key();
     let cache_key = job.track.cache_key();
     let quality = job.source.quality;
@@ -1096,12 +1125,36 @@ fn stream_segment(
     match single.as_mut() {
         Some(response) => copy_into_cache(response)?,
         None => {
+            // A signed stream URL is short-lived, and a long download can outlive
+            // it. One refresh is allowed, and the retry asks for the same range:
+            // that request never delivered a byte, so the range is exactly where
+            // the file stopped — the chunks already written are not fetched again.
+            // A failure *inside* a body is different: it is not retried here,
+            // because resuming mid-range would need the byte counter that the copy
+            // loop owns; the caller's next URL restarts the segment instead.
+            let mut url = url.to_owned();
+            let mut refreshed = false;
             for (start, end) in job.plan.ranges(total) {
                 let want = end - start + 1;
                 let range = format!("bytes={start}-{end}");
-                let mut response = api
-                    .get_stream_range(url, &range)
-                    .map_err(|e| e.to_string())?;
+                let mut response = match api.get_stream_range(&url, &range) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        if refreshed {
+                            return Err(abort(format!("{range} 请求失败（已重试过）：{err}")));
+                        }
+                        refreshed = true;
+                        let Some(fresh) = refresh_stream_url(sources, &job.track) else {
+                            return Err(abort(format!(
+                                "{range} 请求失败，且无法重新取得地址：{err}"
+                            )));
+                        };
+                        eprintln!("stream URL expired mid-download; refreshed it once");
+                        url = fresh;
+                        api.get_stream_range(&url, &range)
+                            .map_err(|err| abort(format!("{range} 重新请求仍失败：{err}")))?
+                    }
+                };
                 // A source that ignored the range would answer 200 with the whole
                 // file; writing that per chunk would corrupt the cache, so the
                 // length is checked rather than assumed.
