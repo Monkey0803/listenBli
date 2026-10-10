@@ -85,7 +85,7 @@ fn machine_subtitle_reaches_into(duration_secs: u64, lyrics: &Lyrics) -> bool {
 /// Never returns an error: a missing lyric is a normal outcome, not a failure
 /// worth interrupting playback for.
 pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
-    if let Some(cached) = load_cached(cache_root, &track.bvid) {
+    if let Some(cached) = load_cached(cache_root, &track.key()) {
         return cached;
     }
 
@@ -106,7 +106,7 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
                     );
                 }
             }
-            Ok(Some(subtitle)) => return finish(cache_root, &track.bvid, subtitle.lyrics),
+            Ok(Some(subtitle)) => return finish(cache_root, &track.key(), subtitle.lyrics),
             Ok(None) => {}
             Err(err) => eprintln!("bilibili subtitle for {} failed: {err}", track.bvid),
         }
@@ -117,17 +117,20 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
         eprintln!("netease lyrics for {} failed: {err}", track.bvid);
     }
     match netease {
-        Ok(Some(lyrics)) => finish(cache_root, &track.bvid, lyrics),
+        Ok(Some(lyrics)) => finish(cache_root, &track.key(), lyrics),
         Ok(None) | Err(_) => match machine_fallback {
-            Some(lyrics) => finish(cache_root, &track.bvid, lyrics),
+            Some(lyrics) => finish(cache_root, &track.key(), lyrics),
             None => Lyrics::empty(LyricsSource::None),
         },
     }
 }
 
 /// Cache a resolved document and hand it back.
-fn finish(cache_root: &Path, bvid: &str, lyrics: Lyrics) -> Lyrics {
-    store_cached(cache_root, bvid, &lyrics);
+///
+/// `key` is [`Track::key`](crate::api::models::Track::key), not the bare `bvid`:
+/// a YouTube id and a Bilibili id must not be able to share a document.
+fn finish(cache_root: &Path, key: &str, lyrics: Lyrics) -> Lyrics {
+    store_cached(cache_root, key, &lyrics);
     lyrics
 }
 

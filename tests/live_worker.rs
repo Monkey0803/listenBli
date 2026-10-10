@@ -264,7 +264,7 @@ fn worker_searches_resolves_and_downloads_a_track() {
 
     // A second request for the same track must be served from the completed cache.
     let cached = listenbli::audio::AudioCache::new()
-        .get(track.cid, quality)
+        .get(&track.cache_key(), quality.stream_id())
         .expect("the segment should now be a complete cache entry");
     assert_eq!(cached, path);
     let bytes = std::fs::read(&path).unwrap();

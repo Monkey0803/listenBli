@@ -5,7 +5,9 @@
 //! rather than treated as fatal.
 
 use super::client::{Api, ApiError};
-use super::models::{FavFolder, FavFolderListData, FavResourceListData, HistoryData, Track};
+use super::models::{
+    FavFolder, FavFolderListData, FavResourceListData, HistoryData, Source, Track,
+};
 use crate::util;
 
 pub fn fav_folders(api: &Api, mid: i64) -> Result<Vec<FavFolder>, ApiError> {
@@ -34,6 +36,7 @@ pub fn fav_items(api: &Api, media_id: i64, page: u32) -> Result<(Vec<Track>, boo
         .filter(|m| m.attr == 1 && !m.bvid.is_empty())
         .map(|m| Track {
             bvid: m.bvid,
+            source: Source::Bilibili,
             aid: m.id,
             cid: 0,
             title: util::strip_html(&m.title),
@@ -65,6 +68,7 @@ pub fn history(api: &Api, max: i64, view_at: i64) -> Result<Vec<Track>, ApiError
             }
             Some(Track {
                 bvid: refer.bvid,
+                source: Source::Bilibili,
                 aid: refer.oid,
                 cid: refer.cid,
                 title: util::strip_html(&item.title),

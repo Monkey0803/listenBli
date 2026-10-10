@@ -590,7 +590,7 @@ fn load_track(
     // race in both directions.
     let generation = play.then(|| request_id.fetch_add(1, Ordering::SeqCst) + 1);
 
-    if let Some(path) = cache.get(track.cid, source.quality) {
+    if let Some(path) = cache.get(&track.cache_key(), source.quality.stream_id()) {
         if play {
             // Fully cached: plain, non-blocking playback.
             let _ = evt_tx.send(Evt::TrackReady {
@@ -695,7 +695,7 @@ fn spawn_export(cache: Arc<AudioCache>, track: Track, quality: AudioQuality, evt
     let _ = std::thread::Builder::new()
         .name("listenbli-export".into())
         .spawn(move || {
-            let Some(segment) = cache.get(track.cid, quality) else {
+            let Some(segment) = cache.get(&track.cache_key(), quality.stream_id()) else {
                 let _ = evt_tx.send(Evt::Error {
                     context: format!("导出失败：{title}"),
                     message: "缓存里找不到这段音频".to_owned(),
@@ -813,8 +813,9 @@ fn stream_segment(
     cache: &Arc<AudioCache>,
 ) -> Result<(), String> {
     let key = job.track.key();
-    let cid = job.track.cid;
+    let cache_key = job.track.cache_key();
     let quality = job.source.quality;
+    let tag = quality.stream_id();
 
     let mut response = api
         .get_stream(url, Some(BILI_WEB))
@@ -827,13 +828,13 @@ fn stream_segment(
     }
 
     platform::ensure_dir(&cache.dir()).map_err(|e| format!("创建缓存目录失败: {e}"))?;
-    let path = cache.path_for(cid, quality);
+    let path = cache.path_for(&cache_key, tag);
 
     // Fresh attempt: drop any stale partial data and record what to expect.
     // The sidecar is written first, so a `.m4s` without one is never a hit.
-    cache.remove(cid, quality);
+    cache.remove(&cache_key, tag);
     cache
-        .begin(cid, quality, total)
+        .begin(&cache_key, tag, total)
         .map_err(|e| format!("写入缓存元数据失败: {e}"))?;
     let mut file = std::fs::File::create(&path).map_err(|e| format!("创建缓存文件失败: {e}"))?;
 
@@ -843,7 +844,7 @@ fn stream_segment(
     // reading this file would block until the read timeout.
     let abort = |message: String| -> String {
         state.fail(message.clone());
-        cache.remove(cid, quality);
+        cache.remove(&cache_key, tag);
         message
     };
 
@@ -855,7 +856,7 @@ fn stream_segment(
     loop {
         if is_superseded(request_id, job.generation) {
             state.cancel();
-            cache.remove(cid, quality);
+            cache.remove(&cache_key, tag);
             return Err(SUPERSEDED.to_string());
         }
 
@@ -923,7 +924,7 @@ fn stream_segment(
     // The bytes are whole: turn them into a file the rest of the world can play.
     // A failure here is not a failed download — the fragment still plays — so it
     // is reported as information, not as an error.
-    if let Err(message) = cache.finish_download(cid, quality) {
+    if let Err(message) = cache.finish_download(&cache_key, tag) {
         let _ = evt_tx.send(Evt::Info(format!("缓存转换失败，仍保留分片：{message}")));
     }
 

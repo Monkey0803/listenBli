@@ -802,6 +802,18 @@ impl Badge {
                 fg: theme::FG_2,
                 bg: theme::white(0.055),
             },
+            // YouTube's two AAC grades. Neither is a Bilibili stream id, so they
+            // take the neutral tint rather than a quality colour.
+            Some(AudioQuality::YtAac128) => Badge {
+                text: "AAC 130K",
+                fg: theme::FG_2,
+                bg: theme::white(0.055),
+            },
+            Some(AudioQuality::YtAac48) => Badge {
+                text: "AAC 50K",
+                fg: theme::FG_2,
+                bg: theme::white(0.055),
+            },
             Some(AudioQuality::K64) => Badge {
                 text: "64K",
                 fg: theme::WARN,

@@ -153,6 +153,7 @@ fn playurl_offers_a_decodable_aac_lc_stream() {
     let api = api();
     let mut track = listenbli::api::models::Track {
         bvid: BVID.to_string(),
+        source: listenbli::api::models::Source::Bilibili,
         aid: 0,
         cid: 0,
         title: String::new(),
@@ -195,6 +196,7 @@ fn lyrics_fall_back_to_netease() {
     let api = api();
     let mut track = listenbli::api::models::Track {
         bvid: BVID.to_string(),
+        source: listenbli::api::models::Source::Bilibili,
         aid: 0,
         cid: 0,
         title: String::new(),

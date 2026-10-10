@@ -1967,6 +1967,7 @@ mod tests {
             .iter()
             .map(|bvid| Track {
                 bvid: (*bvid).to_owned(),
+                source: crate::api::models::Source::Bilibili,
                 aid: 0,
                 cid: 0,
                 title: format!("【无损音质】盘点{bvid}首经典歌曲"),

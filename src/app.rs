@@ -1029,6 +1029,7 @@ mod tests {
     fn track(bvid: &str) -> Track {
         Track {
             bvid: bvid.to_owned(),
+            source: crate::api::models::Source::Bilibili,
             aid: 0,
             cid: 0,
             title: format!("标题 {bvid}"),

@@ -732,6 +732,7 @@ mod tests {
         app.queue = (0..count)
             .map(|i| crate::api::models::Track {
                 bvid: format!("BV{i}"),
+                source: crate::api::models::Source::Bilibili,
                 aid: 0,
                 cid: 0,
                 title: format!("队列曲目 {i}"),

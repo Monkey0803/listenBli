@@ -5,7 +5,7 @@
 //! fallback path.
 
 use super::client::{Api, ApiError, BILI_API};
-use super::models::{SearchAllData, SearchItem, SearchTypeData, Track};
+use super::models::{SearchAllData, SearchItem, SearchTypeData, Source, Track};
 use crate::util;
 
 /// One page of search results, plus whether asking for the next page is useful.
@@ -91,6 +91,7 @@ fn more_pages(page: u32, num_pages: u32, tracks: &[Track]) -> bool {
 fn item_to_track(item: SearchItem) -> Track {
     Track {
         bvid: item.bvid,
+        source: Source::Bilibili,
         aid: item.aid,
         cid: 0,
         title: util::strip_html(&item.title),
@@ -107,6 +108,7 @@ mod tests {
     fn track(bvid: &str) -> Track {
         Track {
             bvid: bvid.to_owned(),
+            source: Source::Bilibili,
             aid: 0,
             cid: 0,
             title: "标题".to_owned(),

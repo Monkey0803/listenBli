@@ -6,10 +6,40 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which platform a track came from.
+///
+/// Everything downstream that has to behave differently per platform (resolving a
+/// stream, which lyric sources to try, which tabs make sense) dispatches on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+pub enum Source {
+    #[default]
+    Bilibili,
+    Youtube,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Bilibili => "B站",
+            Source::Youtube => "YouTube",
+        }
+    }
+}
+
 /// A playable item, normalized from search results, favourites, history or a URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Track {
+    /// The platform's own video id: a Bilibili `bvid`, or a YouTube video id.
+    ///
+    /// One field rather than two because everything downstream already keys off
+    /// it (queue identity, cover cache, lyrics cache); `source` says how to read
+    /// it. A YouTube id that happens to start with `BV` is why [`Track::key`]
+    /// qualifies Bilibili ids not at all and YouTube ids with a prefix.
     pub bvid: String,
+    /// Defaults to Bilibili so configs and caches written before YouTube support
+    /// keep meaning what they meant.
+    #[serde(default)]
+    pub source: Source,
     #[serde(default)]
     pub aid: i64,
     #[serde(default)]
@@ -25,11 +55,31 @@ pub struct Track {
 }
 
 impl Track {
+    /// The identity the UI uses: queue membership, cover cache, lyric routing.
+    ///
+    /// A Bilibili id is left bare — that is what every existing key and cached
+    /// document already says — and a YouTube id is prefixed, because an 11-letter
+    /// YouTube id could otherwise collide with a `bvid`.
     pub fn key(&self) -> String {
-        if self.bvid.is_empty() {
+        let id = if self.bvid.is_empty() {
             format!("aid{}", self.aid)
         } else {
             self.bvid.clone()
+        };
+        match self.source {
+            Source::Bilibili => id,
+            Source::Youtube => format!("yt:{id}"),
+        }
+    }
+
+    /// The key the audio cache files a track under.
+    ///
+    /// A Bilibili track keeps its bare `cid`, so a cache built by earlier versions
+    /// stays valid; a YouTube track has no numeric id and uses its video id.
+    pub fn cache_key(&self) -> String {
+        match self.source {
+            Source::Bilibili => self.cid.to_string(),
+            Source::Youtube => self.bvid.clone(),
         }
     }
 }
@@ -54,6 +104,11 @@ pub enum AudioQuality {
     K192,
     K132,
     K64,
+    /// YouTube `itag 140`: AAC-LC, ~130 kbps. The only YouTube audio Symphonia can
+    /// decode — `itag 251` (Opus) is skipped on purpose.
+    YtAac128,
+    /// YouTube `itag 139`: HE-AAC, ~50 kbps.
+    YtAac48,
 }
 
 impl AudioQuality {
@@ -63,6 +118,8 @@ impl AudioQuality {
             AudioQuality::K192 => "192K",
             AudioQuality::K132 => "132K",
             AudioQuality::K64 => "64K (低清)",
+            AudioQuality::YtAac128 => "AAC 130K",
+            AudioQuality::YtAac48 => "AAC 50K",
         }
     }
 
@@ -74,6 +131,10 @@ impl AudioQuality {
             AudioQuality::K192 => 30280,
             AudioQuality::K132 => 30232,
             AudioQuality::K64 => 30216,
+            // YouTube's DASH `itag`, which plays the same role: it is part of the
+            // cache file name and identifies the stream.
+            AudioQuality::YtAac128 => 140,
+            AudioQuality::YtAac48 => 139,
         }
     }
 }
@@ -503,4 +564,84 @@ pub struct NeLyric {
 pub struct NeLyricText {
     #[serde(default)]
     pub lyric: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bilibili() -> Track {
+        Track {
+            bvid: "BV1xx411c7mD".into(),
+            source: Source::Bilibili,
+            aid: 1,
+            cid: 137_649_199,
+            title: "晴天".into(),
+            author: "周杰伦".into(),
+            duration: 269,
+            cover: None,
+        }
+    }
+
+    fn youtube() -> Track {
+        Track {
+            bvid: "dQw4w9WgXcQ".into(),
+            source: Source::Youtube,
+            aid: 0,
+            cid: 0,
+            title: "Never Gonna Give You Up".into(),
+            author: "Rick Astley".into(),
+            duration: 213,
+            cover: None,
+        }
+    }
+
+    /// A YouTube id is 11 characters and may well start with `BV`, so the prefix
+    /// is not cosmetic: without it the two platforms could share a queue slot, a
+    /// cover and a lyric document.
+    #[test]
+    fn keys_never_collide_across_platforms() {
+        let bili = bilibili();
+        let mut yt = youtube();
+        yt.bvid = bili.bvid.clone();
+
+        assert_eq!(
+            bili.key(),
+            "BV1xx411c7mD",
+            "a Bilibili key stays bare — every cached document already says so"
+        );
+        assert_eq!(yt.key(), format!("yt:{}", bili.bvid));
+        assert_ne!(bili.key(), yt.key());
+    }
+
+    /// The audio cache keeps naming a Bilibili entry after its `cid`, so a cache
+    /// built by an earlier version stays addressable.
+    #[test]
+    fn cache_keys_follow_each_platform() {
+        assert_eq!(bilibili().cache_key(), "137649199");
+        assert_eq!(youtube().cache_key(), "dQw4w9WgXcQ");
+    }
+
+    /// Configs and cached documents written before YouTube support have no
+    /// `source` field and must keep meaning Bilibili.
+    #[test]
+    fn an_older_track_document_loads_as_bilibili() {
+        let text = r#"{"bvid":"BV1xx411c7mD","aid":1,"cid":2,"title":"t",
+                       "author":"a","duration":3,"cover":null}"#;
+        let track: Track = serde_json::from_str(text).expect("an older document");
+        assert_eq!(track.source, Source::Bilibili);
+        assert_eq!(track.cache_key(), "2");
+    }
+
+    /// YouTube grades carry the DASH `itag`, which is what names their cache file
+    /// and tells the downloader which stream to take.
+    #[test]
+    fn youtube_qualities_carry_their_itag() {
+        assert_eq!(AudioQuality::YtAac128.stream_id(), 140);
+        assert_eq!(AudioQuality::YtAac48.stream_id(), 139);
+        assert_eq!(AudioQuality::YtAac128.label(), "AAC 130K");
+        // The Bilibili ids are untouched by the new variants.
+        assert_eq!(AudioQuality::K192.stream_id(), 30280);
+        assert_eq!(AudioQuality::Flac.stream_id(), 0);
+    }
 }

@@ -13,7 +13,6 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::models::AudioQuality;
 use crate::platform;
 
 /// Keep the cache under this size, evicting least-recently-modified files first.
@@ -73,14 +72,36 @@ impl AudioCache {
         self.dir.read().map(|dir| dir.clone()).unwrap_or_default()
     }
 
-    pub fn path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
-        self.dir()
-            .join(format!("{cid}_{}.m4s", quality.stream_id()))
+    /// The file-name stem for one track: `<key>_<tag>`.
+    ///
+    /// The key is the platform's own id (a Bilibili `cid`, a YouTube video id) and
+    /// the tag its stream id, which is what keeps a cache entry addressable from
+    /// the track alone. Anything that is not a plain identifier character becomes
+    /// `_`, so no key — however it arrived — can name a path outside the cache
+    /// directory.
+    fn stem(&self, key: &str, tag: u32) -> String {
+        let safe: String = key
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("{safe}_{tag}")
     }
 
-    fn meta_path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
+    /// The fragment a download is written to, and the file streaming playback
+    /// reads while it arrives.
+    pub fn path_for(&self, key: &str, tag: u32) -> PathBuf {
+        self.dir().join(format!("{}.m4s", self.stem(key, tag)))
+    }
+
+    fn meta_path_for(&self, key: &str, tag: u32) -> PathBuf {
         self.dir()
-            .join(format!("{cid}_{}.meta.json", quality.stream_id()))
+            .join(format!("{}.meta.json", self.stem(key, tag)))
     }
 
     /// Where the *playable* copy lives: a progressive `.m4a` next to the fragment.
@@ -88,52 +109,51 @@ impl AudioCache {
     /// The name stays keyed by `cid` so a lookup is exact and cannot collide: two
     /// videos may share a title, and nothing may share a `cid`. Human names are
     /// what the export action is for.
-    pub fn ready_path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
-        self.dir()
-            .join(format!("{cid}_{}.m4a", quality.stream_id()))
+    pub fn ready_path_for(&self, key: &str, tag: u32) -> PathBuf {
+        self.dir().join(format!("{}.m4a", self.stem(key, tag)))
     }
 
     /// Marks a fragment as still being written, so the background converter never
     /// rewrites a download's fragments out from under it.
-    fn marker_path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
+    fn marker_path_for(&self, key: &str, tag: u32) -> PathBuf {
         self.dir()
-            .join(format!("{cid}_{}.downloading", quality.stream_id()))
+            .join(format!("{}.downloading", self.stem(key, tag)))
     }
 
     /// Record the expected size before/while streaming, so a partial file is
     /// never mistaken for a complete one.
-    pub fn begin(&self, cid: i64, quality: AudioQuality, total: u64) -> std::io::Result<()> {
+    pub fn begin(&self, key: &str, tag: u32, total: u64) -> std::io::Result<()> {
         platform::ensure_dir(&self.dir())?;
         let meta = CacheMeta { total };
         let text = serde_json::to_vec(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // Write the sidecar first: a `.m4s` without a sidecar is never a hit.
-        std::fs::write(self.meta_path_for(cid, quality), text)?;
+        std::fs::write(self.meta_path_for(key, tag), text)?;
         // Then the in-flight marker, which the converter honours.
-        std::fs::write(self.marker_path_for(cid, quality), b"")
+        std::fs::write(self.marker_path_for(key, tag), b"")
     }
 
     /// A cached segment that is complete *and* structurally valid.
-    pub fn get(&self, cid: i64, quality: AudioQuality) -> Option<PathBuf> {
+    pub fn get(&self, key: &str, tag: u32) -> Option<PathBuf> {
         // The playable file first: that is what the cache is for. It carries no
         // sidecar because it is only ever written whole.
-        let ready = self.ready_path_for(cid, quality);
+        let ready = self.ready_path_for(key, tag);
         if ready.is_file() {
             // Leave no fragment behind, from before the conversion or from a
             // platform that would not unlink a file that was still open.
-            let _ = std::fs::remove_file(self.path_for(cid, quality));
-            let _ = std::fs::remove_file(self.meta_path_for(cid, quality));
+            let _ = std::fs::remove_file(self.path_for(key, tag));
+            let _ = std::fs::remove_file(self.meta_path_for(key, tag));
             return Some(ready);
         }
 
-        let path = self.path_for(cid, quality);
+        let path = self.path_for(key, tag);
 
         // A `.m4s` without a sidecar is a leftover from an interrupted attempt
         // (or from an older version of this app): never a hit, and worth
         // cleaning up so the cache does not accumulate junk.
-        let Some(expected) = self.read_meta(cid, quality) else {
+        let Some(expected) = self.read_meta(key, tag) else {
             if path.exists() {
-                self.remove(cid, quality);
+                self.remove(key, tag);
             }
             return None;
         };
@@ -141,7 +161,7 @@ impl AudioCache {
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual != expected.total {
             // Partial (interrupted download) or truncated: drop it.
-            self.remove(cid, quality);
+            self.remove(key, tag);
             return None;
         }
 
@@ -150,28 +170,28 @@ impl AudioCache {
             Some(path)
         } else {
             // An error page saved as `.m4s`: drop it so the next attempt refetches.
-            self.remove(cid, quality);
+            self.remove(key, tag);
             None
         }
     }
 
     /// True when a complete segment is already on disk.
-    pub fn is_complete(&self, cid: i64, quality: AudioQuality) -> bool {
-        self.get(cid, quality).is_some()
+    pub fn is_complete(&self, key: &str, tag: u32) -> bool {
+        self.get(key, tag).is_some()
     }
 
-    fn read_meta(&self, cid: i64, quality: AudioQuality) -> Option<CacheMeta> {
-        let text = std::fs::read_to_string(self.meta_path_for(cid, quality)).ok()?;
+    fn read_meta(&self, key: &str, tag: u32) -> Option<CacheMeta> {
+        let text = std::fs::read_to_string(self.meta_path_for(key, tag)).ok()?;
         serde_json::from_str(&text).ok()
     }
 
     /// Delete everything the cache holds for one track: fragment, sidecar,
     /// playable copy and in-flight marker.
-    pub fn remove(&self, cid: i64, quality: AudioQuality) {
-        let _ = std::fs::remove_file(self.path_for(cid, quality));
-        let _ = std::fs::remove_file(self.meta_path_for(cid, quality));
-        let _ = std::fs::remove_file(self.ready_path_for(cid, quality));
-        let _ = std::fs::remove_file(self.marker_path_for(cid, quality));
+    pub fn remove(&self, key: &str, tag: u32) {
+        let _ = std::fs::remove_file(self.path_for(key, tag));
+        let _ = std::fs::remove_file(self.meta_path_for(key, tag));
+        let _ = std::fs::remove_file(self.ready_path_for(key, tag));
+        let _ = std::fs::remove_file(self.marker_path_for(key, tag));
     }
 
     /// Turn a finished download into a playable file, so the cache holds audio
@@ -181,15 +201,15 @@ impl AudioCache {
     /// marker is cleared either way: a failure must leave the cache exactly as the
     /// old behaviour did — a complete fragment that still plays — and must not
     /// stop a later attempt.
-    pub fn finish_download(&self, cid: i64, quality: AudioQuality) -> Result<PathBuf, String> {
-        let fragment = self.path_for(cid, quality);
-        let ready = self.ready_path_for(cid, quality);
+    pub fn finish_download(&self, key: &str, tag: u32) -> Result<PathBuf, String> {
+        let fragment = self.path_for(key, tag);
+        let ready = self.ready_path_for(key, tag);
         let converted = crate::audio::export::export_m4a(&fragment, &ready);
-        let _ = std::fs::remove_file(self.marker_path_for(cid, quality));
+        let _ = std::fs::remove_file(self.marker_path_for(key, tag));
         match converted {
             Ok(()) => {
                 let _ = std::fs::remove_file(&fragment);
-                let _ = std::fs::remove_file(self.meta_path_for(cid, quality));
+                let _ = std::fs::remove_file(self.meta_path_for(key, tag));
                 Ok(ready)
             }
             Err(message) => Err(message),
@@ -235,11 +255,11 @@ impl AudioCache {
         converted
     }
 
-    pub fn store(&self, cid: i64, quality: AudioQuality, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    pub fn store(&self, key: &str, tag: u32, bytes: &[u8]) -> std::io::Result<PathBuf> {
         platform::ensure_dir(&self.dir())?;
-        let path = self.path_for(cid, quality);
+        let path = self.path_for(key, tag);
         std::fs::write(&path, bytes)?;
-        self.begin(cid, quality, bytes.len() as u64)?;
+        self.begin(key, tag, bytes.len() as u64)?;
         Ok(path)
     }
 
@@ -362,17 +382,17 @@ mod tests {
     fn the_playable_file_wins_and_the_fragment_is_swept_up() {
         let dir = temp_dir("ready-preferred");
         let cache = AudioCache::with_dir(dir.clone());
-        let fragment = cache.path_for(42, AudioQuality::K192);
+        let fragment = cache.path_for("42", 30280);
         std::fs::write(&fragment, fake_segment(128)).unwrap();
-        cache.begin(42, AudioQuality::K192, 128).unwrap();
+        cache.begin("42", 30280, 128).unwrap();
 
-        let ready = cache.ready_path_for(42, AudioQuality::K192);
+        let ready = cache.ready_path_for("42", 30280);
         std::fs::write(&ready, fake_segment(64)).unwrap();
 
-        assert_eq!(cache.get(42, AudioQuality::K192), Some(ready.clone()));
+        assert_eq!(cache.get("42", 30280), Some(ready.clone()));
         assert!(!fragment.exists(), "the fragment should be swept up");
         assert!(
-            !cache.meta_path_for(42, AudioQuality::K192).exists(),
+            !cache.meta_path_for("42", 30280).exists(),
             "and so should its sidecar"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -385,14 +405,14 @@ mod tests {
     fn the_converter_skips_a_fragment_that_is_still_arriving() {
         let dir = temp_dir("converter-skips");
         let cache = AudioCache::with_dir(dir.clone());
-        let fragment = cache.path_for(7, AudioQuality::K192);
+        let fragment = cache.path_for("7", 30280);
         std::fs::write(&fragment, fake_segment(128)).unwrap();
         // Whole by length, but marked as still being written.
-        cache.begin(7, AudioQuality::K192, 128).unwrap();
+        cache.begin("7", 30280, 128).unwrap();
 
         assert_eq!(cache.convert_finished(), 0, "nothing may be converted yet");
         assert!(fragment.exists());
-        assert!(!cache.ready_path_for(7, AudioQuality::K192).exists());
+        assert!(!cache.ready_path_for("7", 30280).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -401,12 +421,46 @@ mod tests {
     fn the_converter_leaves_a_partial_fragment_alone() {
         let dir = temp_dir("converter-partial");
         let cache = AudioCache::with_dir(dir.clone());
-        let fragment = cache.path_for(9, AudioQuality::K192);
+        let fragment = cache.path_for("9", 30280);
         std::fs::write(&fragment, fake_segment(64)).unwrap();
-        cache.begin(9, AudioQuality::K192, 4096).unwrap(); // promised more than arrived
+        cache.begin("9", 30280, 4096).unwrap(); // promised more than arrived
 
         assert_eq!(cache.convert_finished(), 0);
         assert!(fragment.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cache built by an earlier version must keep being found: Bilibili entries
+    /// are still named after their `cid` and stream id.
+    #[test]
+    fn the_bilibili_file_name_is_unchanged() {
+        let cache = AudioCache::with_dir(PathBuf::from("/tmp/listenbli-names"));
+        assert!(cache
+            .path_for("137649199", 30280)
+            .ends_with("137649199_30280.m4s"));
+        assert!(cache
+            .ready_path_for("137649199", 30280)
+            .ends_with("137649199_30280.m4a"));
+        assert!(cache
+            .meta_path_for("137649199", 30280)
+            .ends_with("137649199_30280.meta.json"));
+    }
+
+    /// A key arrives from the network (a video id), so it must never be able to
+    /// name a path outside the cache directory.
+    #[test]
+    fn a_hostile_key_cannot_escape_the_cache_directory() {
+        let dir = temp_dir("traversal");
+        let cache = AudioCache::with_dir(dir.clone());
+
+        let path = cache.path_for("../../etc/passwd", 140);
+
+        assert_eq!(
+            path.parent(),
+            Some(dir.as_path()),
+            "the file must stay in the cache: {path:?}"
+        );
+        assert!(!path.to_string_lossy().contains(".."), "got {path:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -414,13 +468,11 @@ mod tests {
     fn stores_and_reads_back() {
         let dir = temp_dir("roundtrip");
         let cache = AudioCache::with_dir(dir.clone());
-        assert!(cache.get(42, AudioQuality::K192).is_none());
+        assert!(cache.get("42", 30280).is_none());
 
-        let path = cache
-            .store(42, AudioQuality::K192, &fake_segment(128))
-            .unwrap();
-        assert_eq!(path, cache.path_for(42, AudioQuality::K192));
-        assert_eq!(cache.get(42, AudioQuality::K192), Some(path));
+        let path = cache.store("42", 30280, &fake_segment(128)).unwrap();
+        assert_eq!(path, cache.path_for("42", 30280));
+        assert_eq!(cache.get("42", 30280), Some(path));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -428,9 +480,9 @@ mod tests {
     fn rejects_and_deletes_html_error_pages() {
         let dir = temp_dir("html");
         let cache = AudioCache::with_dir(dir.clone());
-        let path = cache.path_for(7, AudioQuality::K132);
+        let path = cache.path_for("7", 30232);
         std::fs::write(&path, b"<html>403 forbidden</html>").unwrap();
-        assert!(cache.get(7, AudioQuality::K132).is_none());
+        assert!(cache.get("7", 30232).is_none());
         assert!(!path.exists(), "poisoned cache entry should be removed");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -439,14 +491,8 @@ mod tests {
     fn distinct_qualities_do_not_collide() {
         let dir = temp_dir("qualities");
         let cache = AudioCache::with_dir(dir.clone());
-        assert_ne!(
-            cache.path_for(1, AudioQuality::K192),
-            cache.path_for(1, AudioQuality::K132)
-        );
-        assert_ne!(
-            cache.path_for(1, AudioQuality::K192),
-            cache.path_for(2, AudioQuality::K192)
-        );
+        assert_ne!(cache.path_for("1", 30280), cache.path_for("1", 30232));
+        assert_ne!(cache.path_for("1", 30280), cache.path_for("2", 30280));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -456,19 +502,11 @@ mod tests {
     fn eviction_counts_the_playable_files() {
         let dir = temp_dir("evict-ready");
         let cache = AudioCache::with_dir(dir.clone());
-        std::fs::write(
-            cache.ready_path_for(1, AudioQuality::K192),
-            fake_segment(4096),
-        )
-        .unwrap();
-        std::fs::write(
-            cache.ready_path_for(2, AudioQuality::K192),
-            fake_segment(4096),
-        )
-        .unwrap();
+        std::fs::write(cache.ready_path_for("1", 30280), fake_segment(4096)).unwrap();
+        std::fs::write(cache.ready_path_for("2", 30280), fake_segment(4096)).unwrap();
 
         // `fake_segment` adds a container header, so measure rather than assume.
-        let each = std::fs::metadata(cache.ready_path_for(1, AudioQuality::K192))
+        let each = std::fs::metadata(cache.ready_path_for("1", 30280))
             .unwrap()
             .len();
         assert_eq!(cache.total_bytes(), each * 2, "the m4a files are the cache");
@@ -500,9 +538,7 @@ mod tests {
     fn evict_is_a_noop_when_under_limit() {
         let dir = temp_dir("noop");
         let cache = AudioCache::with_dir(dir.clone());
-        cache
-            .store(1, AudioQuality::K192, &fake_segment(100))
-            .unwrap();
+        cache.store("1", 30280, &fake_segment(100)).unwrap();
         assert_eq!(cache.evict(u64::MAX), 0);
         assert_eq!(cache.evict_to_fit(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -517,20 +553,18 @@ mod tests {
         let cache = AudioCache::with_dir(dir.clone());
 
         let segment = fake_segment(2000);
-        cache
-            .begin(9, AudioQuality::K192, segment.len() as u64)
-            .unwrap();
+        cache.begin("9", 30280, segment.len() as u64).unwrap();
 
         // Only half of it has landed so far.
-        let path = cache.path_for(9, AudioQuality::K192);
+        let path = cache.path_for("9", 30280);
         std::fs::write(&path, &segment[..1000]).unwrap();
-        assert!(!cache.is_complete(9, AudioQuality::K192));
-        assert!(cache.get(9, AudioQuality::K192).is_none());
+        assert!(!cache.is_complete("9", 30280));
+        assert!(cache.get("9", 30280).is_none());
         assert!(!path.exists(), "the partial file should be discarded");
 
         // Once the whole segment is present it becomes a hit.
-        cache.store(9, AudioQuality::K192, &segment).unwrap();
-        assert!(cache.is_complete(9, AudioQuality::K192));
+        cache.store("9", 30280, &segment).unwrap();
+        assert!(cache.is_complete("9", 30280));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -539,9 +573,9 @@ mod tests {
         let dir = temp_dir("nometa");
         let cache = AudioCache::with_dir(dir.clone());
         // Written directly, as an interrupted first attempt would leave it.
-        let path = cache.path_for(3, AudioQuality::K192);
+        let path = cache.path_for("3", 30280);
         std::fs::write(&path, fake_segment(500)).unwrap();
-        assert!(cache.get(3, AudioQuality::K192).is_none());
+        assert!(cache.get("3", 30280).is_none());
         assert!(!path.exists(), "the orphaned file should be cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -550,8 +584,8 @@ mod tests {
     fn begin_does_not_make_an_absent_file_a_hit() {
         let dir = temp_dir("beginonly");
         let cache = AudioCache::with_dir(dir.clone());
-        cache.begin(5, AudioQuality::K132, 4096).unwrap();
-        assert!(cache.get(5, AudioQuality::K132).is_none());
+        cache.begin("5", 30232, 4096).unwrap();
+        assert!(cache.get("5", 30232).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -559,13 +593,11 @@ mod tests {
     fn eviction_also_removes_the_sidecar() {
         let dir = temp_dir("evictmeta");
         let cache = AudioCache::with_dir(dir.clone());
-        cache
-            .store(1, AudioQuality::K192, &fake_segment(2000))
-            .unwrap();
+        cache.store("1", 30280, &fake_segment(2000)).unwrap();
         assert!(dir.join("1_30280.meta.json").exists());
 
         cache.evict(0);
-        assert!(!cache.path_for(1, AudioQuality::K192).exists());
+        assert!(!cache.path_for("1", 30280).exists());
         assert!(
             !dir.join("1_30280.meta.json").exists(),
             "the sidecar must be cleaned up too"
@@ -577,11 +609,9 @@ mod tests {
     fn remove_deletes_both_files() {
         let dir = temp_dir("remove");
         let cache = AudioCache::with_dir(dir.clone());
-        cache
-            .store(2, AudioQuality::K192, &fake_segment(64))
-            .unwrap();
-        cache.remove(2, AudioQuality::K192);
-        assert!(cache.get(2, AudioQuality::K192).is_none());
+        cache.store("2", 30280, &fake_segment(64)).unwrap();
+        cache.remove("2", 30280);
+        assert!(cache.get("2", 30280).is_none());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
