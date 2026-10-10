@@ -35,12 +35,44 @@ fn fallback_dir(kind: &str) -> PathBuf {
     std::env::temp_dir().join(APP).join(kind)
 }
 
+/// The cache root actually in use: the user's choice when they made one,
+/// otherwise the platform default.
+///
+/// An empty path counts as "not set" — a text field the user cleared should fall
+/// back to the default rather than resolving to the current directory.
+pub fn resolve_cache_dir(override_path: Option<&Path>) -> PathBuf {
+    match override_path {
+        Some(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
+        _ => cache_dir(),
+    }
+}
+
 /// Create a directory (and its parents) if it does not exist yet.
 pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)?;
     }
     Ok(())
+}
+
+/// Can we actually create files in `path`, creating the directory if needed?
+///
+/// Checked before accepting a user-chosen cache location. Merely existing is not
+/// enough — a directory can be read-only or on a volume that refuses writes —
+/// and a cache that cannot be written to fails one download at a time, which is
+/// a poor way to discover the problem.
+pub fn is_writable_dir(path: &Path) -> bool {
+    if ensure_dir(path).is_err() {
+        return false;
+    }
+    let probe = path.join(format!(".listenbli-write-probe-{}", std::process::id()));
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Total size of everything under `path`, in bytes.
@@ -71,11 +103,21 @@ pub fn dir_bytes(path: &Path) -> u64 {
 /// The directory is created if missing, so the button never fails just because
 /// nothing has been cached yet.
 pub fn reveal_dir(path: &Path) -> Result<(), String> {
+    let _ = ensure_dir(path);
+    reveal(path)
+}
+
+/// Show a file or directory, selecting the file itself where the platform can.
+///
+/// A directory opens in place; a file is revealed inside its folder, which is
+/// what makes "open the config" useful — launching `config.json` in whatever
+/// editor happens to be registered would be a surprise.
+pub fn reveal(path: &Path) -> Result<(), String> {
     let mut command = reveal_command(path)?;
     command
         .spawn()
         .map(|_| ())
-        .map_err(|err| format!("打开文件夹失败：{err}"))
+        .map_err(|err| format!("打开位置失败：{err}"))
 }
 
 /// Validate the path and build the launcher, without running it.
@@ -83,29 +125,42 @@ pub fn reveal_dir(path: &Path) -> Result<(), String> {
 /// Split out so the refusal is testable: a passing case would open a real window
 /// during `cargo test`.
 fn reveal_command(path: &Path) -> Result<Command, String> {
-    let _ = ensure_dir(path);
-    if !path.is_dir() {
-        return Err(format!("目录不存在：{}", path.display()));
+    if !path.exists() {
+        return Err(format!("路径不存在：{}", path.display()));
     }
+    let directory = path.is_dir();
 
     // `Command` passes the path as one argument and never involves a shell, so a
     // path containing spaces or metacharacters cannot become a second command.
     #[cfg(target_os = "macos")]
     let command = {
         let mut command = Command::new("open");
+        if !directory {
+            // `-R` reveals the file within its folder rather than opening it.
+            command.arg("-R");
+        }
         command.arg(path);
         command
     };
     #[cfg(target_os = "windows")]
     let command = {
         let mut command = Command::new("explorer");
-        command.arg(path);
+        if !directory {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
         command
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let command = {
+        let target = if directory {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
         let mut command = Command::new("xdg-open");
-        command.arg(path);
+        command.arg(target);
         command
     };
 
@@ -471,20 +526,51 @@ mod tests {
     }
 
     /// The launcher is built but never run here — spawning it would open a Finder
-    /// window during `cargo test`. What matters is that a path which is not a
-    /// directory is refused instead of being handed to the OS.
+    /// window during `cargo test`. What matters is that both a file and a
+    /// directory are accepted, and that a path which does not exist is refused
+    /// instead of being handed to the OS.
     #[test]
-    fn reveal_refuses_a_path_that_is_not_a_directory() {
+    fn reveal_accepts_files_and_directories_but_not_missing_paths() {
         let file = std::env::temp_dir().join(format!("listenbli-file-{}", std::process::id()));
         fs::write(&file, b"x").unwrap();
-        assert!(reveal_command(&file).is_err());
+        assert!(reveal_command(&file).is_ok(), "a file should be revealable");
 
         let dir = std::env::temp_dir().join(format!("listenbli-dir-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        assert!(reveal_command(&dir).is_ok());
+        assert!(reveal_command(&dir).is_ok(), "a directory should open");
+
+        assert!(reveal_command(&dir.join("nope")).is_err());
 
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writability_check_creates_the_directory_and_rejects_impossible_ones() {
+        let dir = std::env::temp_dir().join(format!("listenbli-writable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(is_writable_dir(&dir), "a fresh directory should be created");
+        assert!(dir.is_dir());
+        // It must leave nothing behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        // A path *under* a file can never be a directory.
+        let file = std::env::temp_dir().join(format!("listenbli-notdir-{}", std::process::id()));
+        fs::write(&file, b"x").unwrap();
+        assert!(!is_writable_dir(&file.join("under")));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn resolve_cache_dir_prefers_an_explicit_path() {
+        let chosen = PathBuf::from("/Volumes/Big/listenbli");
+        assert_eq!(resolve_cache_dir(Some(&chosen)), chosen);
+        // A cleared text field means "use the default", not "the cwd".
+        assert_eq!(resolve_cache_dir(Some(Path::new(""))), cache_dir());
+        assert_eq!(resolve_cache_dir(None), cache_dir());
+        assert!(resolve_cache_dir(None).is_absolute());
     }
 
     /// `open_url` is the one place a URL from the network reaches a shell, so the

@@ -29,7 +29,7 @@ use crate::api::video::AudioSource;
 use crate::api::{library, login, search, video};
 use crate::audio::cache::looks_like_iso_bmff;
 use crate::audio::{AudioCache, PlaybackSource, StreamState};
-use crate::config::SharedConfig;
+use crate::config::{self, SharedConfig};
 use crate::lyrics::{self, Lyrics};
 use crate::platform;
 use crate::util;
@@ -142,6 +142,9 @@ pub struct Worker {
     pub cover_tx: Sender<CoverJob>,
     pub evt_rx: Receiver<Evt>,
     pub api: Arc<Api>,
+    /// Shared with the download worker, so the UI can point it at a new root the
+    /// moment the user changes the setting.
+    pub cache: Arc<AudioCache>,
 }
 
 struct DownloadJob {
@@ -209,10 +212,11 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
 
     {
         let api = Arc::clone(&api);
+        let config = Arc::clone(&config);
         let evt_tx = evt_tx.clone();
         let _ = std::thread::Builder::new()
             .name("listenbli-lyrics".into())
-            .spawn(move || lyrics_loop(api, lyrics_rx, evt_tx));
+            .spawn(move || lyrics_loop(api, config, lyrics_rx, evt_tx));
     }
 
     {
@@ -229,6 +233,7 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
         cover_tx,
         evt_rx,
         api,
+        cache,
     }
 }
 
@@ -589,10 +594,20 @@ fn cover_loop(api: Arc<Api>, cover_rx: Receiver<CoverJob>, evt_tx: Sender<Evt>) 
 // Lyrics worker
 // ---------------------------------------------------------------------------
 
-fn lyrics_loop(api: Arc<Api>, lyrics_rx: Receiver<Box<Track>>, evt_tx: Sender<Evt>) {
+fn lyrics_loop(
+    api: Arc<Api>,
+    config: SharedConfig,
+    lyrics_rx: Receiver<Box<Track>>,
+    evt_tx: Sender<Evt>,
+) {
     while let Ok(track) = lyrics_rx.recv() {
         let key = track.key();
-        let lyrics = lyrics::fetch_for(&api, &track);
+        // Read per track rather than once: the user may move the cache while the
+        // app is running, and the lyric cache has to follow it.
+        let root = config::with(&config, |config| {
+            platform::resolve_cache_dir(config.cache_dir.as_deref())
+        });
+        let lyrics = lyrics::fetch_for(&api, &track, &root);
         // A stale answer is harmless: the UI matches on the track key.
         let _ = evt_tx.send(Evt::LyricsReady { key, lyrics });
     }
@@ -711,7 +726,7 @@ fn stream_segment(
         return Err("CDN 返回了空内容".to_string());
     }
 
-    platform::ensure_dir(cache.dir()).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    platform::ensure_dir(&cache.dir()).map_err(|e| format!("创建缓存目录失败: {e}"))?;
     let path = cache.path_for(cid, quality);
 
     // Fresh attempt: drop any stale partial data and record what to expect.

@@ -138,7 +138,7 @@ open dist/ListenBli.app
 | 项目 | macOS | Windows |
 |---|---|---|
 | 配置目录 | `~/Library/Application Support/listenBli/` | `%APPDATA%\listenBli\config\` |
-| 缓存目录 | `~/Library/Caches/listenBli/` | `%LOCALAPPDATA%\listenBli\cache\` |
+| 缓存目录 | `~/Library/Caches/listenBli/` | `%LOCALAPPDATA%\listenBli\cache\`（可在设置里改，见 `cache_dir`） |
 | 音频后端 | CoreAudio | WASAPI |
 | TLS | Security.framework | SChannel |
 | 中文字体 | PingFang → Hiragino Sans GB → STHeiti → Songti → Arial Unicode | `%SystemRoot%\Fonts` 下 msyh → simhei → simsun → DengXian |
@@ -165,6 +165,7 @@ open dist/ListenBli.app
   "accent": "pink",
   "lyric_size": 15.5,
   "density": "comfortable",
+  "cache_dir": null,
   "cookies": { "domains": { "bilibili.com": { "SESSDATA": "…" } } }
 }
 ```
@@ -176,6 +177,7 @@ open dist/ListenBli.app
 | `lyric_size` | `14` – `20` | 歌词字号（px） |
 | `density` | `comfortable` / `compact` | 列表行高（62 / 52 px） |
 | `search_history` | 字符串数组，最多 8 条 | 最近的搜索关键词，最新的在前；重复搜索会提到最前 |
+| `cache_dir` | 绝对路径 / `null` | 缓存（音频分片与歌词）位置；`null` 用系统默认。与配置文件位置**互相独立**，改它不会动配置文件；改动只影响之后写入的文件，已有文件不会搬走 |
 
 > ⚠️ `cookies` 字段等同于账号凭据，请勿分享该文件。
 

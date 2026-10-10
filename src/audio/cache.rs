@@ -9,6 +9,7 @@
 //! later be handed to the decoder as if it were a complete song.
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,38 +34,59 @@ pub struct CacheMeta {
 }
 
 pub struct AudioCache {
-    dir: PathBuf,
+    /// Where the segments live, behind a lock because the user can move the whole
+    /// cache while the download worker is running.
+    dir: RwLock<PathBuf>,
 }
 
 impl AudioCache {
     pub fn new() -> Self {
+        Self::at(&platform::cache_dir())
+    }
+
+    /// A cache under `root`, i.e. `root/audio`.
+    pub fn at(root: &Path) -> Self {
         Self {
-            dir: platform::cache_dir().join("audio"),
+            dir: RwLock::new(root.join("audio")),
+        }
+    }
+
+    /// Point an existing cache at a different root, leaving the files behind.
+    ///
+    /// Nothing is moved: the new root is empty until something is downloaded
+    /// again, and the old files stay where they are for the user to keep or
+    /// delete. Moving several gigabytes behind the user's back is not ours to do.
+    pub fn set_root(&self, root: &Path) {
+        if let Ok(mut dir) = self.dir.write() {
+            *dir = root.join("audio");
         }
     }
 
     #[cfg(test)]
     pub fn with_dir(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir: RwLock::new(dir),
+        }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    pub fn dir(&self) -> PathBuf {
+        self.dir.read().map(|dir| dir.clone()).unwrap_or_default()
     }
 
     pub fn path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
-        self.dir.join(format!("{cid}_{}.m4s", quality.stream_id()))
+        self.dir()
+            .join(format!("{cid}_{}.m4s", quality.stream_id()))
     }
 
     fn meta_path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
-        self.dir
+        self.dir()
             .join(format!("{cid}_{}.meta.json", quality.stream_id()))
     }
 
     /// Record the expected size before/while streaming, so a partial file is
     /// never mistaken for a complete one.
     pub fn begin(&self, cid: i64, quality: AudioQuality, total: u64) -> std::io::Result<()> {
-        platform::ensure_dir(&self.dir)?;
+        platform::ensure_dir(&self.dir())?;
         let meta = CacheMeta { total };
         let text = serde_json::to_vec(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -120,7 +142,7 @@ impl AudioCache {
     }
 
     pub fn store(&self, cid: i64, quality: AudioQuality, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        platform::ensure_dir(&self.dir)?;
+        platform::ensure_dir(&self.dir())?;
         let path = self.path_for(cid, quality);
         std::fs::write(&path, bytes)?;
         self.begin(cid, quality, bytes.len() as u64)?;
@@ -134,7 +156,7 @@ impl AudioCache {
 
     /// `(path, size, modified)` for every cached segment.
     fn entries(&self) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
-        let Ok(read_dir) = std::fs::read_dir(&self.dir) else {
+        let Ok(read_dir) = std::fs::read_dir(self.dir()) else {
             return Vec::new();
         };
         read_dir

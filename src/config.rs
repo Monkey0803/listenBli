@@ -41,6 +41,13 @@ pub struct Config {
     /// `comfortable` (62px rows) or `compact` (52px rows).
     #[serde(default = "default_density")]
     pub density: String,
+    /// Where cached audio and lyrics live, when the user wants them somewhere
+    /// other than the platform's cache directory.
+    ///
+    /// Deliberately independent of where this file itself is stored: moving the
+    /// cache must never move the config, which holds the login credentials.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub cookies: CookieJar,
 }
@@ -86,6 +93,7 @@ impl Default for Config {
             accent: default_accent(),
             lyric_size: default_lyric_size(),
             density: default_density(),
+            cache_dir: None,
             cookies: CookieJar::default(),
         }
     }
@@ -157,6 +165,26 @@ pub fn config_path_display() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_dir_defaults_to_unset_and_round_trips() {
+        // Absent in an older config file: must load as "use the default".
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value.as_object_mut().unwrap().remove("cache_dir");
+        let loaded: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.cache_dir, None);
+
+        let config = Config {
+            cache_dir: Some(PathBuf::from("/Volumes/Big/listenbli-cache")),
+            ..Config::default()
+        };
+        let text = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.cache_dir,
+            Some(PathBuf::from("/Volumes/Big/listenbli-cache"))
+        );
+    }
 
     #[test]
     fn defaults_are_sane() {

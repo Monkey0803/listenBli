@@ -5,7 +5,7 @@ pub mod bilibili;
 pub mod lrc;
 pub mod netease;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::api::client::Api;
 use crate::api::models::Track;
@@ -84,8 +84,8 @@ fn machine_subtitle_reaches_into(duration_secs: u64, lyrics: &Lyrics) -> bool {
 ///
 /// Never returns an error: a missing lyric is a normal outcome, not a failure
 /// worth interrupting playback for.
-pub fn fetch_for(api: &Api, track: &Track) -> Lyrics {
-    if let Some(cached) = load_cached(&track.bvid) {
+pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
+    if let Some(cached) = load_cached(cache_root, &track.bvid) {
         return cached;
     }
 
@@ -106,7 +106,7 @@ pub fn fetch_for(api: &Api, track: &Track) -> Lyrics {
                     );
                 }
             }
-            Ok(Some(subtitle)) => return finish(&track.bvid, subtitle.lyrics),
+            Ok(Some(subtitle)) => return finish(cache_root, &track.bvid, subtitle.lyrics),
             Ok(None) => {}
             Err(err) => eprintln!("bilibili subtitle for {} failed: {err}", track.bvid),
         }
@@ -117,21 +117,21 @@ pub fn fetch_for(api: &Api, track: &Track) -> Lyrics {
         eprintln!("netease lyrics for {} failed: {err}", track.bvid);
     }
     match netease {
-        Ok(Some(lyrics)) => finish(&track.bvid, lyrics),
+        Ok(Some(lyrics)) => finish(cache_root, &track.bvid, lyrics),
         Ok(None) | Err(_) => match machine_fallback {
-            Some(lyrics) => finish(&track.bvid, lyrics),
+            Some(lyrics) => finish(cache_root, &track.bvid, lyrics),
             None => Lyrics::empty(LyricsSource::None),
         },
     }
 }
 
 /// Cache a resolved document and hand it back.
-fn finish(bvid: &str, lyrics: Lyrics) -> Lyrics {
-    store_cached(bvid, &lyrics);
+fn finish(cache_root: &Path, bvid: &str, lyrics: Lyrics) -> Lyrics {
+    store_cached(cache_root, bvid, &lyrics);
     lyrics
 }
 
-fn cache_file(bvid: &str) -> Option<PathBuf> {
+fn cache_file(cache_root: &Path, bvid: &str) -> Option<PathBuf> {
     let safe: String = bvid
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -140,15 +140,15 @@ fn cache_file(bvid: &str) -> Option<PathBuf> {
         return None;
     }
     Some(
-        platform::cache_dir()
+        cache_root
             .join("lyrics")
             .join(CACHE_GENERATION)
             .join(format!("{safe}.json")),
     )
 }
 
-pub fn load_cached(bvid: &str) -> Option<Lyrics> {
-    let path = cache_file(bvid)?;
+pub fn load_cached(cache_root: &Path, bvid: &str) -> Option<Lyrics> {
+    let path = cache_file(cache_root, bvid)?;
     let text = std::fs::read_to_string(path).ok()?;
     parse_cached(&text)
 }
@@ -164,8 +164,10 @@ fn parse_cached(text: &str) -> Option<Lyrics> {
     Some(lyrics)
 }
 
-pub fn store_cached(bvid: &str, lyrics: &Lyrics) {
-    let Some(path) = cache_file(bvid) else { return };
+pub fn store_cached(cache_root: &Path, bvid: &str, lyrics: &Lyrics) {
+    let Some(path) = cache_file(cache_root, bvid) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = platform::ensure_dir(parent);
     }
@@ -182,14 +184,57 @@ mod tests {
     #[test]
     fn cache_file_rejects_path_traversal() {
         assert!(
-            cache_file("../../etc/passwd").is_none()
-                || !cache_file("../../etc/passwd")
+            cache_file(&root(), "../../etc/passwd").is_none()
+                || !cache_file(&root(), "../../etc/passwd")
                     .unwrap()
                     .to_string_lossy()
                     .contains("..")
         );
-        assert!(cache_file("").is_none());
-        assert!(cache_file("BV1xx411c7mD").is_some());
+        assert!(cache_file(&root(), "").is_none());
+        assert!(cache_file(&root(), "BV1xx411c7mD").is_some());
+    }
+
+    /// The cache root the tests write under. Also proves the path is built from
+    /// the argument and not from the platform directory.
+    fn root() -> PathBuf {
+        std::env::temp_dir().join("listenbli-lyrics-root-tests")
+    }
+
+    #[test]
+    fn the_cache_root_argument_decides_where_documents_live() {
+        let elsewhere = PathBuf::from("/Volumes/Big/listenbli");
+        let path = cache_file(&elsewhere, "BV1xx411c7mD").expect("a valid bvid yields a path");
+        assert!(
+            path.starts_with(elsewhere.join("lyrics").join(CACHE_GENERATION)),
+            "got {path:?}"
+        );
+        assert_ne!(
+            path,
+            cache_file(&root(), "BV1xx411c7mD").unwrap(),
+            "a different root must be a different document"
+        );
+    }
+
+    /// The stored document is found under the root it was written to, and not
+    /// under another one — this is the cache-hit path `fetch_for` tries first.
+    #[test]
+    fn a_document_is_only_visible_under_the_root_it_was_stored_in() {
+        let root = std::env::temp_dir().join(format!("listenbli-lyrics-{}", std::process::id()));
+        let other = root.join("elsewhere");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let lyrics = lyrics_at(&[1, 2, 3]);
+        store_cached(&root, "BV1xx411c7mD", &lyrics);
+        assert!(cache_file(&root, "BV1xx411c7mD").unwrap().is_file());
+
+        let loaded = load_cached(&root, "BV1xx411c7mD").expect("stored under this root");
+        assert_eq!(loaded.lines.len(), 3);
+        assert!(
+            load_cached(&other, "BV1xx411c7mD").is_none(),
+            "another root must not see it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn lyrics_at(seconds: &[u64]) -> Lyrics {
@@ -293,7 +338,7 @@ mod tests {
         // A policy change must not keep serving documents written under the old
         // rules, so the generation is part of the path and bumping it orphans
         // every earlier file.
-        let path = cache_file("BV1xx411c7mD").expect("a valid bvid yields a path");
+        let path = cache_file(&root(), "BV1xx411c7mD").expect("a valid bvid yields a path");
         let parts: Vec<String> = path
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())

@@ -15,6 +15,7 @@ use crate::audio::{AudioEngine, SeekOutcome};
 use crate::config::{Config, SharedConfig};
 use crate::lyrics::Lyrics;
 use crate::net::{self, Cmd, Evt, Worker};
+use crate::platform;
 use crate::ui::theme::Theme;
 
 /// How long a status message stays on screen.
@@ -123,6 +124,9 @@ pub struct App {
     /// Bytes under the cache directory, measured when the settings sheet opens
     /// (a directory walk is cheap but should not run every frame).
     pub(crate) cache_bytes: Option<u64>,
+    /// In-progress text of the settings sheet's cache-directory field. Empty
+    /// means "use the platform default".
+    pub(crate) cache_path_input: String,
 }
 
 impl App {
@@ -147,6 +151,12 @@ impl App {
         let show_translation = config.prefer_translation;
         let theme = Theme::from_config(&config);
         let fonts_key = crate::ui::theme::fonts_key(&config);
+        let cache_root = platform::resolve_cache_dir(config.cache_dir.as_deref());
+        let cache_path_input = config
+            .cache_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
         let config_path_input = config
             .cjk_font_path
             .as_ref()
@@ -168,6 +178,9 @@ impl App {
         };
 
         let worker = net::spawn(Arc::clone(&api), Arc::clone(&shared));
+        // The download worker starts on the platform default; honour a configured
+        // root before anything can be requested.
+        worker.cache.set_root(&cache_root);
         // Ask the worker who we are; it also refreshes the WBI keys.
         let _ = worker.cmd_tx.send(Cmd::RefreshLogin);
 
@@ -220,6 +233,7 @@ impl App {
             style_key: String::new(),
             cjk_path_input: config_path_input,
             cache_bytes: None,
+            cache_path_input,
         }
     }
 
@@ -253,6 +267,43 @@ impl App {
     pub(crate) fn config_value<R>(&self, read: impl FnOnce(&Config) -> R) -> R {
         let guard = self.config.lock().unwrap();
         read(&guard)
+    }
+
+    /// Where cached audio and lyrics go right now.
+    pub(crate) fn cache_root(&self) -> std::path::PathBuf {
+        self.config_value(|config| platform::resolve_cache_dir(config.cache_dir.as_deref()))
+    }
+
+    /// Point the cache at `path`, or back at the platform default when `None`.
+    ///
+    /// The directory is created and probed for writability *before* it is
+    /// accepted: a location the app cannot write to would otherwise surface as
+    /// one failed download at a time, which is a poor way to find out.
+    ///
+    /// Nothing is moved. Existing files stay where they are, so a user who
+    /// switches back finds them, and one who does not can delete them.
+    pub(crate) fn set_cache_dir(&mut self, path: Option<std::path::PathBuf>) {
+        let chosen = path.filter(|path| !path.as_os_str().is_empty());
+        let root = platform::resolve_cache_dir(chosen.as_deref());
+
+        if !platform::is_writable_dir(&root) {
+            self.cache_path_input = chosen
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            self.notify(format!("无法写入 {}，已保持原目录", root.display()));
+            return;
+        }
+
+        self.worker.cache.set_root(&root);
+        self.update_config(|config| config.cache_dir = chosen.clone());
+        // Re-measure on the next frame, now that the sheet is still open.
+        self.cache_bytes = None;
+        self.notify(if chosen.is_some() {
+            "缓存目录已更改，已有文件不会搬动"
+        } else {
+            "缓存目录已恢复默认位置"
+        });
     }
 
     // -- search history ----------------------------------------------------
@@ -776,7 +827,7 @@ impl App {
         // close so reopening shows fresh numbers.
         if self.settings_open {
             if self.cache_bytes.is_none() {
-                self.cache_bytes = Some(crate::platform::dir_bytes(&crate::platform::cache_dir()));
+                self.cache_bytes = Some(platform::dir_bytes(&self.cache_root()));
             }
         } else {
             self.cache_bytes = None;
@@ -913,6 +964,61 @@ mod tests {
             App::new_for_tests(Config::default()),
             egui::Context::default(),
         )
+    }
+
+    /// The point of the setting: the workers actually follow it, and a location
+    /// we cannot write to is refused before it is saved.
+    #[test]
+    fn changing_the_cache_dir_moves_the_workers_and_is_refused_when_unwritable() {
+        let (mut app, _ctx) = an_app();
+        let default_root = app.cache_root();
+        assert_eq!(
+            default_root,
+            platform::cache_dir(),
+            "no override means default"
+        );
+        assert_eq!(app.worker.cache.dir(), default_root.join("audio"));
+
+        let chosen = std::env::temp_dir().join(format!("listenbli-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&chosen);
+        app.set_cache_dir(Some(chosen.clone()));
+
+        assert_eq!(
+            app.config_value(|config| config.cache_dir.clone()),
+            Some(chosen.clone()),
+            "the choice must be persisted"
+        );
+        assert_eq!(app.cache_root(), chosen);
+        assert_eq!(
+            app.worker.cache.dir(),
+            chosen.join("audio"),
+            "the download worker must write to the new root"
+        );
+        // The root itself is created up front; `audio/` appears with the first
+        // download, which is what keeps an unused cache from leaving litter.
+        assert!(chosen.is_dir(), "the chosen root is created");
+
+        // A path under a regular file can never be a directory: refuse it and
+        // keep the previous choice rather than saving something unusable.
+        let file = std::env::temp_dir().join(format!("listenbli-notdir-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        app.set_cache_dir(Some(file.join("under")));
+
+        assert_eq!(
+            app.config_value(|config| config.cache_dir.clone()),
+            Some(chosen.clone()),
+            "a refused path must not replace the working one"
+        );
+        assert!(app.toast.is_some(), "the refusal is reported");
+        assert_eq!(app.worker.cache.dir(), chosen.join("audio"));
+
+        // Clearing it goes back to the platform default.
+        app.set_cache_dir(None);
+        assert_eq!(app.config_value(|config| config.cache_dir.clone()), None);
+        assert_eq!(app.worker.cache.dir(), default_root.join("audio"));
+
+        let _ = std::fs::remove_dir_all(&chosen);
+        let _ = std::fs::remove_file(&file);
     }
 
     fn track(bvid: &str) -> Track {

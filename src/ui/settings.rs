@@ -249,61 +249,7 @@ impl App {
             // design's `.input`.
             let field = (ui.available_width() - button - gap - 20.0).max(80.0);
             ui.horizontal(|ui| {
-                let input = egui::Frame::NONE
-                    .fill(Color32::from_black_alpha(102))
-                    .corner_radius(t::R_SM)
-                    .stroke(Stroke::new(1.0, t::LINE))
-                    .inner_margin(Margin {
-                        left: 10,
-                        right: 10,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .show(ui, |ui| {
-                        let font = t::mono_font(11.5);
-                        let offset = widgets::field_text_offset(ui.painter(), &font);
-                        let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                            widgets::field_galley(ui, buf.as_str(), &font, t::FG, offset, wrap)
-                        };
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut path)
-                                .frame(egui::Frame::NONE)
-                                .margin(Margin::ZERO)
-                                .min_size(Vec2::new(field, 32.0))
-                                .vertical_align(Align::Center)
-                                .layouter(&mut layouter)
-                                .font(font.clone())
-                                .text_color(t::FG),
-                        );
-                        if path.is_empty() {
-                            widgets::paint_label(
-                                ui.painter(),
-                                response.rect.left_center(),
-                                Align2::LEFT_CENTER,
-                                platform::cjk_font_hint(),
-                                font,
-                                t::FG_4,
-                            );
-                        }
-                        response
-                    });
-                let response = input.inner;
-                if response.has_focus() {
-                    let painter = ui.painter().clone();
-                    painter.rect_stroke(
-                        input.response.rect,
-                        t::R_SM,
-                        Stroke::new(1.0, t::fade(accent.accent, 0.5)),
-                        egui::StrokeKind::Inside,
-                    );
-                    painter.rect_stroke(
-                        input.response.rect.expand(3.0),
-                        11.0,
-                        Stroke::new(3.0, accent.dim()),
-                        egui::StrokeKind::Outside,
-                    );
-                }
-
+                let response = path_field(ui, &mut path, &platform::cjk_font_hint(), field, accent);
                 ui.add_space(gap);
                 if widgets::icon_button(ui, icons::copy, button, false, accent, "复制路径")
                     .clicked()
@@ -344,60 +290,191 @@ impl App {
 
     fn config_group(&mut self, ui: &mut Ui, accent: t::Accent) {
         group(ui, icons::folder, "配置与缓存", accent, |ui| {
+            // -- the config file: fixed location, but openable ----------------
             let config = crate::config::config_path_display();
-            if path_row(
+            let clicked = path_row(
                 ui,
                 &config,
                 "config",
-                &[(icons::copy, "复制配置路径")],
-                accent,
-            ) == Some(0)
-            {
-                ui.ctx().copy_text(config);
-                self.notify("已复制到剪贴板");
-            }
-            ui.add_space(4.0);
-
-            // The cache path is the one thing the app never showed, and it is
-            // where the disk actually goes — so it gets the extra button that
-            // opens it, which is what "clear the cache" needs.
-            let cache = platform::cache_dir().display().to_string();
-            let clicked = path_row(
-                ui,
-                &cache,
-                "cache",
                 &[
-                    (icons::copy, "复制缓存路径"),
-                    (icons::external, "在文件管理器中打开"),
+                    (icons::copy, "复制配置路径"),
+                    (icons::external, "在文件管理器中显示"),
                 ],
                 accent,
             );
             match clicked {
                 Some(0) => {
-                    ui.ctx().copy_text(cache);
+                    ui.ctx().copy_text(config);
                     self.notify("已复制到剪贴板");
                 }
                 Some(1) => {
-                    if let Err(err) = platform::reveal_dir(&platform::cache_dir()) {
-                        self.notify(err);
-                    }
+                    // Before the first save the file does not exist yet, and
+                    // `reveal` refuses a path that is not there; show the folder
+                    // it will appear in rather than an error.
+                    let file = crate::config::Config::path();
+                    let target = if file.exists() {
+                        file
+                    } else {
+                        platform::config_dir()
+                    };
+                    self.reveal(&target);
                 }
                 _ => {}
             }
-            ui.add_space(8.0);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "配置文件位置固定，登录凭据存在里面；Windows 下为 \
+                     %APPDATA%\\listenBli\\config\\。",
+                )
+                .size(11.0)
+                .color(t::FG_3),
+            );
 
+            // -- the cache: movable, opened, or reset to the default ----------
+            //
+            // Two rows on purpose. The first shows where the cache *is* right
+            // now, read-only and with its own buttons; the second is where a new
+            // location is typed. Folding them into one row would leave the path
+            // and the edit fighting for the same space.
+            ui.add_space(12.0);
+            let root = self.cache_root();
+            let shown = root.display().to_string();
+            match path_row(
+                ui,
+                &shown,
+                "cache",
+                &[
+                    (icons::copy, "复制缓存路径"),
+                    (icons::external, "打开缓存目录"),
+                    (icons::refresh, "恢复默认位置"),
+                ],
+                accent,
+            ) {
+                Some(0) => {
+                    ui.ctx().copy_text(shown);
+                    self.notify("已复制到剪贴板");
+                }
+                Some(1) => self.reveal(&root),
+                Some(2) => {
+                    self.cache_path_input.clear();
+                    self.set_cache_dir(None);
+                }
+                _ => {}
+            }
+
+            ui.add_space(6.0);
+            let mut typed = self.cache_path_input.clone();
+            // 10px of padding on each side, so the text lines up with the
+            // design's `.input`.
+            let field = (ui.available_width() - 20.0).max(80.0);
+            let response = path_field(
+                ui,
+                &mut typed,
+                &format!("留空使用 {}", platform::cache_dir().display()),
+                field,
+                accent,
+            );
+            if response.changed() {
+                // Held locally until committed: applying per keystroke would
+                // move the cache to a half-typed path.
+                self.cache_path_input = typed.clone();
+            }
+            if response.lost_focus() {
+                let typed = self.cache_path_input.trim().to_owned();
+                self.set_cache_dir((!typed.is_empty()).then(|| std::path::PathBuf::from(&typed)));
+            }
+
+            ui.add_space(8.0);
             let used = crate::net::human_bytes(self.cache_bytes.unwrap_or(0));
             ui.label(
                 RichText::new(format!(
-                    "配置存偏好与登录凭据（Windows 在 %APPDATA%\\listenBli\\config\\）。\
-                     缓存占用 {used}：audio/ 音频、lyrics/v2/ 歌词，超过 2 GB 会按最久未使用\
-                     自动清理。"
+                    "缓存占用 {used}，超过 2 GB 会按最久未使用自动清理；改动目录只影响之后写入的\
+                     文件，已有文件不会搬动。"
                 ))
                 .size(11.0)
                 .color(t::FG_3),
             );
         });
     }
+
+    /// Open a file or directory in the OS file manager, reporting a refusal in
+    /// the toast rather than silently doing nothing.
+    fn reveal(&mut self, path: &std::path::Path) {
+        if let Err(err) = platform::reveal(path) {
+            self.notify(err);
+        }
+    }
+}
+
+/// One line of the design's `.input`: mono text on a black wash with a hairline,
+/// plus the accent focus ring. The caller decides what a commit means.
+///
+/// `placeholder` is painted in the field while it is empty, so a hint can show
+/// what the value would default to without being mistaken for the value itself.
+fn path_field(
+    ui: &mut Ui,
+    text: &mut String,
+    placeholder: &str,
+    width: f32,
+    accent: t::Accent,
+) -> egui::Response {
+    let input = egui::Frame::NONE
+        .fill(Color32::from_black_alpha(102))
+        .corner_radius(t::R_SM)
+        .stroke(Stroke::new(1.0, t::LINE))
+        .inner_margin(Margin {
+            left: 10,
+            right: 10,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let font = t::mono_font(11.5);
+            let offset = widgets::field_text_offset(ui.painter(), &font);
+            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                widgets::field_galley(ui, buf.as_str(), &font, t::FG, offset, wrap)
+            };
+            let response = ui.add(
+                egui::TextEdit::singleline(text)
+                    .frame(egui::Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .min_size(Vec2::new(width, 32.0))
+                    .vertical_align(Align::Center)
+                    .layouter(&mut layouter)
+                    .font(font.clone())
+                    .text_color(t::FG),
+            );
+            if text.is_empty() && !placeholder.is_empty() {
+                widgets::paint_label(
+                    ui.painter(),
+                    response.rect.left_center(),
+                    Align2::LEFT_CENTER,
+                    placeholder,
+                    font,
+                    t::FG_4,
+                );
+            }
+            response
+        });
+
+    let response = input.inner;
+    if response.has_focus() {
+        let painter = ui.painter().clone();
+        painter.rect_stroke(
+            input.response.rect,
+            t::R_SM,
+            Stroke::new(1.0, t::fade(accent.accent, 0.5)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            input.response.rect.expand(3.0),
+            11.0,
+            Stroke::new(3.0, accent.dim()),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response
 }
 
 /// A path row: elided mono text with square icon buttons on the right.

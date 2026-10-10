@@ -1661,6 +1661,45 @@ mod tests {
         }
     }
 
+    /// A window at the size the app is usually run in, to check what is visible
+    /// without scrolling: the sheet scrolls, and content past the fold is never
+    /// painted.
+    fn settings_short(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            app.ui_settings_sheet(ui.ctx());
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    /// The cache path has to be reachable without scrolling, which is the whole
+    /// complaint that prompted it: it was previously nowhere in the app at all.
+    #[test]
+    fn the_cache_path_is_visible_without_scrolling() {
+        let (mut app, ctx) = focused_app(&[]);
+        app.settings_open = true;
+        for _ in 0..3 {
+            settings_short(&ctx, &mut app, vec![]);
+        }
+        let output = settings_short(&ctx, &mut app, vec![]);
+        let texts: Vec<String> = painted_text(&output)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        let cache = crate::platform::cache_dir().display().to_string();
+        assert!(
+            texts
+                .iter()
+                .any(|text| *text == cache || cache.starts_with(text.as_str())),
+            "the cache path should be above the fold in an 820px window: {texts:?}"
+        );
+    }
+
     /// The sheet has to name the cache directory: it is where the disk actually
     /// goes, and there was previously no way to find it from inside the app.
     #[test]
