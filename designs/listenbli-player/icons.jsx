@@ -166,6 +166,22 @@ const IconCopy = (p) => (
   </Icon>
 );
 
+const IconExternal = (p) => (
+  <Icon {...p}>
+    <path d="M14.4 4.4h5.2v5.2" />
+    <path d="M10.6 13.4 19.2 4.8" />
+    <path d="M17.2 13.2v4.8a1.6 1.6 0 0 1-1.6 1.6H6a1.6 1.6 0 0 1-1.6-1.6V8.4A1.6 1.6 0 0 1 6 6.8h4.8" />
+  </Icon>
+);
+
+const IconDownload = (p) => (
+  <Icon {...p}>
+    <path d="M12 3.6v11.2" />
+    <path d="m7.4 10.2 4.6 4.6 4.6-4.6" />
+    <path d="M20 14.8v4a1.6 1.6 0 0 1-1.6 1.6H5.6A1.6 1.6 0 0 1 4 18.8v-4" />
+  </Icon>
+);
+
 const IconMore = (p) => (
   <Icon {...p} strokeWidth={2.4}>
     <path d="M6.4 12h.01M12 12h.01M17.6 12h.01" />
@@ -205,6 +221,8 @@ Object.assign(window, {
   IconTranslate,
   IconSpark,
   IconCopy,
+  IconExternal,
+  IconDownload,
   IconMore,
   IconTarget,
 });

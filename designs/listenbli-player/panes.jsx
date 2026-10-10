@@ -267,7 +267,24 @@ function TopBar({
 // -- track list -------------------------------------------------------------
 
 function TrackRow({ track, index, current, playing, resolved, listKey, onPlay }) {
+  // The row menu mirrors the app's: hover reveals `⋯`, and clicking it opens
+  // the row's own actions instead of starting the track.
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [menuOpen]);
+
+  const rowAction = (label) => {
+    setMenuOpen(false);
+    window.__lastRowAction = `${label} · ${track.title}`;
+  };
+
   return (
+    <div className="row-wrap" style={{ position: "relative" }}>
     <button
       className={`row ${current ? "row--current" : ""}`}
       style={{ "--i": index % 14 }}
@@ -303,9 +320,50 @@ function TrackRow({ track, index, current, playing, resolved, listKey, onPlay })
           {current ? <QualityBadge quality={resolved} /> : null}
         </span>
         <span className="row__dur mono">{fmtTime(track.duration)}</span>
-        <span className="row__more" aria-hidden="true"><IconMore size={16} /></span>
+        <span
+          className="row__more"
+          role="button"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          aria-label="更多操作"
+          style={menuOpen ? { opacity: 1, color: "var(--fg)" } : undefined}
+          onClick={(e) => { e.stopPropagation(); setMenuOpen((open) => !open); }}
+        >
+          <IconMore size={16} />
+        </span>
       </span>
     </button>
+
+    {menuOpen ? (
+      <div
+        className="menu"
+        role="menu"
+        style={{ position: "absolute", top: "calc(100% + 4px)", right: 10, zIndex: 30, minWidth: 186 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button className="menu__item" role="menuitem" onClick={() => rowAction("复制视频链接")}>
+          <IconCopy size={14} />
+          复制视频链接
+        </button>
+        <button className="menu__item" role="menuitem" onClick={() => rowAction("在浏览器打开")}>
+          <IconExternal size={14} />
+          在浏览器打开
+        </button>
+        <button className="menu__item" role="menuitem" onClick={() => rowAction("加入播放列表")}>
+          <IconQueue size={14} />
+          加入播放列表
+        </button>
+        <button className="menu__item" role="menuitem" onClick={() => rowAction("下一首播放")}>
+          <IconNext size={14} />
+          下一首播放
+        </button>
+        <button className="menu__item" role="menuitem" onClick={() => rowAction("缓存到本地")}>
+          <IconDownload size={14} />
+          缓存到本地
+        </button>
+      </div>
+    ) : null}
+    </div>
   );
 }
 
