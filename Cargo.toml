@@ -13,9 +13,23 @@ repository = "https://github.com/Monkey0803/listenBli"
 eframe = "0.36"
 egui = "0.36"
 
-# HTTP. `native-tls` (the default) maps to Security.framework on macOS and to
-# SChannel on Windows, so neither platform needs OpenSSL or any system package.
-reqwest = { version = "0.12", features = ["blocking", "json", "gzip", "brotli"] }
+# HTTP. The TLS backend is pinned to `native-tls` on purpose: it maps to
+# Security.framework on macOS and to SChannel on Windows, so neither platform
+# needs OpenSSL or any system package. reqwest 0.13 switched its defaults to
+# rustls (whose default provider, aws-lc-rs, wants cmake and a C toolchain), so
+# `default-features = false` plus explicit features is what keeps that promise.
+# The rest of the list is 0.13's former default set, kept for parity:
+# `charset` (encoding_rs), `http2`, `system-proxy` (honour OS proxy settings).
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "json",
+    "gzip",
+    "brotli",
+    "charset",
+    "http2",
+    "system-proxy",
+    "native-tls",
+] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
