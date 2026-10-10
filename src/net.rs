@@ -15,7 +15,7 @@
 //! token lets it abandon a segment as soon as the user picks something else.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use crate::api::models::{AudioQuality, FavFolder, Track, UserInfo};
 use crate::api::video::AudioSource;
 use crate::api::{library, login, search, video};
 use crate::audio::cache::looks_like_iso_bmff;
-use crate::audio::{AudioCache, PlaybackSource, StreamState};
+use crate::audio::{self, AudioCache, PlaybackSource, StreamState};
 use crate::config::{self, SharedConfig};
 use crate::lyrics::{self, Lyrics};
 use crate::platform;
@@ -54,6 +54,8 @@ pub enum Cmd {
     LoadTrack(Box<Track>),
     /// Download into the cache without touching playback.
     CacheTrack(Box<Track>),
+    /// Write a normal `.m4a` copy of the track's audio into the export folder.
+    ExportTrack(Box<Track>),
     QrStart,
     QrPoll {
         key: String,
@@ -100,6 +102,11 @@ pub enum Evt {
     Cached {
         title: String,
         already: bool,
+    },
+    /// An exported `.m4a` is on disk.
+    Exported {
+        title: String,
+        path: PathBuf,
     },
     LyricsReady {
         key: String,
@@ -157,6 +164,9 @@ struct DownloadJob {
     /// as a newer request arrives. Cache-only jobs carry `None`: they must never
     /// supersede a playback request, and playback must not cancel them.
     generation: Option<u64>,
+    /// Write an `.m4a` once the bytes are in the cache. Only set for an export,
+    /// which is why it is not part of `play`.
+    export: bool,
 }
 
 /// Where the API worker fans its results out to.
@@ -274,7 +284,7 @@ fn dispatch(
     cmd: Cmd,
     sinks: &Sinks,
     request_id: &Arc<AtomicU64>,
-    cache: &AudioCache,
+    cache: &Arc<AudioCache>,
 ) {
     let evt_tx = &sinks.events;
     match cmd {
@@ -297,11 +307,30 @@ fn dispatch(
         }
 
         Cmd::LoadTrack(track) => {
-            load_track(api, config, *track, sinks, request_id, cache, true);
+            load_track(api, config, *track, sinks, request_id, cache, Purpose::Play);
         }
 
         Cmd::CacheTrack(track) => {
-            load_track(api, config, *track, sinks, request_id, cache, false);
+            load_track(
+                api,
+                config,
+                *track,
+                sinks,
+                request_id,
+                cache,
+                Purpose::Cache,
+            );
+        }
+        Cmd::ExportTrack(track) => {
+            load_track(
+                api,
+                config,
+                *track,
+                sinks,
+                request_id,
+                cache,
+                Purpose::Export,
+            );
         }
 
         Cmd::QrStart => match login::generate(api) {
@@ -460,15 +489,34 @@ fn refresh_login(api: &Api, config: &SharedConfig, evt_tx: &Sender<Evt>) -> Opti
     }
 }
 
+/// What a resolved track is for. Two bare booleans at the call sites read as
+/// nothing in particular; this says it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// Play it (and keep the cache warm while doing so).
+    Play,
+    /// Fill the cache and say so.
+    Cache,
+    /// Fill the cache if needed, then write a normal `.m4a` next to it.
+    Export,
+}
+
+impl Purpose {
+    fn plays(self) -> bool {
+        self == Purpose::Play
+    }
+}
+
 fn load_track(
     api: &Api,
     config: &SharedConfig,
     mut track: Track,
     sinks: &Sinks,
     request_id: &Arc<AtomicU64>,
-    cache: &AudioCache,
-    play: bool,
+    cache: &Arc<AudioCache>,
+    purpose: Purpose,
 ) {
+    let play = purpose.plays();
     let evt_tx = &sinks.events;
     let job_tx = &sinks.downloads;
     let lyrics_tx = &sinks.lyrics;
@@ -532,6 +580,8 @@ fn load_track(
                 source: PlaybackSource::Complete(path),
                 quality: source.quality,
             });
+        } else if purpose == Purpose::Export {
+            spawn_export(cache.clone(), track.clone(), source.quality, evt_tx.clone());
         } else {
             let _ = evt_tx.send(Evt::Cached {
                 title: track.title.clone(),
@@ -549,6 +599,7 @@ fn load_track(
             source,
             play,
             generation,
+            export: purpose == Purpose::Export,
         });
     }
 
@@ -617,6 +668,37 @@ fn lyrics_loop(
 // Download worker
 // ---------------------------------------------------------------------------
 
+/// Remux a cached segment into a normal audio file on its own thread.
+///
+/// The copy is hundreds of megabytes and must not stall the worker that serves
+/// playback, so it gets a thread rather than a slot in the queue.
+fn spawn_export(cache: Arc<AudioCache>, track: Track, quality: AudioQuality, evt_tx: Sender<Evt>) {
+    let title = track.title.clone();
+    let _ = std::thread::Builder::new()
+        .name("listenbli-export".into())
+        .spawn(move || {
+            let Some(segment) = cache.get(track.cid, quality) else {
+                let _ = evt_tx.send(Evt::Error {
+                    context: format!("导出失败：{title}"),
+                    message: "缓存里找不到这段音频".to_owned(),
+                });
+                return;
+            };
+            let out = platform::export_dir().join(audio::export::file_name(&title, &track.author));
+            match audio::export_m4a(&segment, &out) {
+                Ok(()) => {
+                    let _ = evt_tx.send(Evt::Exported { title, path: out });
+                }
+                Err(message) => {
+                    let _ = evt_tx.send(Evt::Error {
+                        context: format!("导出失败：{title}"),
+                        message,
+                    });
+                }
+            }
+        });
+}
+
 fn download_loop(
     api: Arc<Api>,
     job_rx: Receiver<DownloadJob>,
@@ -668,7 +750,7 @@ fn run_download(
     job: &DownloadJob,
     evt_tx: &Sender<Evt>,
     request_id: &AtomicU64,
-    cache: &AudioCache,
+    cache: &Arc<AudioCache>,
 ) -> Result<(), String> {
     let key = job.track.key();
     let mut last_err = String::from("没有可用的下载地址");
@@ -710,7 +792,7 @@ fn stream_segment(
     job: &DownloadJob,
     evt_tx: &Sender<Evt>,
     request_id: &AtomicU64,
-    cache: &AudioCache,
+    cache: &Arc<AudioCache>,
 ) -> Result<(), String> {
     let key = job.track.key();
     let cid = job.track.cid;
@@ -820,7 +902,14 @@ fn stream_segment(
         got: written,
         total: Some(total),
     });
-    if !job.play {
+    if job.export {
+        spawn_export(
+            Arc::clone(cache),
+            job.track.clone(),
+            job.source.quality,
+            evt_tx.clone(),
+        );
+    } else if !job.play {
         let _ = evt_tx.send(Evt::Cached {
             title: job.track.title.clone(),
             already: false,

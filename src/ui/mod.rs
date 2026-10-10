@@ -1077,6 +1077,16 @@ impl App {
                         }
                     }
                 }
+                RowAction::Export => {
+                    if let Some(track) = track {
+                        // Implies caching: the worker downloads first if it has
+                        // to, then writes the file. Both take time, so the toast
+                        // reports the start and the event reports the result.
+                        let title = track.title.clone();
+                        self.send(crate::net::Cmd::ExportTrack(Box::new(track)));
+                        self.notify(format!("正在导出：{title}"));
+                    }
+                }
             }
         }
 
@@ -1193,6 +1203,8 @@ pub(crate) enum RowAction {
     EnqueueNext,
     /// `⋯` menu: download it into the audio cache without playing it.
     Cache,
+    /// `⋯` menu: write a normal `.m4a` copy of the audio into the export folder.
+    Export,
 }
 
 /// One row of the list. Clicking anywhere on it plays that track; the `⋯` button
@@ -1371,6 +1383,9 @@ pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> 
             }
             if menu_item(ui, "缓存到本地", icons::download, false) {
                 action = Some(RowAction::Cache);
+            }
+            if menu_item(ui, "导出为 m4a", icons::folder, false) {
+                action = Some(RowAction::Export);
             }
         });
     if current {

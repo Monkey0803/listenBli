@@ -753,6 +753,11 @@ impl App {
                     self.request_cover(track);
                 }
             }
+            Evt::Exported { title, path } => {
+                // The point of the export is the file, so name it: the toast is
+                // the only place the user can read where it landed.
+                self.notify(format!("已导出 {title}：{}", path.display()));
+            }
             Evt::Cached { title, already } => {
                 // A cache-only download finished in the background: nothing on
                 // screen depended on it, so a toast is the whole reaction.

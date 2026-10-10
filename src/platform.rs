@@ -75,6 +75,28 @@ pub fn is_writable_dir(path: &Path) -> bool {
     }
 }
 
+/// Where exported audio is written: `Music/listenBli` on the usual platforms.
+///
+/// Falls back to the home directory when `Music` cannot be created (a machine
+/// without one, or a read-only home), which keeps the export working rather than
+/// failing on a convention.
+pub fn export_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let Some(home) = home else {
+        return std::env::temp_dir().join("listenBli");
+    };
+    let music = home.join("Music");
+    let dir = if music.is_dir() { music } else { home.clone() };
+    let dir = dir.join("listenBli");
+    if ensure_dir(&dir).is_ok() {
+        dir
+    } else {
+        home
+    }
+}
+
 /// Total size of everything under `path`, in bytes.
 ///
 /// Best effort: entries that cannot be read are skipped, because this only feeds
@@ -543,6 +565,31 @@ mod tests {
 
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exports_land_in_a_listenbli_folder_under_the_home() {
+        let home = std::env::temp_dir().join(format!("listenbli-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        // Tests share one process, so this is set and cleared rather than left.
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let dir = export_dir();
+
+        if let Some(previous) = previous {
+            std::env::set_var("HOME", previous);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        assert!(
+            dir.starts_with(&home),
+            "the export dir should be under the home: {dir:?}"
+        );
+        assert_eq!(dir.file_name().unwrap(), "listenBli");
+        assert!(dir.is_dir(), "the export dir should be created: {dir:?}");
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
