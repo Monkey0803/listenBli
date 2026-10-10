@@ -61,10 +61,34 @@ impl Youtube {
     /// sees, because a refusal from the client that got furthest is the informative
     /// one.
     pub fn resolve(&self, video_id: &str) -> Result<Playable, YoutubeError> {
+        self.resolve_avoiding(video_id, None)
+            .map(|(playable, _)| playable)
+    }
+
+    /// Resolve, and say which client answered.
+    pub fn resolve_client(&self, video_id: &str) -> Result<(Playable, ClientKind), YoutubeError> {
+        self.resolve_avoiding(video_id, None)
+    }
+
+    /// Resolve, preferring not to use one client.
+    ///
+    /// This is what a retry needs. Asking the same client again is not a retry: the
+    /// limit measured on 2026-10-10 is per client *and* per URL — one video's IOS link
+    /// served its first ~1 MB and answered 403 to every byte past that, while three
+    /// fresh resolves changed nothing. Another client signs a different URL, and
+    /// whether it is also capped is then its own question.
+    ///
+    /// `avoid` is only a preference: when it is the only client that answers, it is
+    /// used anyway.
+    pub fn resolve_avoiding(
+        &self,
+        video_id: &str,
+        avoid: Option<ClientKind>,
+    ) -> Result<(Playable, ClientKind), YoutubeError> {
         let mut last_error = None;
-        for client in ClientKind::PLAYBACK_FALLBACKS {
-            match player::resolve(&self.http, *client, video_id) {
-                Ok(playable) => return Ok(playable),
+        for client in client_order(avoid) {
+            match player::resolve(&self.http, client, video_id) {
+                Ok(playable) => return Ok((playable, client)),
                 Err(err) => {
                     eprintln!("youtube player via {client:?} failed for {video_id}: {err}");
                     last_error = Some(err);
@@ -176,6 +200,22 @@ impl Youtube {
     }
 }
 
+/// The clients to try, with one of them held back to last.
+///
+/// The avoided client is not dropped: it may be the only one that answers at all, and
+/// a refusal from it is still worth reporting over "nothing worked".
+fn client_order(avoid: Option<ClientKind>) -> Vec<ClientKind> {
+    let fallbacks = ClientKind::PLAYBACK_FALLBACKS.iter().copied();
+    match avoid {
+        None => fallbacks.collect(),
+        Some(avoided) => fallbacks
+            .clone()
+            .filter(|client| *client != avoided)
+            .chain(fallbacks.filter(|client| *client == avoided))
+            .collect(),
+    }
+}
+
 /// The caption tracks out of a `player` response.
 ///
 /// A video with no captions has no `captions` object at all, which is the common
@@ -219,6 +259,23 @@ mod tests {
     /// Nothing here touches the network: these are the cursor rules, and the live
     /// behaviour is covered by `tests/live_youtube.rs`.
     ///
+    /// A retry has to offer a different client first, or it is the same attempt again.
+    #[test]
+    fn a_retry_prefers_a_different_client() {
+        let all = super::client_order(None);
+        assert_eq!(all, vec![ClientKind::AndroidVr, ClientKind::Ios]);
+
+        let avoiding_vr = super::client_order(Some(ClientKind::AndroidVr));
+        assert_eq!(
+            avoiding_vr,
+            vec![ClientKind::Ios, ClientKind::AndroidVr],
+            "the avoided client is tried last, not dropped"
+        );
+
+        let avoiding_ios = super::client_order(Some(ClientKind::Ios));
+        assert_eq!(avoiding_ios, vec![ClientKind::AndroidVr, ClientKind::Ios]);
+    }
+
     /// A player response without captions is the common case, and must read as
     /// "none" rather than as an error.
     #[test]

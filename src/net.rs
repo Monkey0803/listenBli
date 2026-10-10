@@ -26,6 +26,7 @@ use egui::ColorImage;
 use crate::api::client::{Api, ApiError, BILI_WEB};
 use crate::api::models::{AudioQuality, FavFolder, Source, Track, UserInfo};
 use crate::api::video::AudioSource;
+use crate::api::youtube::ClientKind;
 use crate::api::Youtube;
 use crate::api::{library, login, search, video};
 use crate::audio::cache::looks_like_iso_bmff;
@@ -177,6 +178,8 @@ struct DownloadJob {
     /// The stream's length, when the API stated it (a ranged source must, because
     /// a 206 response's `Content-Length` is only the chunk's own length).
     total: Option<u64>,
+    /// The client that signed the URL, so a retry can pick a different one.
+    client: Option<ClientKind>,
 }
 
 /// Where the API worker fans its results out to.
@@ -572,6 +575,8 @@ struct Resolved {
     plan: DownloadPlan,
     /// The stream's total size, when the API states it up front (YouTube does).
     total: Option<u64>,
+    /// Which YouTube client signed the URL; `None` for Bilibili.
+    client: Option<ClientKind>,
 }
 
 /// How a job's bytes are fetched.
@@ -707,6 +712,7 @@ fn load_track(
             source: resolved.source,
             plan: resolved.plan,
             total: resolved.total,
+            client: resolved.client,
             play,
             generation,
             export: purpose == Purpose::Export,
@@ -777,13 +783,15 @@ fn resolve_bilibili(
         // Bilibili serves one file in one response.
         plan: DownloadPlan::Single,
         total: None,
+        client: None,
     })
 }
 
 /// Resolve a YouTube track: the player's own metadata, and a decodable stream.
 fn resolve_youtube(youtube: &Youtube, track: &mut Track, evt_tx: &Sender<Evt>) -> Option<Resolved> {
-    let playable = match youtube.resolve(&track.bvid) {
-        Ok(playable) => playable,
+    // Which client answers matters later: a retry has to offer a different one.
+    let (playable, client) = match youtube.resolve_client(&track.bvid) {
+        Ok((playable, client)) => (playable, client),
         Err(err) => {
             let _ = evt_tx.send(Evt::Error {
                 context: format!("无法播放：{}", track.title),
@@ -838,6 +846,7 @@ fn resolve_youtube(youtube: &Youtube, track: &mut Track, evt_tx: &Sender<Evt>) -
         duration_secs: playable.duration,
         plan: DownloadPlan::ranged(pick.init_end, pick.index_end),
         total: pick.content_length,
+        client: Some(client),
     })
 }
 
@@ -922,16 +931,38 @@ fn track_tags(api: &Api, track: &Track) -> audio::export::TrackTags {
 ///
 /// Only the ranged sources need this: their URL is signed and expires, while a
 /// Bilibili CDN URL is re-fetched by the caller's own retry loop.
-fn refresh_stream_url(sources: &Sources<'_>, track: &Track) -> Option<String> {
+fn refresh_stream_url(
+    sources: &Sources<'_>,
+    track: &Track,
+    avoid: Option<ClientKind>,
+) -> Option<(String, ClientKind)> {
     let Source::Youtube = track.source else {
         return None;
     };
-    match sources.youtube.resolve(&track.bvid) {
-        Ok(playable) => playable.best_audio().map(|pick| pick.url.clone()),
+    match sources.youtube.resolve_avoiding(&track.bvid, avoid) {
+        Ok((playable, client)) => playable.best_audio().map(|pick| (pick.url.clone(), client)),
         Err(err) => {
             eprintln!("re-resolving {} failed: {err}", track.bvid);
             None
         }
+    }
+}
+
+/// What to say when a range keeps being refused.
+///
+/// `bytes=525319-3636946 … HTTP 403` is precise and useless: it names neither the
+/// cause nor what to do. A refusal past the first range of a signed URL is the limit
+/// measured on 2026-10-10 — YouTube hands out URLs that carry only the opening of the
+/// file, and re-resolving does not lift it — while the bytes that did arrive are still
+/// on disk and still playable, which is the part a person needs to hear.
+fn range_refused_message(start: u64, error: &str) -> String {
+    if error.contains("403") && start > 0 {
+        format!(
+            "该视频的直链只允许前 {start} 字节（YouTube 对无 PoToken 客户端的限制），无法完整下载；\
+             已下载的部分仍可继续试听"
+        )
+    } else {
+        format!("下载中断：{error}；已下载的部分仍可继续试听")
     }
 }
 
@@ -1188,26 +1219,31 @@ fn stream_segment(
             // because resuming mid-range would need the byte counter that the copy
             // loop owns; the caller's next URL restarts the segment instead.
             let mut url = url.to_owned();
-            let mut refreshed = false;
+            let mut client = job.client;
+            // One refresh for the other client, one more in case the same client signs
+            // something better on a second try.
+            let mut refreshes_left = 2usize;
             for (start, end) in job.plan.ranges(total) {
                 let want = end - start + 1;
                 let range = format!("bytes={start}-{end}");
                 let mut response = match api.get_stream_range(&url, &range) {
                     Ok(response) => response,
                     Err(err) => {
-                        if refreshed {
-                            return Err(abort(format!("{range} 请求失败（已重试过）：{err}")));
+                        if refreshes_left == 0 {
+                            return Err(abort(range_refused_message(start, &err.to_string())));
                         }
-                        refreshed = true;
-                        let Some(fresh) = refresh_stream_url(sources, &job.track) else {
-                            return Err(abort(format!(
-                                "{range} 请求失败，且无法重新取得地址：{err}"
-                            )));
+                        refreshes_left -= 1;
+                        let Some((fresh, signer)) = refresh_stream_url(sources, &job.track, client)
+                        else {
+                            return Err(abort(range_refused_message(start, &err.to_string())));
                         };
-                        eprintln!("stream URL expired mid-download; refreshed it once");
+                        eprintln!(
+                            "{range} refused ({err}); re-signing with {signer:?}, not {client:?}"
+                        );
                         url = fresh;
+                        client = Some(signer);
                         api.get_stream_range(&url, &range)
-                            .map_err(|err| abort(format!("{range} 重新请求仍失败：{err}")))?
+                            .map_err(|err| abort(range_refused_message(start, &err.to_string())))?
                     }
                 };
                 // A source that ignored the range would answer 200 with the whole
@@ -1382,6 +1418,33 @@ mod tests {
             at = end + 1;
         }
         assert_eq!(at, total, "the ranges must end exactly at the stream's end");
+    }
+
+    /// The message a person reads instead of `bytes=… HTTP 403`. It has to name the
+    /// cause and say that the audio already on disk still plays.
+    #[test]
+    fn a_refused_range_explains_itself() {
+        // The measured case: a signed URL that carries only the opening of the file.
+        let capped = range_refused_message(525_319, "网络请求失败: HTTP 403");
+        println!("{capped}");
+        assert!(capped.contains("只允许前 525319 字节"), "got {capped}");
+        assert!(capped.contains("PoToken"), "got {capped}");
+        assert!(capped.contains("仍可继续试听"), "got {capped}");
+        assert!(
+            !capped.contains("bytes="),
+            "the raw range helps nobody: {capped}"
+        );
+
+        // A failure on the very first range is not the cap: nothing has arrived to
+        // reassure anyone about, and 403 there means something else.
+        let first = range_refused_message(0, "网络请求失败: HTTP 403");
+        assert!(first.contains("下载中断"), "got {first}");
+        assert!(first.contains("403"), "the raw error must survive: {first}");
+
+        // And a failure that is not a refusal at all.
+        let other = range_refused_message(1024, "网络请求失败: 连接被重置");
+        assert!(other.contains("连接被重置"), "got {other}");
+        assert!(other.contains("仍可继续试听"), "got {other}");
     }
 
     #[test]
