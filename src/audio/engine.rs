@@ -6,14 +6,99 @@
 //! * `Player::try_seek` cannot saturate at the end when the source does not
 //!   report a duration, so positions must be clamped by us.
 
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rodio::decoder::DecoderBuilder;
-use rodio::{Decoder, MixerDeviceSink, Player};
+use rodio::{Decoder, MixerDeviceSink, Player, Source};
 
 use super::stream::{BlockingFileReader, PlaybackSource, StreamState};
+
+/// A decoder that has been built and is ready to hand to the player.
+///
+/// Boxed rather than a concrete `Decoder<R>` because building it happens on a
+/// worker thread and what comes back has to cross a channel.
+pub type PreparedSource = Box<dyn Source + Send>;
+
+/// What a worker thread needs in order to open a decoder.
+enum PrepareJob {
+    Complete(PathBuf),
+    Streaming {
+        path: PathBuf,
+        total: u64,
+        state: Arc<StreamState>,
+    },
+}
+
+impl PrepareJob {
+    fn of(source: &PlaybackSource) -> Self {
+        match source {
+            PlaybackSource::Complete(path) => PrepareJob::Complete(path.clone()),
+            PlaybackSource::Streaming { path, total, state } => PrepareJob::Streaming {
+                path: path.clone(),
+                total: *total,
+                state: Arc::clone(state),
+            },
+        }
+    }
+}
+
+/// Open a decoder. **Blocking, and expensive — never call this on the UI thread.**
+///
+/// Symphonia's ISO-BMFF reader walks the whole segment to build its sample
+/// tables, so this does not return until it has read the file to the end.
+/// Measured against real segments: 100.00% of both a 4.7 MB and a 182 MB file is
+/// read before `build()` returns; the small one takes 10 ms of CPU and the large
+/// one is bounded only by how fast it arrives. Called inline it froze the window
+/// for the length of the download, which is the whole reason this runs on a
+/// thread.
+fn build_source(job: PrepareJob) -> Result<PreparedSource, String> {
+    match job {
+        PrepareJob::Complete(path) => {
+            let file = std::fs::File::open(&path)
+                .map_err(|e| format!("无法打开音频缓存 {}: {e}", path.display()))?;
+            let decoder = Decoder::try_from(file)
+                .map_err(|e| format!("解码失败（音频格式可能不受支持）: {e}"))?;
+            Ok(Box::new(decoder))
+        }
+        PrepareJob::Streaming { path, total, state } => {
+            let reader = BlockingFileReader::open(&path, state)
+                .map_err(|e| format!("无法打开音频缓存 {}: {e}", path.display()))?;
+            let decoder = DecoderBuilder::new()
+                .with_data(reader)
+                .with_byte_len(total)
+                .with_seekable(true)
+                .build()
+                .map_err(|e| format!("解码失败（音频格式可能不受支持）: {e}"))?;
+            Ok(Box::new(decoder))
+        }
+    }
+}
+
+/// Queue a decoder build and return its result channel at once.
+///
+/// One thread per request on purpose: a superseded job can be parked in a
+/// blocking read for up to `stream::READ_TIMEOUT`, and the newest click must not
+/// queue behind it. Abandoned jobs end early anyway, because the download worker
+/// cancels their `StreamState` when a newer track supersedes them.
+fn spawn_prepare(job: PrepareJob) -> Receiver<Result<PreparedSource, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A closed receiver just means the engine moved on; ignore it.
+        let _ = tx.send(build_source(job));
+    });
+    rx
+}
+
+/// A decoder being built on a worker thread.
+struct Pending {
+    rx: Receiver<Result<PreparedSource, String>>,
+    duration: Duration,
+    key: String,
+    stream: Option<Arc<StreamState>>,
+}
 
 /// Clamp a requested position into `0..=duration`.
 pub fn clamp_position(position: Duration, duration: Duration) -> Duration {
@@ -44,6 +129,8 @@ pub struct AudioEngine {
     loaded_key: Option<String>,
     /// Set while the current track is still being streamed in.
     stream: Option<Arc<StreamState>>,
+    /// A decoder still being built for the newest selection.
+    pending: Option<Pending>,
 }
 
 impl AudioEngine {
@@ -59,69 +146,86 @@ impl AudioEngine {
             volume,
             loaded_key: None,
             stream: None,
+            pending: None,
         })
     }
 
-    /// Play a fully cached file.
-    pub fn play(
-        &mut self,
-        path: &Path,
-        duration: Duration,
-        key: impl Into<String>,
-    ) -> Result<(), String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("无法打开音频缓存 {}: {e}", path.display()))?;
-        let decoder = Decoder::try_from(file)
-            .map_err(|e| format!("解码失败（音频格式可能不受支持）: {e}"))?;
-        self.start(decoder, duration, key, None);
-        Ok(())
-    }
-
-    /// Play a segment that is still downloading.
+    /// Hand a track to the player, returning immediately.
     ///
-    /// The decoder is told the segment's *real* final size, and its reads block
-    /// until the bytes arrive, so playback starts after only the first few
-    /// hundred kilobytes instead of the whole song.
+    /// Decoding is queued to a worker thread and lands via [`AudioEngine::poll`].
+    /// Nothing here blocks: the window must stay responsive while a segment is
+    /// being read, which for a long upload is the whole download.
+    ///
+    /// Playback of the previous track stops now, because the new one cannot
+    /// start until its segment has been fully read and letting the old song
+    /// continue under a new title would misrepresent what is happening.
     pub fn play_stream(
         &mut self,
         source: &PlaybackSource,
         duration: Duration,
         key: impl Into<String>,
-    ) -> Result<(), String> {
-        let key = key.into();
-        match source {
-            PlaybackSource::Complete(path) => self.play(path, duration, key),
-            PlaybackSource::Streaming { path, total, state } => {
-                let reader = BlockingFileReader::open(path, Arc::clone(state))
-                    .map_err(|e| format!("无法打开音频缓存 {}: {e}", path.display()))?;
-                let decoder = DecoderBuilder::new()
-                    .with_data(reader)
-                    .with_byte_len(*total)
-                    .with_seekable(true)
-                    .build()
-                    .map_err(|e| format!("解码失败（音频格式可能不受支持）: {e}"))?;
-                self.start(decoder, duration, key, Some(Arc::clone(state)));
-                Ok(())
+    ) {
+        let job = PrepareJob::of(source);
+        self.pending = Some(Pending {
+            rx: spawn_prepare(job),
+            duration,
+            key: key.into(),
+            stream: source.stream_state().cloned(),
+        });
+        self.player.stop();
+        self.loaded_key = None;
+        self.stream = None;
+        self.duration = duration;
+    }
+
+    /// Install a decoder that finished building.
+    ///
+    /// `None` while the newest selection is still being prepared; `Some(Ok(()))`
+    /// once it is playing; `Some(Err(_))` if it could not be opened.
+    pub fn poll(&mut self) -> Option<Result<(), String>> {
+        let pending = self.pending.as_ref()?;
+        match pending.rx.try_recv() {
+            Ok(Ok(source)) => {
+                let Pending {
+                    duration,
+                    key,
+                    stream,
+                    ..
+                } = self.pending.take().expect("checked just above");
+                self.install(source, duration, key, stream);
+                Some(Ok(()))
+            }
+            Ok(Err(err)) => {
+                self.pending = None;
+                Some(Err(err))
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.pending = None;
+                Some(Err("解码线程意外退出".to_string()))
             }
         }
     }
 
-    fn start<R>(
+    /// True while the newest selection's decoder is still being built.
+    pub fn is_preparing(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn install(
         &mut self,
-        decoder: Decoder<R>,
+        source: PreparedSource,
         duration: Duration,
-        key: impl Into<String>,
+        key: String,
         stream: Option<Arc<StreamState>>,
-    ) where
-        R: std::io::Read + std::io::Seek + Send + 'static,
-    {
+    ) {
         self.player.stop();
         self.duration = duration;
         self.stream = stream;
-        self.player.append(decoder);
+        self.player.append(source);
         self.player.set_volume(self.volume);
         self.player.play();
-        self.loaded_key = Some(key.into());
+        self.loaded_key = Some(key);
     }
 
     /// The in-flight stream for the current track, if any.
@@ -134,6 +238,7 @@ impl AudioEngine {
         // `player.stop()`, and deliberately *not* cancelling the in-flight
         // download means it still finishes and leaves a complete cache entry for
         // the next play.
+        self.pending = None;
         self.stream = None;
         self.player.stop();
         self.loaded_key = None;
@@ -170,6 +275,11 @@ impl AudioEngine {
     }
 
     pub fn position(&self) -> Duration {
+        // While a decoder is being built nothing is playing, and the player's
+        // own position still refers to the track that was just stopped.
+        if self.pending.is_some() {
+            return Duration::ZERO;
+        }
         clamp_position(self.player.get_pos(), self.duration)
     }
 
@@ -224,6 +334,7 @@ impl AudioEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn clamps_position_to_duration() {
@@ -248,5 +359,67 @@ mod tests {
     #[test]
     fn zero_duration_does_not_divide_by_zero() {
         assert_eq!(progress_ratio(Duration::from_secs(5), Duration::ZERO), 0.0);
+    }
+
+    /// A file that starts like an ISO-BMFF segment and then declares a `moov`
+    /// box far larger than what exists on disk, so any decoder must read past
+    /// everything published and therefore block on the streaming reader.
+    fn blocking_segment() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&24u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"isom");
+        bytes.extend_from_slice(&0x200u32.to_be_bytes());
+        bytes.extend_from_slice(b"isomiso2");
+        bytes.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // moov claims 16 MiB
+        bytes.extend_from_slice(b"moov");
+        bytes
+    }
+
+    /// Regression: opening a decoder used to happen inline, and symphonia reads
+    /// the *whole* segment while building its tables, so a click froze the window
+    /// for the length of the download. Queueing it must cost nothing.
+    #[test]
+    fn queueing_a_decoder_never_blocks_the_caller() {
+        let path = std::env::temp_dir().join(format!(
+            "listenbli-engine-{}-{:?}.m4s",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let bytes = blocking_segment();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let total = 16 * 1024 * 1024;
+        let state = Arc::new(StreamState::new(total));
+        state.publish(bytes.len() as u64);
+
+        let started = Instant::now();
+        let rx = spawn_prepare(PrepareJob::Streaming {
+            path: path.clone(),
+            total,
+            state: Arc::clone(&state),
+        });
+        let handoff = started.elapsed();
+        assert!(
+            handoff < Duration::from_millis(50),
+            "queueing must not wait on the decoder: took {handoff:?}"
+        );
+
+        let outcome = match rx.try_recv() {
+            // Parked on a read that cannot be satisfied — the case this guards.
+            Err(TryRecvError::Empty) => {
+                // Cancelling the stream is what the download worker does when a
+                // newer track supersedes this one; it must end the job promptly
+                // rather than leave the thread parked until the read times out.
+                state.cancel();
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("a cancelled stream must resolve the job")
+            }
+            Ok(result) => result,
+            Err(TryRecvError::Disconnected) => panic!("the prepare thread vanished"),
+        };
+        assert!(outcome.is_err(), "this segment cannot decode successfully");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

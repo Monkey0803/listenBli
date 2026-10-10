@@ -19,6 +19,27 @@ use listenbli::audio::{looks_like_iso_bmff, AudioEngine};
 use listenbli::config::{self, Config};
 use listenbli::net::{Cmd, Evt, Worker};
 
+/// Drive the engine's poll loop until it has installed a decoder.
+///
+/// Decoding happens on a worker thread, so tests — like the UI — have to poll
+/// for it rather than expect `play_stream` to have finished.
+fn wait_for_decoder(engine: &mut AudioEngine) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match engine.poll() {
+            Some(Ok(())) => return,
+            Some(Err(err)) => panic!("the decoder failed to open: {err}"),
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the decoder never finished being built"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 /// Drain events until one satisfies `f`, or panic on timeout.
 fn wait_for<T>(
     rx: &Receiver<Evt>,
@@ -194,7 +215,14 @@ fn worker_searches_resolves_and_downloads_a_track() {
          ({time_to_ready:?} vs {time_to_complete:?}) - not actually streaming"
     );
 
-    // Opening the decoder must not need the rest of the file either.
+    // Handing the track over must not wait on the decoder.
+    //
+    // This deliberately does *not* claim to prove the decoder opened early: the
+    // loop above already waited for the download to complete, so the file is
+    // whole by now. (An earlier version of this test made exactly that claim,
+    // which is why it never caught the freeze it was meant to guard.) What
+    // opening a decoder costs is covered offline by the unit test
+    // `queueing_a_decoder_never_blocks_the_caller`.
     let mut engine = match AudioEngine::new(0.0) {
         Ok(engine) => engine,
         Err(err) => {
@@ -202,15 +230,20 @@ fn worker_searches_resolves_and_downloads_a_track() {
             return;
         }
     };
-    let open_started = Instant::now();
-    engine
-        .play_stream(&source, Duration::from_secs(track.duration), track.key())
-        .expect("streaming playback should start");
-    let open_took = open_started.elapsed();
-    println!("decoder opened in {:.3}s", open_took.as_secs_f64());
+    let handoff_started = Instant::now();
+    engine.play_stream(&source, Duration::from_secs(track.duration), track.key());
+    let handoff = handoff_started.elapsed();
+    println!("handed to the engine in {:.3}s", handoff.as_secs_f64());
     assert!(
-        open_took < Duration::from_secs(2),
-        "opening the decoder took {open_took:?}, which suggests it waited for the whole file"
+        handoff < Duration::from_millis(500),
+        "handing a track to the engine blocked the caller for {handoff:?}"
+    );
+
+    let installed_started = Instant::now();
+    wait_for_decoder(&mut engine);
+    println!(
+        "decoder installed {:.3}s after handoff",
+        installed_started.elapsed().as_secs_f64()
     );
     assert!(engine.is_playing(), "engine should report playing");
 
@@ -311,9 +344,12 @@ fn audio_engine_starts_and_advances_playback() {
         }
     };
 
-    engine
-        .play(&path, Duration::from_secs(track.duration), track.key())
-        .expect("playback should start");
+    engine.play_stream(
+        &listenbli::audio::PlaybackSource::Complete(path),
+        Duration::from_secs(track.duration),
+        track.key(),
+    );
+    wait_for_decoder(&mut engine);
     assert!(engine.is_playing(), "engine should report playing");
 
     let started = engine.position();

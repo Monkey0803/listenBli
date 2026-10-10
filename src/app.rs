@@ -426,7 +426,13 @@ impl App {
     /// yet, so a jump beyond the download frontier is refused instead of
     /// hanging the window. The buffer fills within seconds, after which every
     /// position is available.
+    ///
+    /// Nothing is loaded while a decoder is still being built, so a seek then
+    /// has no source to move and is refused rather than handed to the player.
     pub(crate) fn try_seek(&mut self, target: Duration) {
+        if self.loading {
+            return;
+        }
         let allowed = self
             .engine
             .as_ref()
@@ -527,22 +533,18 @@ impl App {
                 source,
                 quality,
             } => {
-                self.loading = false;
+                // Deliberately still loading: the decoder is built on a worker
+                // thread and only installed from `tick`, and nothing can play
+                // until that has happened.
                 self.quality = Some(quality);
                 let key = track.key();
                 self.current = Some(*track.clone());
                 match &mut self.engine {
                     Some(engine) => {
-                        // Streaming sources start playing after only a fraction
-                        // of the segment has arrived; the decoder's reads block
-                        // until the rest lands.
-                        if let Err(err) =
-                            engine.play_stream(&source, Duration::from_secs(track.duration), key)
-                        {
-                            self.set_status(err, true);
-                        }
+                        engine.play_stream(&source, Duration::from_secs(track.duration), key);
                     }
                     None => {
+                        self.loading = false;
                         self.set_status("音频输出不可用，无法播放", true);
                     }
                 }
@@ -682,6 +684,19 @@ impl App {
 
     /// Drive auto-advance and QR polling.
     fn tick(&mut self) {
+        // Install a decoder whose worker thread has finished with it. This is
+        // where playback actually starts; everything before it is preparation,
+        // and the UI stays live throughout.
+        match self.engine.as_mut().and_then(|engine| engine.poll()) {
+            Some(Ok(())) => self.loading = false,
+            Some(Err(err)) => {
+                self.loading = false;
+                self.download = None;
+                self.set_status(err, true);
+            }
+            None => {}
+        }
+
         if self
             .engine
             .as_ref()
