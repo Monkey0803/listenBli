@@ -236,11 +236,12 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
 
     {
         let api = Arc::clone(&api);
+        let youtube = Arc::clone(&youtube);
         let config = Arc::clone(&config);
         let evt_tx = evt_tx.clone();
         let _ = std::thread::Builder::new()
             .name("listenbli-lyrics".into())
-            .spawn(move || lyrics_loop(api, config, lyrics_rx, evt_tx));
+            .spawn(move || lyrics_loop(api, youtube, config, lyrics_rx, evt_tx));
     }
 
     {
@@ -863,6 +864,7 @@ fn cover_loop(api: Arc<Api>, cover_rx: Receiver<CoverJob>, evt_tx: Sender<Evt>) 
 
 fn lyrics_loop(
     api: Arc<Api>,
+    youtube: Arc<Youtube>,
     config: SharedConfig,
     lyrics_rx: Receiver<Box<Track>>,
     evt_tx: Sender<Evt>,
@@ -874,7 +876,7 @@ fn lyrics_loop(
         let root = config::with(&config, |config| {
             platform::resolve_cache_dir(config.cache_dir.as_deref())
         });
-        let lyrics = lyrics::fetch_for(&api, &track, &root);
+        let lyrics = lyrics::fetch_for(&api, &youtube, &track, &root);
         // A stale answer is harmless: the UI matches on the track key.
         let _ = evt_tx.send(Evt::LyricsReady { key, lyrics });
     }

@@ -209,6 +209,29 @@ impl InnerTube {
     }
 }
 
+impl InnerTube {
+    /// GET a URL as one of the clients.
+    ///
+    /// The user agent is not decoration: a `googlevideo`-style URL minted for a
+    /// client is bound to it, and asking with a browser agent returns an empty body
+    /// rather than an error. Measured on the caption endpoint: six tracks listed,
+    /// zero lines parsed, until the request carried the client's own agent.
+    pub fn get_text(&self, client: ClientKind, url: &str) -> Result<String, YoutubeError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(client.user_agent()).expect("a constant user agent"),
+        );
+        self.http
+            .get(url)
+            .headers(headers)
+            .send()
+            .map_err(|err| YoutubeError::Network(err.to_string()))?
+            .text()
+            .map_err(|err| YoutubeError::Network(err.to_string()))
+    }
+}
+
 impl Default for InnerTube {
     fn default() -> Self {
         Self::new()

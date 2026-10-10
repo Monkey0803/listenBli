@@ -206,7 +206,12 @@ fn lyrics_fall_back_to_netease() {
     };
     video::resolve_track(&api, &mut track).expect("view lookup should succeed");
 
-    let lyrics = lyrics::fetch_for(&api, &track, &listenbli::platform::cache_dir());
+    let lyrics = lyrics::fetch_for(
+        &api,
+        &listenbli::api::Youtube::new(),
+        &track,
+        &listenbli::platform::cache_dir(),
+    );
     println!(
         "lyrics source = {:?}, {} lines",
         lyrics.source,
@@ -244,7 +249,12 @@ fn lyrics_match_a_chinese_song_whose_title_carries_the_artist() {
     );
 
     video::resolve_track(&api, &mut track).expect("view lookup should succeed");
-    let lyrics = lyrics::fetch_for(&api, &track, &listenbli::platform::cache_dir());
+    let lyrics = lyrics::fetch_for(
+        &api,
+        &listenbli::api::Youtube::new(),
+        &track,
+        &listenbli::platform::cache_dir(),
+    );
 
     println!(
         "lyrics source = {:?}, {} lines",

@@ -412,6 +412,7 @@ fn source_badge(ui: &mut Ui, source: crate::lyrics::LyricsSource) {
         crate::lyrics::LyricsSource::BilibiliSubtitle => ("B 站 CC 字幕", true),
         crate::lyrics::LyricsSource::Netease => ("网易云音乐", true),
         crate::lyrics::LyricsSource::Lrclib => ("LRCLib", true),
+        crate::lyrics::LyricsSource::YoutubeCaptions => ("YouTube 字幕", true),
         crate::lyrics::LyricsSource::None => ("无", false),
     };
     let font = t::ui_font(10.5);

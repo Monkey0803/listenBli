@@ -19,6 +19,8 @@ pub enum LyricsSource {
     Netease,
     /// LRCLib, which serves both platforms.
     Lrclib,
+    /// The uploader's own subtitles on YouTube.
+    YoutubeCaptions,
     None,
 }
 
@@ -28,6 +30,7 @@ impl LyricsSource {
             LyricsSource::BilibiliSubtitle => "B站字幕",
             LyricsSource::Netease => "网易云",
             LyricsSource::Lrclib => "LRCLib",
+            LyricsSource::YoutubeCaptions => "YouTube 字幕",
             LyricsSource::None => "无",
         }
     }

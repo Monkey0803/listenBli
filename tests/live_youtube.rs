@@ -136,6 +136,67 @@ fn a_resolved_stream_is_a_fragmented_mp4_in_reach() {
     );
 }
 
+/// YouTube's own subtitles: the caption list, the chosen track, and the parse.
+#[test]
+#[ignore = "hits the live YouTube service"]
+fn youtubes_own_captions_parse_into_timed_lines() {
+    use listenbli::api::models::{Source, Track};
+    use listenbli::lyrics::captions;
+
+    let youtube = Youtube::new();
+
+    let tracks = youtube.captions(VIDEO).expect("a caption list");
+    let listed: Vec<(&str, bool)> = tracks
+        .iter()
+        .map(|track| (track.language.as_str(), track.machine))
+        .collect();
+    println!("{} caption tracks: {listed:?}", tracks.len());
+    assert!(!tracks.is_empty(), "this video has captions");
+    assert!(
+        tracks.iter().any(|track| !track.machine),
+        "and at least one written by a person"
+    );
+
+    // The document is bound to the client that named it, so the client fetches it:
+    // with a browser user agent the same URL returns an empty body.
+    let (xml, machine) = youtube
+        .caption_xml(VIDEO)
+        .expect("the caption document")
+        .expect("a document");
+    let lines = captions::parse_timedtext(&xml);
+    println!(
+        "{} lines (machine={machine}), first {:?}",
+        lines.len(),
+        lines.first()
+    );
+    assert!(lines.len() > 10, "a real document: {}", lines.len());
+    assert!(
+        lines.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "timestamps must ascend"
+    );
+
+    // And through the provider, which is what the lyrics worker calls.
+    let track = Track {
+        bvid: VIDEO.to_owned(),
+        source: Source::Youtube,
+        aid: 0,
+        cid: 0,
+        title: "Never Gonna Give You Up".to_owned(),
+        author: "Rick Astley".to_owned(),
+        duration: 213,
+        cover: None,
+    };
+    let (lyrics, machine) =
+        captions::fetch_for(&youtube, &track).expect("the provider should find a document");
+    println!(
+        "provider: {} lines, machine={machine}, source={:?}",
+        lyrics.lines.len(),
+        lyrics.source
+    );
+    assert!(!machine, "an official music video has human subtitles");
+    assert!(lyrics.lines.len() > 10);
+}
+
 /// LRCLib is the one lyric provider that serves both platforms, which is exactly
 /// why it was worth adding when YouTube turned out to have no usable native source.
 #[test]

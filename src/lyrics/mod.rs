@@ -2,6 +2,7 @@
 //! small on-disk cache so repeated plays do not re-query the third party.
 
 pub mod bilibili;
+pub mod captions;
 pub mod lrc;
 pub mod lrclib;
 pub mod netease;
@@ -85,7 +86,12 @@ fn machine_subtitle_reaches_into(duration_secs: u64, lyrics: &Lyrics) -> bool {
 ///
 /// Never returns an error: a missing lyric is a normal outcome, not a failure
 /// worth interrupting playback for.
-pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
+pub fn fetch_for(
+    api: &Api,
+    youtube: &crate::api::Youtube,
+    track: &Track,
+    cache_root: &Path,
+) -> Lyrics {
     if let Some(cached) = load_cached(cache_root, &track.key()) {
         return cached;
     }
@@ -113,10 +119,31 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
         }
     }
 
-    // LRCLib goes first for YouTube: it is the provider built around music, and
-    // what YouTube holds is mostly music videos. For a Bilibili upload it is tried
-    // after NetEase, because NetEase's catalogue covers Chinese pop better and its
-    // translations are merged into the document.
+    // YouTube's own subtitles first: for an official music video the uploader's
+    // document is the most faithful one, and no database match by title can beat it.
+    // The auto-generated ones are held back to the end, exactly like Bilibili's
+    // machine subtitles, and go through the same coverage guard.
+    let mut youtube_machine: Option<Lyrics> = None;
+    if track.source == Source::Youtube {
+        if let Some((lyrics, machine)) = captions::fetch_for(youtube, track) {
+            if !machine {
+                return finish(cache_root, &track.key(), lyrics);
+            }
+            if machine_subtitle_reaches_into(track.duration, &lyrics) {
+                youtube_machine = Some(lyrics);
+            } else {
+                eprintln!(
+                    "youtube auto captions for {} stop far short of the video's {}s; ignoring",
+                    track.bvid, track.duration
+                );
+            }
+        }
+    }
+
+    // LRCLib goes first among the databases for YouTube: it is the provider built
+    // around music, and what YouTube holds is mostly music videos. For a Bilibili
+    // upload it is tried after NetEase, because NetEase's catalogue covers Chinese
+    // pop better and its translations are merged into the document.
     if track.source == Source::Youtube {
         if let Some(lyrics) = try_lrclib(api, track) {
             return finish(cache_root, &track.key(), lyrics);
@@ -137,7 +164,7 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
         }
     }
 
-    match machine_fallback {
+    match machine_fallback.or(youtube_machine) {
         Some(lyrics) => finish(cache_root, &track.key(), lyrics),
         None => Lyrics::empty(LyricsSource::None),
     }
