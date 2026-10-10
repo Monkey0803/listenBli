@@ -343,50 +343,112 @@ impl App {
     }
 
     fn config_group(&mut self, ui: &mut Ui, accent: t::Accent) {
-        group(ui, icons::folder, "配置文件", accent, |ui| {
-            // Laid out by hand: the path is longer than the sheet is wide, so
-            // it has to be elided before the button gets its slot — otherwise
-            // it pushes the button out past the edge of the sheet.
-            let (row, _) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
-            let button = 30.0;
-            let button_rect = Rect::from_min_size(
-                Pos2::new(row.right() - button, row.center().y - button * 0.5),
-                Vec2::splat(button),
-            );
-            widgets::clipped_line(
+        group(ui, icons::folder, "配置与缓存", accent, |ui| {
+            let config = crate::config::config_path_display();
+            if path_row(
                 ui,
-                Rect::from_min_max(row.min, Pos2::new(button_rect.left() - 10.0, row.bottom())),
-                &crate::config::config_path_display(),
-                t::mono_font(11.0),
-                t::FG_3,
-                false,
-            );
-            if widgets::icon_button_at(
-                ui,
-                Id::new("copy-config-path"),
-                button_rect,
-                icons::copy,
-                false,
+                &config,
+                "config",
+                &[(icons::copy, "复制配置路径")],
                 accent,
-                "复制配置路径",
-            )
-            .clicked()
+            ) == Some(0)
             {
-                ui.ctx().copy_text(crate::config::config_path_display());
+                ui.ctx().copy_text(config);
                 self.notify("已复制到剪贴板");
             }
+            ui.add_space(4.0);
+
+            // The cache path is the one thing the app never showed, and it is
+            // where the disk actually goes — so it gets the extra button that
+            // opens it, which is what "clear the cache" needs.
+            let cache = platform::cache_dir().display().to_string();
+            let clicked = path_row(
+                ui,
+                &cache,
+                "cache",
+                &[
+                    (icons::copy, "复制缓存路径"),
+                    (icons::external, "在文件管理器中打开"),
+                ],
+                accent,
+            );
+            match clicked {
+                Some(0) => {
+                    ui.ctx().copy_text(cache);
+                    self.notify("已复制到剪贴板");
+                }
+                Some(1) => {
+                    if let Err(err) = platform::reveal_dir(&platform::cache_dir()) {
+                        self.notify(err);
+                    }
+                }
+                _ => {}
+            }
             ui.add_space(8.0);
+
+            let used = crate::net::human_bytes(self.cache_bytes.unwrap_or(0));
             ui.label(
-                RichText::new(
-                    "音量、无损开关、歌词偏好与登录凭据都存在这里；Windows 下位于 \
-                     %APPDATA%\\listenBli\\config\\。",
-                )
+                RichText::new(format!(
+                    "配置存偏好与登录凭据（Windows 在 %APPDATA%\\listenBli\\config\\）。\
+                     缓存占用 {used}：audio/ 音频、lyrics/v2/ 歌词，超过 2 GB 会按最久未使用\
+                     自动清理。"
+                ))
                 .size(11.0)
                 .color(t::FG_3),
             );
         });
     }
+}
+
+/// A path row: elided mono text with square icon buttons on the right.
+///
+/// Hand-laid-out because the path is longer than the sheet is wide: it has to be
+/// elided into whatever the buttons leave, otherwise it pushes them off the edge.
+/// Returns the index of the button that was clicked.
+fn path_row(
+    ui: &mut Ui,
+    text: &str,
+    id: &str,
+    buttons: &[(icons::Icon, &str)],
+    accent: t::Accent,
+) -> Option<usize> {
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+    let size = 30.0;
+    let gap = 4.0;
+    let mut clicked = None;
+    let mut right = row.right();
+
+    for (index, (icon, tip)) in buttons.iter().enumerate() {
+        right -= size;
+        let rect = Rect::from_min_size(
+            Pos2::new(right, row.center().y - size * 0.5),
+            Vec2::splat(size),
+        );
+        if widgets::icon_button_at(
+            ui,
+            Id::new(format!("{id}-{index}")),
+            rect,
+            *icon,
+            false,
+            accent,
+            tip,
+        )
+        .clicked()
+        {
+            clicked = Some(index);
+        }
+        right -= gap;
+    }
+
+    widgets::clipped_line(
+        ui,
+        Rect::from_min_max(row.min, Pos2::new(right, row.bottom())),
+        text,
+        t::mono_font(11.0),
+        t::FG_3,
+        false,
+    );
+    clicked
 }
 
 /// A titled group inside the sheet.

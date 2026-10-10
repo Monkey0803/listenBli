@@ -1628,6 +1628,100 @@ mod tests {
         output
     }
 
+    /// The settings sheet, where the config and cache paths live.
+    ///
+    /// Two things about it shape the tests below. It sits in an `egui` `Area`,
+    /// and a new area paints nothing until the pass *after* it is first laid out
+    /// — hence [`warm_settings`]. And it scrolls, so anything past the fold is
+    /// never painted; this renders at a window tall enough for the whole sheet,
+    /// otherwise assertions about its lower half would silently pass on nothing.
+    fn settings(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 1400.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            app.ui_settings_sheet(ui.ctx());
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    /// Lay the settings sheet out until it stops moving.
+    ///
+    /// Two reasons it takes more than one pass: it lives in an `egui` `Area`,
+    /// which paints nothing until the pass after it is first laid out, and each
+    /// path row places its buttons from the *elided* text width — so the buttons
+    /// shift sideways on the pass that first paints them. Reading a button's
+    /// rect before that lands puts a test's click into empty space.
+    fn warm_settings(ctx: &egui::Context, app: &mut App) {
+        for _ in 0..3 {
+            settings(ctx, app, vec![]);
+        }
+    }
+
+    /// The sheet has to name the cache directory: it is where the disk actually
+    /// goes, and there was previously no way to find it from inside the app.
+    #[test]
+    fn the_settings_sheet_shows_where_the_cache_is() {
+        let (mut app, ctx) = focused_app(&[]);
+        app.settings_open = true;
+        warm_settings(&ctx, &mut app);
+        let output = settings(&ctx, &mut app, vec![]);
+
+        let cache = crate::platform::cache_dir().display().to_string();
+        let texts: Vec<String> = painted_text(&output)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|text| *text == cache || cache.starts_with(text.as_str())),
+            "the cache path should be painted (elided if it is long): {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("缓存占用")),
+            "the sheet should say how much the cache is using: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains(&crate::config::config_path_display())),
+            "the config path should still be there: {texts:?}"
+        );
+    }
+
+    /// The copy and reveal buttons belong to the cache row, and the copy one has
+    /// to put the cache path — not the config path — on the clipboard.
+    #[test]
+    fn the_cache_path_can_be_copied_and_revealed() {
+        let (mut app, ctx) = focused_app(&[]);
+        app.settings_open = true;
+        warm_settings(&ctx, &mut app);
+        settings(&ctx, &mut app, vec![]);
+
+        let copy = ctx
+            .read_response(egui::Id::new("cache-0"))
+            .expect("the cache row should have a copy button");
+        assert!(
+            ctx.read_response(egui::Id::new("cache-1")).is_some(),
+            "the cache row should have a reveal button"
+        );
+
+        let released = click_at_capturing(&ctx, &mut app, copy.rect.center(), settings);
+        let expected = crate::platform::cache_dir().display().to_string();
+        let copied = released.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &expected),
+        );
+        assert!(
+            copied,
+            "缓存按钮应该把缓存路径交给剪贴板（{expected}），实际是 {:?}",
+            released.platform_output.commands
+        );
+    }
+
     /// Every string egui painted, with the rect it was painted into.
     fn painted_text(output: &egui::FullOutput) -> Vec<(String, Rect)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {

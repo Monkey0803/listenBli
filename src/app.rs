@@ -120,6 +120,9 @@ pub struct App {
     pub(crate) style_key: String,
     /// In-progress text of the settings sheet's font-path field.
     pub(crate) cjk_path_input: String,
+    /// Bytes under the cache directory, measured when the settings sheet opens
+    /// (a directory walk is cheap but should not run every frame).
+    pub(crate) cache_bytes: Option<u64>,
 }
 
 impl App {
@@ -216,6 +219,7 @@ impl App {
             fonts_key,
             style_key: String::new(),
             cjk_path_input: config_path_input,
+            cache_bytes: None,
         }
     }
 
@@ -765,6 +769,17 @@ impl App {
             .is_some_and(|(_, at)| at.elapsed() > TOAST_TTL)
         {
             self.toast = None;
+        }
+
+        // The settings sheet shows how much disk the cache is using. Measure on
+        // the frame it opens rather than every frame, and forget it again on
+        // close so reopening shows fresh numbers.
+        if self.settings_open {
+            if self.cache_bytes.is_none() {
+                self.cache_bytes = Some(crate::platform::dir_bytes(&crate::platform::cache_dir()));
+            }
+        } else {
+            self.cache_bytes = None;
         }
     }
 

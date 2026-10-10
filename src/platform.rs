@@ -43,6 +43,75 @@ pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Total size of everything under `path`, in bytes.
+///
+/// Best effort: entries that cannot be read are skipped, because this only feeds
+/// a "how much is the cache using" line and must never fail or stall a frame.
+/// The cache holds a few hundred files, so one walk is sub-millisecond.
+pub fn dir_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            total += dir_bytes(&entry.path());
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Show a directory in the OS file manager.
+///
+/// The directory is created if missing, so the button never fails just because
+/// nothing has been cached yet.
+pub fn reveal_dir(path: &Path) -> Result<(), String> {
+    let mut command = reveal_command(path)?;
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("打开文件夹失败：{err}"))
+}
+
+/// Validate the path and build the launcher, without running it.
+///
+/// Split out so the refusal is testable: a passing case would open a real window
+/// during `cargo test`.
+fn reveal_command(path: &Path) -> Result<Command, String> {
+    let _ = ensure_dir(path);
+    if !path.is_dir() {
+        return Err(format!("目录不存在：{}", path.display()));
+    }
+
+    // `Command` passes the path as one argument and never involves a shell, so a
+    // path containing spaces or metacharacters cannot become a second command.
+    #[cfg(target_os = "macos")]
+    let command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let command = {
+        let mut command = Command::new("explorer");
+        command.arg(path);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    Ok(command)
+}
+
 /// Windows fonts live under `%SystemRoot%\Fonts`; never hardcode `C:\Windows`
 /// because Windows may be installed on another drive.
 fn windows_fonts_dir() -> PathBuf {
@@ -383,6 +452,39 @@ mod tests {
     fn config_and_cache_dirs_are_absolute() {
         assert!(config_dir().is_absolute());
         assert!(cache_dir().is_absolute());
+    }
+
+    #[test]
+    fn dir_bytes_sums_nested_files_and_ignores_a_missing_root() {
+        let root = std::env::temp_dir().join(format!("listenbli-bytes-{}", std::process::id()));
+        let nested = root.join("lyrics").join("v2");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("a.bin"), vec![0u8; 1000]).unwrap();
+        fs::write(nested.join("b.bin"), vec![0u8; 24]).unwrap();
+
+        assert_eq!(dir_bytes(&root), 1024);
+        // A directory that does not exist reads as empty rather than failing:
+        // this only ever feeds a label.
+        assert_eq!(dir_bytes(&root.join("nope")), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The launcher is built but never run here — spawning it would open a Finder
+    /// window during `cargo test`. What matters is that a path which is not a
+    /// directory is refused instead of being handed to the OS.
+    #[test]
+    fn reveal_refuses_a_path_that_is_not_a_directory() {
+        let file = std::env::temp_dir().join(format!("listenbli-file-{}", std::process::id()));
+        fs::write(&file, b"x").unwrap();
+        assert!(reveal_command(&file).is_err());
+
+        let dir = std::env::temp_dir().join(format!("listenbli-dir-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(reveal_command(&dir).is_ok());
+
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `open_url` is the one place a URL from the network reaches a shell, so the
