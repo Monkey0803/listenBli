@@ -1040,6 +1040,72 @@ mod tests {
         assert!(bytes.windows(4).any(|window| window == 13u32.to_be_bytes()));
     }
 
+    /// The objective's own constraint, checked directly: the sample table's chunk
+    /// offset has to point at the audio the writer actually wrote.
+    ///
+    /// This is the failure that would not announce itself. A `stco` entry left short by
+    /// the metadata's size makes a file that plays and then reads the wrong bytes — no
+    /// error, no wrong size, just noise or the wrong song at the seek point. So the
+    /// offset is compared against where `mdat` really starts, and the bytes there are
+    /// compared against the samples that went in, for a tagged file and an untagged one.
+    #[test]
+    fn the_chunk_offset_points_at_the_audio_when_tags_are_written() {
+        let sizes = [5u32, 7, 3, 11];
+        let source = temp("tags-offset.m4s");
+        std::fs::write(&source, synthetic_fmp4(&sizes, 1024)).unwrap();
+
+        let tags = TrackTags {
+            title: "晴天".to_owned(),
+            artist: "周杰伦".to_owned(),
+            cover: Some(vec![0xFF, 0xD8, 0xFF, 0xE0, 9, 8, 7]),
+        };
+        let expected: Vec<u8> = sizes
+            .iter()
+            .enumerate()
+            .flat_map(|(index, size)| std::iter::repeat_n(index as u8 + 1, *size as usize))
+            .collect();
+
+        let mut lengths = Vec::new();
+        for (label, tagged) in [("untagged", false), ("tagged", true)] {
+            let out = temp(&format!("tags-offset-{label}.m4a"));
+            if tagged {
+                export_m4a_tagged(&source, &out, &tags).unwrap();
+            } else {
+                export_m4a(&source, &out).unwrap();
+            }
+            let bytes = std::fs::read(&out).unwrap();
+            lengths.push(bytes.len());
+
+            let (mdat_at, _) = find_box(&bytes, b"mdat").expect("an mdat");
+            let stco = find_nested(&bytes, b"stco").expect("an stco");
+            // size(4) kind(4) version/flags(4) entry_count(4) first_entry(4)
+            let entry = u32::from_be_bytes(bytes[stco + 16..stco + 20].try_into().unwrap());
+            assert_eq!(
+                entry as usize,
+                mdat_at + 8,
+                "{label}: stco must point at the mdat payload, not {} vs {}",
+                entry,
+                mdat_at + 8
+            );
+
+            let payload = &bytes[mdat_at + 8..];
+            assert_eq!(
+                &payload[..expected.len()],
+                &expected[..],
+                "{label}: the bytes at that offset must be the audio"
+            );
+            assert!(
+                payload.len() >= expected.len(),
+                "{label}: the mdat must hold every sample"
+            );
+        }
+
+        assert!(
+            lengths[1] > lengths[0],
+            "the tagged file should carry the metadata on top: {lengths:?}"
+        );
+    }
+
     /// An init segment's own `udta` must be merged into, not shadowed: a moov with two
     /// of them makes the writer's tags invisible to every reader, including a
     /// straightforward one.
