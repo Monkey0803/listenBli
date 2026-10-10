@@ -179,10 +179,61 @@ pub fn clipped_line(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color3
     paint_galley_centred(ui.painter(), Pos2::new(x, rect.center().y), galley, color);
 }
 
+/// The design's `.field__hint` leading: 11px text on a 1.6 line height.
+pub(crate) const HINT_LEADING: f32 = 1.6;
+
+/// `<text>` laid out wrapped, with the leading the design asks for.
+///
+/// epaint spaces its rows from the font's own metrics (a bit over 1.1× here),
+/// which is tighter than every multi-line paragraph in the design
+/// (`.field__hint` 1.6, `.modal__desc` 1.7, `.state__desc` 1.75). Without an
+/// explicit `TextFormat::line_height` two lines of a hint read as one block.
+/// `leading` is a multiple of the font size.
+fn wrapped(
+    ui: &Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+    leading: f32,
+) -> Arc<Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color,
+            line_height: Some(font.size * leading),
+            ..Default::default()
+        },
+    );
+    ui.painter().layout_job(job)
+}
+
+/// A left-aligned, wrapped hint line — the design's `.field__hint`.
+pub(crate) fn hint(ui: &mut Ui, text: &str, size: f32, color: Color32) {
+    let width = ui.available_width();
+    let galley = wrapped(ui, text, ui_font(size), color, width, HINT_LEADING);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, color);
+}
+
 /// A wrapped paragraph, centred inside the available width.
-pub fn centred_paragraph(ui: &mut Ui, text: &str, font: FontId, color: Color32, max_width: f32) {
+///
+/// `leading` is a multiple of the font size, as in the design's
+/// `.state__desc` (1.75) and `.modal__desc` (1.7).
+pub fn centred_paragraph(
+    ui: &mut Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+    leading: f32,
+) {
     let width = max_width.min(ui.available_width() - 32.0).max(80.0);
-    let galley = ui.painter().layout(text.to_owned(), font, color, width);
+    let galley = wrapped(ui, text, font, color, width, leading);
     let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
     ui.painter().galley(rect.min, galley, color);
 }
@@ -823,7 +874,7 @@ pub fn empty_state(
         ui.label(egui::RichText::new(title).size(15.0).color(theme::FG_2));
         ui.add_space(6.0);
         if !desc.is_empty() {
-            centred_paragraph(ui, desc, ui_font(12.5), theme::FG_3, 380.0);
+            centred_paragraph(ui, desc, ui_font(12.5), theme::FG_3, 380.0, 1.75);
         }
         if !suggestions.is_empty() {
             ui.add_space(14.0);
@@ -872,4 +923,64 @@ pub fn skeleton(ui: &mut Ui, rows: usize, row_h: f32) {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The row step of the first wrapped galley, i.e. the leading in pixels.
+    ///
+    /// ASCII on purpose: the assertion is about the leading, and a CJK sample
+    /// would lay out differently on a machine without a Chinese font.
+    fn leading_of(text: &str, build: impl FnOnce(&mut Ui)) -> f32 {
+        let ctx = egui::Context::default();
+        let mut build = Some(build);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            if let Some(build) = build.take() {
+                build(ui);
+            }
+        });
+        // epaint's font atlas arrives as a texture delta that a headless test
+        // has nothing to upload; dropping it unhandled panics.
+        output.textures_delta.clear();
+        for clipped in output.shapes {
+            if let egui::Shape::Text(text_shape) = clipped.shape {
+                let rows = &text_shape.galley.rows;
+                assert!(
+                    rows.len() >= 2,
+                    "{text:?} should have wrapped into two rows"
+                );
+                return rows[1].pos.y - rows[0].pos.y;
+            }
+        }
+        panic!("{text:?} should have been painted as text");
+    }
+
+    #[test]
+    fn hints_keep_the_designs_leading() {
+        let text = "The quick brown fox jumps over the lazy dog, and then does it again.";
+        let step = leading_of(text, |ui| {
+            ui.set_max_width(220.0);
+            hint(ui, text, 11.0, theme::FG_3);
+        });
+        let expected = 11.0 * HINT_LEADING;
+        assert!(
+            (step - expected).abs() < 0.75,
+            "hint leading should be {expected}, got {step}"
+        );
+    }
+
+    #[test]
+    fn paragraphs_keep_the_designs_leading() {
+        let text = "The quick brown fox jumps over the lazy dog, and then does it again.";
+        let step = leading_of(text, |ui| {
+            centred_paragraph(ui, text, ui_font(12.5), theme::FG_3, 240.0, 1.75);
+        });
+        let expected = 12.5 * 1.75;
+        assert!(
+            (step - expected).abs() < 0.75,
+            "paragraph leading should be {expected}, got {step}"
+        );
+    }
 }

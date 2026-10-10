@@ -63,6 +63,7 @@ impl App {
                         t::ui_font(12.5),
                         t::FG_3,
                         360.0,
+                        1.7,
                     );
                     ui.add_space(22.0);
 

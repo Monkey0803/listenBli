@@ -235,10 +235,11 @@ impl App {
             }
 
             ui.add_space(10.0);
-            ui.label(
-                RichText::new("自动探测失败时界面中文会显示为方块，此时在下面填入字体绝对路径。")
-                    .size(11.0)
-                    .color(t::FG_3),
+            widgets::hint(
+                ui,
+                "自动探测失败时界面中文会显示为方块，此时在下面填入字体绝对路径。",
+                11.0,
+                t::FG_3,
             );
             ui.add_space(9.0);
 
@@ -322,13 +323,12 @@ impl App {
                 _ => {}
             }
             ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "配置文件位置固定，登录凭据存在里面；Windows 下为 \
-                     %APPDATA%\\listenBli\\config\\。",
-                )
-                .size(11.0)
-                .color(t::FG_3),
+            widgets::hint(
+                ui,
+                "配置文件位置固定，登录凭据存在里面；Windows 下为 \
+                 %APPDATA%\\listenBli\\config\\。",
+                11.0,
+                t::FG_3,
             );
 
             // -- the cache: movable, opened, or reset to the default ----------
@@ -387,13 +387,14 @@ impl App {
 
             ui.add_space(8.0);
             let used = crate::net::human_bytes(self.cache_bytes.unwrap_or(0));
-            ui.label(
-                RichText::new(format!(
+            widgets::hint(
+                ui,
+                &format!(
                     "缓存占用 {used}，超过 2 GB 会按最久未使用自动清理；改动目录只影响之后写入的\
                      文件，已有文件不会搬动。"
-                ))
-                .size(11.0)
-                .color(t::FG_3),
+                ),
+                11.0,
+                t::FG_3,
             );
         });
     }
