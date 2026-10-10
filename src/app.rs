@@ -11,7 +11,7 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use crate::api::client::Api;
 use crate::api::models::{AudioQuality, FavFolder, Track, UserInfo};
-use crate::audio::AudioEngine;
+use crate::audio::{AudioEngine, SeekOutcome};
 use crate::config::{Config, SharedConfig};
 use crate::lyrics::Lyrics;
 use crate::net::{self, Cmd, Evt, Worker};
@@ -455,11 +455,11 @@ impl App {
 
     /// Seek without ever freezing the UI thread.
     ///
-    /// `Player::try_seek` blocks until the decoder has moved. For a track that is
-    /// still streaming, that means waiting on bytes that may not have arrived
-    /// yet, so a jump beyond the download frontier is refused instead of
-    /// hanging the window. The buffer fills within seconds, after which every
-    /// position is available.
+    /// The decision lives in the engine, which knows whether the installed
+    /// decoder can seek at all. A track that is still arriving plays through an
+    /// unseekable decoder (that is what lets it start early), so a jump backwards
+    /// waits for the file to complete; the engine reports which of those
+    /// happened and this only turns it into a message.
     ///
     /// Nothing is loaded while a decoder is still being built, so a seek then
     /// has no source to move and is refused rather than handed to the player.
@@ -467,17 +467,19 @@ impl App {
         if self.loading {
             return;
         }
-        let allowed = self
-            .engine
-            .as_ref()
-            .is_some_and(|engine| engine.can_seek_without_waiting(target));
-        if !allowed {
-            self.set_status("音频仍在缓冲，暂时无法跳转到该位置", false);
+        let Some(engine) = self.engine.as_mut() else {
+            // No output device: nothing can move, and saying so beats silence.
+            self.set_status("音频输出不可用，无法跳转", true);
             return;
-        }
-        let outcome = self.engine.as_ref().map(|engine| engine.seek(target));
-        if let Some(Err(err)) = outcome {
-            self.set_status(format!("跳转失败：{err}"), true);
+        };
+        match engine.seek(target) {
+            SeekOutcome::Seeked => {}
+            SeekOutcome::Upgrading => {
+                self.set_status("正在打开可跳转的副本，稍后跳转…", false);
+            }
+            SeekOutcome::Refused => {
+                self.set_status("音频仍在缓冲，暂时无法回退到该位置", false);
+            }
         }
     }
 

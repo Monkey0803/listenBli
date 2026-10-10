@@ -15,7 +15,7 @@ use crossbeam_channel::Receiver;
 use listenbli::api::client::Api;
 use listenbli::api::cookie::CookieJar;
 use listenbli::api::models::Track;
-use listenbli::audio::{looks_like_iso_bmff, AudioEngine};
+use listenbli::audio::{looks_like_iso_bmff, AudioEngine, SeekOutcome};
 use listenbli::config::{self, Config};
 use listenbli::net::{Cmd, Evt, Worker};
 
@@ -372,17 +372,23 @@ fn audio_engine_starts_and_advances_playback() {
     );
 
     // Seeking must work on the real decoder, and must clamp past the end.
-    engine
-        .seek(Duration::from_secs(60))
-        .expect("seek should work");
+    // This track is a cached file, so it is opened seekable and every jump is
+    // available immediately.
+    assert_eq!(
+        engine.seek(Duration::from_secs(60)),
+        SeekOutcome::Seeked,
+        "a complete file must be seekable"
+    );
     let after_seek = engine.position();
     assert!(
         after_seek >= Duration::from_secs(55),
         "seek did not move the position: {after_seek:?}"
     );
-    engine
-        .seek(Duration::from_secs(999_999))
-        .expect("an over-long seek should clamp, not fail");
+    assert_eq!(
+        engine.seek(Duration::from_secs(999_999)),
+        SeekOutcome::Seeked,
+        "an over-long seek should clamp, not fail"
+    );
     assert!(
         engine.position() <= engine.duration(),
         "position must stay within the duration"

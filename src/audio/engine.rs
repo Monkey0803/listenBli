@@ -14,7 +14,7 @@ use std::time::Duration;
 use rodio::decoder::DecoderBuilder;
 use rodio::{Decoder, MixerDeviceSink, Player, Source};
 
-use super::stream::{BlockingFileReader, PlaybackSource, StreamState};
+use super::stream::{BlockingFileReader, PlaybackSource, StreamState, StreamStatus};
 
 /// A decoder that has been built and is ready to hand to the player.
 ///
@@ -29,31 +29,49 @@ enum PrepareJob {
         path: PathBuf,
         total: u64,
         state: Arc<StreamState>,
+        /// Whether to declare the source seekable.
+        ///
+        /// This is the single most consequential flag in the file. Symphonia's
+        /// ISO-BMFF reader only stops early — at the first `moof`/`mdat` — when
+        /// the source is *un*seekable; a seekable source makes it scan every
+        /// atom to build its index, which means reading to the end of the file.
+        /// Measured on a real 181.9 MB segment:
+        ///
+        /// * `seekable(true)`: `build()` took 3.6 s, having waited for 100% of
+        ///   the file to arrive, across 7983 reads;
+        /// * `seekable(false)`: `build()` took 1.1 ms after **5 reads and 30 KB**.
+        ///
+        /// So a file still arriving must be opened unseekable to play early. The
+        /// cost is that symphonia will then only move *forward* (by ignoring
+        /// bytes) — see `AudioEngine::seek`, which re-opens the file seekably
+        /// once it is complete so that jumping back still works.
+        seekable: bool,
     },
 }
 
 impl PrepareJob {
-    fn of(source: &PlaybackSource) -> Self {
+    /// A job for a track that is still arriving.
+    fn streaming(source: &PlaybackSource) -> Option<Self> {
         match source {
-            PlaybackSource::Complete(path) => PrepareJob::Complete(path.clone()),
-            PlaybackSource::Streaming { path, total, state } => PrepareJob::Streaming {
+            PlaybackSource::Streaming { path, total, state } => Some(PrepareJob::Streaming {
                 path: path.clone(),
                 total: *total,
                 state: Arc::clone(state),
-            },
+                // Play as soon as the first fragment lands; seeking is handled
+                // by `AudioEngine::seek` re-opening once the file is complete.
+                seekable: false,
+            }),
+            PlaybackSource::Complete(_) => None,
         }
     }
 }
 
 /// Open a decoder. **Blocking, and expensive — never call this on the UI thread.**
 ///
-/// Symphonia's ISO-BMFF reader walks the whole segment to build its sample
-/// tables, so this does not return until it has read the file to the end.
-/// Measured against real segments: 100.00% of both a 4.7 MB and a 182 MB file is
-/// read before `build()` returns; the small one takes 10 ms of CPU and the large
-/// one is bounded only by how fast it arrives. Called inline it froze the window
-/// for the length of the download, which is the whole reason this runs on a
-/// thread.
+/// With `seekable` set this does not return until it has read the file to the
+/// end, so for a segment that is still arriving it is bounded only by the
+/// download; see [`PrepareJob::Streaming::seekable`] for the measurements. This
+/// always runs on a worker thread, which is why it may block freely.
 fn build_source(job: PrepareJob) -> Result<PreparedSource, String> {
     match job {
         PrepareJob::Complete(path) => {
@@ -63,13 +81,18 @@ fn build_source(job: PrepareJob) -> Result<PreparedSource, String> {
                 .map_err(|e| format!("解码失败（音频格式可能不受支持）: {e}"))?;
             Ok(Box::new(decoder))
         }
-        PrepareJob::Streaming { path, total, state } => {
+        PrepareJob::Streaming {
+            path,
+            total,
+            state,
+            seekable,
+        } => {
             let reader = BlockingFileReader::open(&path, state)
                 .map_err(|e| format!("无法打开音频缓存 {}: {e}", path.display()))?;
             let decoder = DecoderBuilder::new()
                 .with_data(reader)
                 .with_byte_len(total)
-                .with_seekable(true)
+                .with_seekable(seekable)
                 .build()
                 .map_err(|e| format!("解码失败（音频格式可能不受支持）: {e}"))?;
             Ok(Box::new(decoder))
@@ -98,6 +121,27 @@ struct Pending {
     duration: Duration,
     key: String,
     stream: Option<Arc<StreamState>>,
+    path: PathBuf,
+}
+
+/// A seekable decoder being opened over a file that has finished downloading,
+/// so that a jump backwards becomes possible again.
+struct Upgrade {
+    rx: Receiver<Result<PreparedSource, String>>,
+    target: Duration,
+}
+
+/// What a seek request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekOutcome {
+    /// The source moved.
+    Seeked,
+    /// The jump needs a seekable view of the file, which is being opened; it
+    /// will happen when that lands.
+    Upgrading,
+    /// Nothing is loaded, or the wanted position is behind the play head while
+    /// the file is still arriving.
+    Refused,
 }
 
 /// Clamp a requested position into `0..=duration`.
@@ -131,6 +175,14 @@ pub struct AudioEngine {
     stream: Option<Arc<StreamState>>,
     /// A decoder still being built for the newest selection.
     pending: Option<Pending>,
+    /// Whether the *installed* decoder can seek freely. False while a segment is
+    /// being played unseekable so that it could start early.
+    source_seekable: bool,
+    /// The file behind the installed decoder, needed to re-open it seekably.
+    path: PathBuf,
+    /// A seekable re-open in flight, requested by a jump the current source
+    /// cannot make.
+    upgrade: Option<Upgrade>,
 }
 
 impl AudioEngine {
@@ -147,6 +199,9 @@ impl AudioEngine {
             loaded_key: None,
             stream: None,
             pending: None,
+            source_seekable: true,
+            path: PathBuf::new(),
+            upgrade: None,
         })
     }
 
@@ -156,33 +211,47 @@ impl AudioEngine {
     /// Nothing here blocks: the window must stay responsive while a segment is
     /// being read, which for a long upload is the whole download.
     ///
+    /// A segment still arriving is opened *unseekable* so that playback can begin
+    /// as soon as its first fragment lands rather than after the whole file
+    /// (see [`PrepareJob::Streaming::seekable`]). A file already on disk is
+    /// opened seekable, as before.
+    ///
     /// Playback of the previous track stops now, because the new one cannot
-    /// start until its segment has been fully read and letting the old song
-    /// continue under a new title would misrepresent what is happening.
+    /// start instantly and letting the old song continue under a new title would
+    /// misrepresent what is happening.
     pub fn play_stream(
         &mut self,
         source: &PlaybackSource,
         duration: Duration,
         key: impl Into<String>,
     ) {
-        let job = PrepareJob::of(source);
+        let job = match PrepareJob::streaming(source) {
+            Some(job) => job,
+            None => PrepareJob::Complete(source.path().to_path_buf()),
+        };
         self.pending = Some(Pending {
             rx: spawn_prepare(job),
             duration,
             key: key.into(),
             stream: source.stream_state().cloned(),
+            path: source.path().to_path_buf(),
         });
+        self.upgrade = None;
         self.player.stop();
         self.loaded_key = None;
         self.stream = None;
         self.duration = duration;
     }
 
-    /// Install a decoder that finished building.
+    /// Install a decoder that finished building, or a seekable re-open that did.
     ///
-    /// `None` while the newest selection is still being prepared; `Some(Ok(()))`
-    /// once it is playing; `Some(Err(_))` if it could not be opened.
+    /// `None` while nothing is ready; `Some(Ok(()))` once something was
+    /// installed; `Some(Err(_))` if it could not be opened.
     pub fn poll(&mut self) -> Option<Result<(), String>> {
+        if let Some(outcome) = self.poll_upgrade() {
+            return Some(outcome);
+        }
+
         let pending = self.pending.as_ref()?;
         match pending.rx.try_recv() {
             Ok(Ok(source)) => {
@@ -190,9 +259,12 @@ impl AudioEngine {
                     duration,
                     key,
                     stream,
+                    path,
                     ..
                 } = self.pending.take().expect("checked just above");
-                self.install(source, duration, key, stream);
+                let seekable = stream.is_none();
+                self.path = path;
+                self.install(source, duration, key, stream, seekable, None);
                 Some(Ok(()))
             }
             Ok(Err(err)) => {
@@ -207,6 +279,33 @@ impl AudioEngine {
         }
     }
 
+    /// Install a seekable re-open once it lands, jumping to the position that
+    /// asked for it.
+    ///
+    /// Reports like [`AudioEngine::poll`] does, so a caller that is waiting for a
+    /// jump to happen can see it: the audio keeps playing throughout, so there is
+    /// no other signal that the swap occurred.
+    fn poll_upgrade(&mut self) -> Option<Result<(), String>> {
+        let upgrade = self.upgrade.as_ref()?;
+        let arrived = match upgrade.rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err("解码线程意外退出".to_string()),
+        };
+        let target = self.upgrade.take().expect("checked just above").target;
+        match arrived {
+            Ok(source) => {
+                let duration = self.duration;
+                let key = self.loaded_key.clone().unwrap_or_default();
+                // The file is whole now, so `stream` clears: reads no longer block.
+                self.install(source, duration, key, None, true, Some(target));
+                Some(Ok(()))
+            }
+            // The old source is still playing; only the jump was lost.
+            Err(err) => Some(Err(err)),
+        }
+    }
+
     /// True while the newest selection's decoder is still being built.
     pub fn is_preparing(&self) -> bool {
         self.pending.is_some()
@@ -218,14 +317,20 @@ impl AudioEngine {
         duration: Duration,
         key: String,
         stream: Option<Arc<StreamState>>,
+        seekable: bool,
+        resume_at: Option<Duration>,
     ) {
         self.player.stop();
         self.duration = duration;
         self.stream = stream;
+        self.source_seekable = seekable;
         self.player.append(source);
         self.player.set_volume(self.volume);
         self.player.play();
         self.loaded_key = Some(key);
+        if let Some(target) = resume_at {
+            let _ = self.player.try_seek(clamp_position(target, duration));
+        }
     }
 
     /// The in-flight stream for the current track, if any.
@@ -239,7 +344,9 @@ impl AudioEngine {
         // download means it still finishes and leaves a complete cache entry for
         // the next play.
         self.pending = None;
+        self.upgrade = None;
         self.stream = None;
+        self.source_seekable = true;
         self.player.stop();
         self.loaded_key = None;
         self.duration = Duration::ZERO;
@@ -287,38 +394,76 @@ impl AudioEngine {
         progress_ratio(self.position(), self.duration)
     }
 
-    pub fn seek(&self, position: Duration) -> Result<(), String> {
+    /// Move the play head, without ever blocking the calling thread.
+    ///
+    /// Three things can happen, because a segment that is still arriving is
+    /// played through an *unseekable* decoder (that is what lets it start at
+    /// all — see [`PrepareJob::Streaming::seekable`]):
+    ///
+    /// * The installed decoder is seekable (a cached file, or one that has been
+    ///   upgraded), so the jump happens now.
+    /// * It is not, and the target is ahead of the play head within the buffered
+    ///   region: symphonia emulates that by ignoring the bytes in between, so it
+    ///   also happens now.
+    /// * It is not, and the target is *behind* the play head. Nothing can make an
+    ///   unseekable decoder go back, so if the file has finished downloading we
+    ///   open a seekable view of it and jump when that lands. While it is still
+    ///   arriving there is genuinely nothing to do, and the request is refused
+    ///   rather than left to block on bytes that are not there yet.
+    ///
+    /// `Player::try_seek` waits for the decoder to move, which for an unseekable
+    /// source reading past the download frontier would mean blocking on the
+    /// network, so every path here is checked before it is taken.
+    pub fn seek(&mut self, position: Duration) -> SeekOutcome {
+        if self.pending.is_some() || self.upgrade.is_some() || self.loaded_key.is_none() {
+            return SeekOutcome::Refused;
+        }
         let target = clamp_position(position, self.duration);
-        self.player
-            .try_seek(target)
-            .map_err(|e| format!("跳转失败: {e:?}"))
+
+        if self.source_seekable {
+            return match self.player.try_seek(target) {
+                Ok(()) => SeekOutcome::Seeked,
+                Err(_) => SeekOutcome::Refused,
+            };
+        }
+
+        // Unseekable: forward jumps inside the buffer are emulated by the reader.
+        let buffered = self
+            .stream
+            .as_ref()
+            .map_or(1.0, |state| state.buffered_fraction() as f64);
+        let frontier = self.duration.mul_f64(buffered * 0.9);
+        if target >= self.player.get_pos() && target <= frontier {
+            return match self.player.try_seek(target) {
+                Ok(()) => SeekOutcome::Seeked,
+                Err(_) => SeekOutcome::Refused,
+            };
+        }
+
+        if self.stream_is_complete() && !self.path.as_os_str().is_empty() {
+            self.upgrade = Some(Upgrade {
+                rx: spawn_prepare(PrepareJob::Complete(self.path.clone())),
+                target,
+            });
+            return SeekOutcome::Upgrading;
+        }
+        SeekOutcome::Refused
     }
 
-    pub fn seek_fraction(&self, fraction: f32) -> Result<(), String> {
+    pub fn seek_fraction(&mut self, fraction: f32) -> SeekOutcome {
         let fraction = fraction.clamp(0.0, 1.0);
         let target = self.duration.mul_f32(fraction);
         self.seek(target)
     }
 
-    /// Whether a seek to `target` can complete without waiting on the download.
+    /// Has every expected byte of the current track's segment landed?
     ///
-    /// `Player::try_seek` blocks the calling thread until the decoder has moved,
-    /// and for a streaming source that means blocking on the blocking reader
-    /// when the target lies beyond the download frontier. Since seeking happens
-    /// on the UI thread, callers must check this first and refuse (or defer)
-    /// rather than freeze the window.
-    pub fn can_seek_without_waiting(&self, target: Duration) -> bool {
-        let Some(state) = &self.stream else {
-            return true;
-        };
-        if !state.is_running() {
-            // Complete, failed or cancelled: reads no longer block (or fail fast).
-            return true;
-        }
-        // AAC is roughly constant bitrate, so bytes map proportionally to time.
-        let buffered = self.duration.mul_f64(state.buffered_fraction() as f64);
-        // Leave a margin so we never land right on the frontier.
-        target <= buffered.mul_f64(0.9)
+    /// Deliberately not `!is_running()`: a failed or cancelled download leaves a
+    /// truncated file, which must never be re-opened as if it were whole.
+    fn stream_is_complete(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|state| state.status() == StreamStatus::Finished)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -376,6 +521,38 @@ mod tests {
         bytes
     }
 
+    /// Regression: the flag that decides whether playback can start early.
+    ///
+    /// Symphonia scans every atom — the whole file — when the source claims to
+    /// be seekable, so a segment that is still arriving must never be opened
+    /// that way. Measured on a 181.9 MB segment: seekable took 3.6 s and waited
+    /// for 100% of the bytes; unseekable took 1.1 ms after 30 KB.
+    #[test]
+    fn a_still_arriving_segment_is_opened_unseekable() {
+        let state = Arc::new(StreamState::new(1024));
+        let source = PlaybackSource::Streaming {
+            path: PathBuf::from("/tmp/listenbli-does-not-exist.m4s"),
+            total: 1024,
+            state,
+        };
+        match PrepareJob::streaming(&source).expect("a streaming source yields a job") {
+            PrepareJob::Streaming { seekable, .. } => assert!(
+                !seekable,
+                "an unfinished segment must be opened unseekable or it waits for all of it"
+            ),
+            PrepareJob::Complete(_) => {
+                panic!("a streaming source must not be opened as a complete file")
+            }
+        }
+
+        // A file already on disk keeps full seeking; it costs a local scan.
+        let complete = PlaybackSource::Complete(PathBuf::from("/tmp/listenbli.m4s"));
+        assert!(
+            PrepareJob::streaming(&complete).is_none(),
+            "a cached file must take the seekable path"
+        );
+    }
+
     /// Regression: opening a decoder used to happen inline, and symphonia reads
     /// the *whole* segment while building its tables, so a click froze the window
     /// for the length of the download. Queueing it must cost nothing.
@@ -398,6 +575,8 @@ mod tests {
             path: path.clone(),
             total,
             state: Arc::clone(&state),
+            // What a still-arriving segment is really opened with.
+            seekable: false,
         });
         let handoff = started.elapsed();
         assert!(
