@@ -25,9 +25,11 @@ use crate::api::models::Track;
 const DURATION_TOLERANCE_SECS: f64 = 8.0;
 
 #[derive(Debug, Deserialize)]
+/// One search result.
+///
+/// The response echoes the query back as `trackName`, which is why it is not
+/// parsed: matching on the words we just sent would only re-test the query.
 struct Hit {
-    #[serde(default, rename = "trackName")]
-    track_name: String,
     #[serde(default, rename = "artistName")]
     artist_name: String,
     #[serde(default)]

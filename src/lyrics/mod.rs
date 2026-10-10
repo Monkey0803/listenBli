@@ -127,9 +127,8 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
     if let Err(err) = &netease {
         eprintln!("netease lyrics for {} failed: {err}", track.bvid);
     }
-    match netease {
-        Ok(Some(lyrics)) => return finish(cache_root, &track.key(), lyrics),
-        Ok(None) | Err(_) => {}
+    if let Ok(Some(lyrics)) = netease {
+        return finish(cache_root, &track.key(), lyrics);
     }
 
     if track.source == Source::Bilibili {
