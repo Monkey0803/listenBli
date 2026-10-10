@@ -97,9 +97,44 @@ pub fn resolve(
 /// Read a `player` response.
 ///
 /// A refusal is reported with YouTube's own words: "Video unavailable",
-/// "This video is not available in your country", "Sign in to confirm you're not a
-/// bot" are all actionable to a person and none of them are guessable, so they are
-/// passed through rather than mapped onto a generic message.
+/// Explain a refusal, leading in Chinese and keeping YouTube's own words.
+///
+/// The first attempt passed YouTube's reason straight through. That is wrong for the
+/// case people actually hit: "Sign in to confirm you're not a bot" is English, names
+/// no action, and arrives when an IP looks like a scraper — the user can do something
+/// about it (another network, a moment later, an account) and would never guess that
+/// from the sentence. The original is still shown, in brackets, because it is the one
+/// thing that is ever exactly right.
+fn refusal(status: &str, reason: &str) -> String {
+    let lower = reason.to_ascii_lowercase();
+    // `not a bot` and not the wider `sign in to confirm`: the age refusal carries the
+    // same prefix, and matching it here would answer an age wall with bot advice.
+    // Every message leads with the same two words: the status bar is skimmed, and a
+    // person should never have to work out whether "不可播放" and "无法播放" mean the
+    // same thing.
+    let explanation = if lower.contains("not a bot") {
+        "无法播放：YouTube 要求验证这不是机器人，可换网络、稍后再试或登录账号"
+    } else if lower.contains("age") {
+        "无法播放：该视频有年龄限制，需要登录账号"
+    } else if lower.contains("country") || lower.contains("region") {
+        "无法播放：该视频在您所在地区受限"
+    } else if lower.contains("private") {
+        "无法播放：该视频已被设为私享"
+    } else if lower.contains("removed") || lower.contains("deleted") {
+        "无法播放：该视频已被删除"
+    } else if status == "LIVE_STREAM_OFFLINE" {
+        "无法播放：直播已结束"
+    } else if lower.contains("premier") {
+        "无法播放：首播尚未开始"
+    } else if lower.contains("sign in to confirm") {
+        "无法播放：该视频需要登录后确认身份"
+    } else if lower.contains("unavailable") {
+        "无法播放：视频不可用（可能已删除、设为私享或受版权限制）"
+    } else {
+        "无法播放：YouTube 未说明原因"
+    };
+    format!("{explanation}（YouTube：{reason} / {status}）")
+}
 pub fn parse(response: &Value) -> Result<Playable, YoutubeError> {
     let status = response
         .get("playabilityStatus")
@@ -112,9 +147,7 @@ pub fn parse(response: &Value) -> Result<Playable, YoutubeError> {
             .and_then(|status| status.get("reason"))
             .and_then(Value::as_str)
             .unwrap_or("YouTube 未给出原因");
-        return Err(YoutubeError::Api(format!(
-            "无法播放该视频：{reason}（{status}）"
-        )));
+        return Err(YoutubeError::Api(refusal(status, reason)));
     }
 
     let details = response
@@ -270,9 +303,10 @@ mod tests {
         assert!(playable.best_audio().is_none());
     }
 
-    /// YouTube's own reason is what makes a refusal actionable, so it must survive.
+    /// YouTube's own reason must survive even though it is no longer the whole
+    /// message: it is the only part that is exactly right.
     #[test]
-    fn a_refusal_is_reported_in_youtubes_words() {
+    fn a_refusal_is_explained_and_youtubes_words_survive() {
         let response = json!({
             "playabilityStatus": {
                 "status": "UNPLAYABLE",
@@ -280,8 +314,66 @@ mod tests {
             }
         });
         let err = parse(&response).unwrap_err().to_string();
+        assert!(err.contains("所在地区"), "got {err}");
         assert!(err.contains("This video is not available"), "got {err}");
         assert!(err.contains("UNPLAYABLE"), "got {err}");
+    }
+
+    /// Every refusal a person can do something about gets a sentence that says what
+    /// to do — and the bot wall, which is the one that actually shows up, leads.
+    #[test]
+    fn refusals_name_an_action_in_chinese() {
+        let cases = [
+            (
+                "LOGIN_REQUIRED",
+                "Sign in to confirm you're not a bot. This helps protect our community.",
+                "可换网络",
+            ),
+            ("LOGIN_REQUIRED", "Sign in to confirm your age", "年龄限制"),
+            (
+                "UNPLAYABLE",
+                "This video is not available in your country",
+                "所在地区",
+            ),
+            ("UNPLAYABLE", "This video is private", "私享"),
+            (
+                "ERROR",
+                "This video has been removed by the uploader",
+                "已被删除",
+            ),
+            (
+                "LIVE_STREAM_OFFLINE",
+                "This live stream has ended",
+                "直播已结束",
+            ),
+            ("UNPLAYABLE", "This video is unavailable", "视频不可用"),
+            ("ERROR", "Something nobody has seen before", "无法播放"),
+            // The age refusal carries the bot refusal's prefix; the specific cause
+            // has to win.
+            (
+                "LOGIN_REQUIRED",
+                "Sign in to confirm something else",
+                "需要登录",
+            ),
+        ];
+        for (status, reason, expected) in cases {
+            let message = refusal(status, reason);
+            // Every refusal opens the same way: the live suite depends on that
+            // shape, and so does a person skimming the status bar.
+            assert!(
+                message.starts_with("无法播放："),
+                "{reason:?} should open as a refusal, got {message:?}"
+            );
+            assert!(
+                message.contains(expected),
+                "{reason:?} should mention {expected:?}, got {message:?}"
+            );
+            // Whatever else happens, the original is never dropped.
+            assert!(
+                message.contains(reason),
+                "the original must survive: {message:?}"
+            );
+        }
     }
 
     #[test]

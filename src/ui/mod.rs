@@ -252,21 +252,10 @@ impl App {
                 self.tab = tab;
             }
             ui.add_space(8.0);
-            // The platform switch sits between the tabs and the field, so it reads
-            // as part of "what am I looking at" rather than as a setting. The label
-            // says where a click goes, which needs no explaining.
-            let on_youtube = self.source == Source::Youtube;
-            let label = if on_youtube {
-                "切到 B 站"
-            } else {
-                "切到 YouTube"
-            };
-            if chip(ui, label, None, None, on_youtube, accent).clicked() {
-                self.set_source(if on_youtube {
-                    Source::Bilibili
-                } else {
-                    Source::Youtube
-                });
+            // The platform control sits between the tabs and the field, so it reads
+            // as part of "what am I looking at" rather than as a setting.
+            if let Some(source) = self.source_control(ui) {
+                self.set_source(source);
             }
             ui.add_space(8.0);
             self.search_field(ui);
@@ -355,6 +344,73 @@ impl App {
     }
 
     /// The three-way tab control from the design's `.segmented`.
+    /// The platform control: two cells, the current one filled.
+    ///
+    /// A segmented control rather than a button reading "switch to …": both options
+    /// stay visible, so it shows a state instead of offering a command, and it is
+    /// drawn like the tab control beside it because it answers the same kind of
+    /// question.
+    fn source_control(&mut self, ui: &mut Ui) -> Option<Source> {
+        const ENTRIES: [(Source, &str); 2] =
+            [(Source::Bilibili, "B 站"), (Source::Youtube, "YouTube")];
+
+        let font = t::ui_font(12.5);
+        let mut widths = [0.0f32; 2];
+        for (index, (_, label)) in ENTRIES.iter().enumerate() {
+            widths[index] = widgets::measure(ui, label, &font).x + 32.0;
+        }
+        let total: f32 = widths.iter().sum::<f32>() + 6.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 32.0), Sense::hover());
+        let painter = ui.painter().clone();
+        painter.rect_filled(rect, t::R_MD, t::white(0.045));
+        painter.rect_stroke(
+            rect,
+            t::R_MD,
+            Stroke::new(1.0, t::LINE),
+            egui::StrokeKind::Inside,
+        );
+
+        let mut picked = None;
+        let mut cursor = rect.left() + 3.0;
+        for (index, (source, label)) in ENTRIES.iter().enumerate() {
+            let cell = Rect::from_min_size(
+                Pos2::new(cursor, rect.top() + 3.0),
+                Vec2::new(widths[index], 26.0),
+            );
+            let response = ui.interact(cell, ui.id().with(("source", index)), Sense::click());
+            let active = self.source == *source;
+            if active {
+                painter.rect_filled(cell, 7.0, t::INK_4);
+                painter.rect_stroke(
+                    cell,
+                    7.0,
+                    Stroke::new(1.0, t::white(0.06)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let fg = if active {
+                t::FG
+            } else if response.hovered() {
+                t::FG_2
+            } else {
+                t::FG_3
+            };
+            widgets::label_at(
+                ui,
+                Pos2::new(cell.center().x, cell.center().y),
+                Align2::CENTER_CENTER,
+                label,
+                font.clone(),
+                fg,
+            );
+            if response.clicked() {
+                picked = Some(*source);
+            }
+            cursor += widths[index];
+        }
+        picked
+    }
+
     fn tab_control(&mut self, ui: &mut Ui, logged_in: bool) -> Option<Tab> {
         let accent = self.theme.accent;
         let fav_count = self
@@ -1826,8 +1882,8 @@ mod tests {
         let output = top_bar_render(&ctx, &mut app, vec![]);
         let texts: Vec<String> = painted_text(&output).into_iter().map(|(t, _)| t).collect();
         assert!(
-            texts.iter().any(|text| text == "切到 YouTube"),
-            "the switch should name the platform it goes to: {texts:?}"
+            texts.iter().any(|text| text == "B 站") && texts.iter().any(|text| text == "YouTube"),
+            "both platforms should be offered, not a command: {texts:?}"
         );
         assert!(
             texts.iter().any(|text| text == "收藏夹") && texts.iter().any(|text| text == "历史"),
@@ -1840,8 +1896,8 @@ mod tests {
         let output = top_bar_render(&ctx, &mut app, vec![]);
         let texts: Vec<String> = painted_text(&output).into_iter().map(|(t, _)| t).collect();
         assert!(
-            texts.iter().any(|text| text == "切到 B 站"),
-            "the switch should now point back: {texts:?}"
+            texts.iter().any(|text| text == "B 站") && texts.iter().any(|text| text == "YouTube"),
+            "the control keeps showing both options: {texts:?}"
         );
         assert!(
             !texts.iter().any(|text| text == "收藏夹") && !texts.iter().any(|text| text == "历史"),
