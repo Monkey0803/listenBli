@@ -1243,14 +1243,25 @@ pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> 
     let inner = rect.shrink2(Vec2::new(10.0, 0.0));
 
     let idx_rect = Rect::from_min_size(Pos2::new(inner.left(), rect.top()), Vec2::new(28.0, row_h));
-    widgets::paint_label(
-        &painter,
-        idx_rect.center(),
-        Align2::CENTER_CENTER,
-        format!("{:02}", index + 1),
-        t::mono_font(11.5),
-        t::FG_3,
-    );
+    if current {
+        // The playing row says so here instead of showing its number. The tint,
+        // the side bar and the accent title already carry "this one is current",
+        // so the one part of the row that could say *playing* should say it.
+        icons::equalizer(
+            &painter,
+            Rect::from_center_size(idx_rect.center(), Vec2::splat(13.0)),
+            accent.accent,
+        );
+    } else {
+        widgets::paint_label(
+            &painter,
+            idx_rect.center(),
+            Align2::CENTER_CENTER,
+            format!("{:02}", index + 1),
+            t::mono_font(11.5),
+            t::FG_3,
+        );
+    }
 
     let cover_size = if compact { 38.0 } else { 46.0 };
     let cover_rect = Rect::from_center_size(
@@ -1479,38 +1490,38 @@ impl App {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::icon_button(
+                // Right-to-left, so the first thing added ends up rightmost:
+                // `配置：/path [copy][open]`. The config keeps the spot it had.
+                //
+                // Both paths share one budget, derived from what the row has
+                // left after the hint. Without it a long path runs into the hint
+                // (measured: the cache label landed 100px inside the logged-out
+                // hint) and a long one on a narrow window collides regardless, so
+                // a path that does not fit is elided rather than overlapped.
+                let room = ((ui.available_width() - 40.0) / 2.0 - 100.0).max(70.0);
+                let config_file = crate::config::Config::path();
+                self.status_path(
                     ui,
-                    icons::copy,
-                    20.0,
-                    false,
-                    self.theme.accent,
-                    "复制配置路径",
-                )
-                .clicked()
-                {
-                    ui.ctx().copy_text(crate::config::config_path_display());
-                    self.notify("已复制到剪贴板");
-                }
-                // `配置：` rides the UI face rather than the path's monospace
-                // one. Within the monospace family egui places a *fallback* face
-                // with its own ascent, which measured two to three pixels above
-                // the Latin baseline — so in one mono string the Chinese label
-                // floated above the path and the row looked ragged. The UI face
-                // is the one the hint on the left already uses, and there the
-                // label and the Latin sit on the same baseline. Zero spacing
-                // keeps the two pieces reading as the single line they are.
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    // Right-to-left: the path first so the label ends up left.
-                    status_text(
-                        ui,
-                        &crate::config::config_path_display(),
-                        t::mono_font(10.5),
-                        t::FG_3,
-                    );
-                    status_text(ui, "配置：", t::ui_font(10.5), t::FG_3);
-                });
+                    "配置：",
+                    &crate::config::config_path_display(),
+                    if config_file.exists() {
+                        config_file
+                    } else {
+                        crate::platform::config_dir()
+                    },
+                    room,
+                );
+
+                ui.add_space(14.0);
+                let cache_root = self.cache_root();
+                self.status_path(
+                    ui,
+                    "缓存：",
+                    &cache_root.display().to_string(),
+                    cache_root,
+                    room,
+                );
+
                 if let Some(err) = &self.engine_error {
                     ui.add_space(8.0);
                     status_text(ui, err, t::ui_font(11.0), t::ERR);
@@ -1519,6 +1530,57 @@ impl App {
         });
 
         self.ui_toast(ui);
+    }
+
+    /// One `标签：路径` item at the right of the status bar, with a copy button
+    /// and one that opens it.
+    ///
+    /// Both paths live here rather than only in the settings sheet, because that
+    /// sheet scrolls and its path group sits below the fold in a normal window —
+    /// which is how "where is the cache?" became a question at all. This bar is
+    /// always on screen.
+    ///
+    /// The label rides the UI face rather than the path's monospace one. Within
+    /// the monospace family egui places a *fallback* face with its own ascent,
+    /// which measured two to three pixels above the Latin baseline — so in one
+    /// mono string the Chinese label floated above the path and the row looked
+    /// ragged. Zero spacing keeps the two pieces reading as the single line they
+    /// are.
+    fn status_path(
+        &mut self,
+        ui: &mut Ui,
+        label: &str,
+        path: &str,
+        target: std::path::PathBuf,
+        room: f32,
+    ) {
+        if widgets::icon_button(
+            ui,
+            icons::external,
+            20.0,
+            false,
+            self.theme.accent,
+            "在文件管理器中打开",
+        )
+        .clicked()
+        {
+            if let Err(err) = crate::platform::reveal(&target) {
+                self.notify(err);
+            }
+        }
+        if widgets::icon_button(ui, icons::copy, 20.0, false, self.theme.accent, "复制路径")
+            .clicked()
+        {
+            ui.ctx().copy_text(path.to_owned());
+            self.notify("已复制到剪贴板");
+        }
+        let font = t::mono_font(10.5);
+        // Take only the width the path needs, so a short path does not push the
+        // other one out of the row; elide when the budget is smaller than that.
+        let width = widgets::measure(ui, path, &font).x.min(room);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), Sense::hover());
+        widgets::clipped_line(ui, rect, path, font, t::FG_3, false);
+        status_text(ui, label, t::ui_font(10.5), t::FG_3);
     }
 
     fn ui_toast(&mut self, ui: &mut Ui) {
@@ -1661,42 +1723,108 @@ mod tests {
         }
     }
 
-    /// A window at the size the app is usually run in, to check what is visible
-    /// without scrolling: the sheet scrolls, and content past the fold is never
-    /// painted.
-    fn settings_short(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
-        let raw = RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
-            events,
-            ..Default::default()
-        };
-        let mut output = ctx.run_ui(raw, |ui| {
-            app.ui_settings_sheet(ui.ctx());
-        });
-        output.textures_delta.clear();
-        output
+    /// The row that is playing marks itself with the level meter instead of its
+    /// position number: the number column is the one place in a row that could
+    /// say "this is the one playing", and a number cannot say it.
+    #[test]
+    fn the_playing_row_marks_itself_instead_of_showing_its_number() {
+        let (mut app, ctx) = app_with_results();
+        let playing = app.results[0].clone();
+        app.current = Some(playing);
+        app.loading = false;
+
+        central(&ctx, &mut app, vec![]);
+        let output = central(&ctx, &mut app, vec![]);
+        let texts: Vec<String> = painted_text(&output)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+
+        assert!(
+            texts.iter().any(|text| text == "02"),
+            "the other rows keep their numbers: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "01"),
+            "the playing row must not show a number: {texts:?}"
+        );
+
+        // And a marker is painted where that number was: the meter is four small
+        // filled bars in the left-hand column.
+        let bars = painted_rects(&output)
+            .into_iter()
+            .filter(|shape| {
+                shape.rect.left() < 60.0
+                    && shape.rect.width() <= 4.0
+                    && shape.rect.height() <= 12.0
+                    && shape.rect.height() >= 3.0
+            })
+            .count();
+        assert!(
+            bars >= 4,
+            "expected the four meter bars in the index column, found {bars}"
+        );
     }
 
-    /// The cache path has to be reachable without scrolling, which is the whole
-    /// complaint that prompted it: it was previously nowhere in the app at all.
+    /// Both paths are on screen with no scrolling and no clicking.
+    ///
+    /// This is the guarantee the settings sheet cannot give: it scrolls, and its
+    /// path group sits below the fold in an ordinary window. A test of mine once
+    /// asserted the opposite about the sheet and passed only because it counted
+    /// shapes the clip rect had already thrown away.
     #[test]
-    fn the_cache_path_is_visible_without_scrolling() {
+    fn the_status_bar_shows_both_the_config_and_cache_paths() {
         let (mut app, ctx) = focused_app(&[]);
-        app.settings_open = true;
-        for _ in 0..3 {
-            settings_short(&ctx, &mut app, vec![]);
-        }
-        let output = settings_short(&ctx, &mut app, vec![]);
+
+        // The bar is a bottom panel; a full-screen `Ui` gives it the width it
+        // would have. Two passes so the toast area, which is its own `Area`, has
+        // settled.
+        let mut output = ctx.run_ui(raw(vec![]), |ui| {
+            app.ui_status_bar(ui);
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(raw(vec![]), |ui| {
+            app.ui_status_bar(ui);
+        });
+        output.textures_delta.clear();
+
         let texts: Vec<String> = painted_text(&output)
             .into_iter()
             .map(|(text, _)| text)
             .collect();
         let cache = crate::platform::cache_dir().display().to_string();
         assert!(
+            texts.iter().any(|text| text.starts_with(&cache)),
+            "the cache path should be in the bar: {texts:?}"
+        );
+        assert!(
             texts
                 .iter()
-                .any(|text| *text == cache || cache.starts_with(text.as_str())),
-            "the cache path should be above the fold in an 820px window: {texts:?}"
+                .any(|text| text.contains(&crate::config::config_path_display())),
+            "the config path should still be in the bar: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "缓存：") && texts.iter().any(|text| text == "配置："),
+            "both labels should be there: {texts:?}"
+        );
+
+        // Two paths plus four buttons is a lot of bar. The hint on the left must
+        // still be clear of them, or the row becomes one run-on string.
+        let rects = painted_text(&output);
+        let rect_of = |pred: &dyn Fn(&str) -> bool| {
+            rects
+                .iter()
+                .find(|(text, _)| pred(text))
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("missing from the bar: {texts:?}"))
+        };
+        let hint = rect_of(&|text| text.starts_with("已登录") || text.starts_with("未登录"));
+        let cache_label = rect_of(&|text| text == "缓存：");
+        assert!(
+            hint.right() < cache_label.left(),
+            "the hint ends at {} but the cache label starts at {}",
+            hint.right(),
+            cache_label.left()
         );
     }
 
@@ -1761,7 +1889,12 @@ mod tests {
         );
     }
 
-    /// Every string egui painted, with the rect it was painted into.
+    /// Every string egui *actually shows*, with the rect it was painted into.
+    ///
+    /// Clip-aware on purpose: a shape scrolled out of a `ScrollArea`, or cut by a
+    /// panel, is still in the shape list. Counting it would let a test about "is
+    /// this on screen" pass on something nobody can see — which is exactly how an
+    /// earlier test of mine claimed the cache path was above the fold.
     fn painted_text(output: &egui::FullOutput) -> Vec<(String, Rect)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
             match shape {
@@ -1779,6 +1912,12 @@ mod tests {
         }
         let mut out = Vec::new();
         for clipped in &output.shapes {
+            if !clipped
+                .clip_rect
+                .intersects(clipped.shape.visual_bounding_rect())
+            {
+                continue;
+            }
             walk(&clipped.shape, &mut out);
         }
         out

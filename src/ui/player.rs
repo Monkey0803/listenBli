@@ -349,6 +349,11 @@ impl App {
         let mut jump = None;
         let mut close = false;
 
+        // Size the list to the room above the chip so the popup can never be
+        // clipped by the window edge, then hold it inside the bounds above.
+        let space_above = response.rect.top() - ui.ctx().viewport_rect().top() - 84.0;
+        let list_h = space_above.clamp(QUEUE_LIST_MIN_H, QUEUE_LIST_MAX_H);
+
         egui::Popup::from_response(&response)
             .open(self.queue_open && !queue.is_empty())
             .align(egui::emath::RectAlign::TOP_END)
@@ -371,9 +376,12 @@ impl App {
                     ui.add_space(11.0);
                     super::hline(ui, ui.min_rect().bottom() - 0.5, t::LINE);
 
+                    // `list_h` is both the floor and the ceiling: with auto
+                    // shrink off, the area takes exactly the height it is given,
+                    // so a short queue no longer collapses to its content.
                     egui::ScrollArea::vertical()
-                        .max_height(372.0)
-                        .auto_shrink([false, true])
+                        .max_height(list_h)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
@@ -382,7 +390,7 @@ impl App {
                                     for (index, track) in queue.iter().enumerate() {
                                         let is_current = index == position;
                                         let (rect, row) = ui.allocate_exact_size(
-                                            Vec2::new(ui.available_width(), 32.0),
+                                            Vec2::new(ui.available_width(), QUEUE_ROW_H),
                                             Sense::click(),
                                         );
                                         let painter = ui.painter().clone();
@@ -391,18 +399,29 @@ impl App {
                                         } else if row.hovered() {
                                             painter.rect_filled(rect, t::R_SM, t::white(0.06));
                                         }
-                                        widgets::paint_label(
-                                            &painter,
-                                            Pos2::new(rect.left() + 11.0, rect.center().y),
-                                            Align2::LEFT_CENTER,
-                                            if is_current {
-                                                "▶".to_owned()
-                                            } else {
-                                                format!("{:02}", index + 1)
-                                            },
-                                            t::mono_font(10.5),
-                                            if is_current { accent.accent } else { t::FG_3 },
-                                        );
+                                        if is_current {
+                                            // A state marker, not a control: the
+                                            // text glyph this used to paint read
+                                            // as "press to play" on the row that
+                                            // is already playing.
+                                            icons::equalizer(
+                                                &painter,
+                                                Rect::from_center_size(
+                                                    Pos2::new(rect.left() + 15.0, rect.center().y),
+                                                    Vec2::splat(12.0),
+                                                ),
+                                                accent.accent,
+                                            );
+                                        } else {
+                                            widgets::paint_label(
+                                                &painter,
+                                                Pos2::new(rect.left() + 11.0, rect.center().y),
+                                                Align2::LEFT_CENTER,
+                                                format!("{:02}", index + 1),
+                                                t::mono_font(10.5),
+                                                t::FG_3,
+                                            );
+                                        }
                                         widgets::clipped_line(
                                             ui,
                                             Rect::from_min_max(
@@ -565,6 +584,21 @@ fn transport_button(
 /// which floats 首 a couple of pixels above the mono digits and drags those
 /// digits below the centre line. Painted separately, each piece is centred on
 /// its own ink, like every other hand-painted label in the chrome.
+/// One row in the queue popup.
+const QUEUE_ROW_H: f32 = 32.0;
+
+/// The list is never shorter than this, so a three-song queue still reads as a
+/// panel rather than a stub — which is what it looked like when the scroll area
+/// shrank to its content.
+const QUEUE_LIST_MIN_H: f32 = 198.0;
+
+/// Nor taller than this, so the popup cannot run off the top of a short window.
+///
+/// It is a cap, not a promise: measured, `egui`'s popup area hands the list about
+/// 341 px (nine rows) whether the window is 600 px tall or 1400, so a long queue
+/// ends up there. Only a window shorter than that runs into this constant.
+const QUEUE_LIST_MAX_H: f32 = 460.0;
+
 fn queue_header(ui: &mut Ui, accent: t::Accent, count: usize) -> bool {
     let mut close = false;
     ui.horizontal(|ui| {
@@ -651,7 +685,11 @@ mod tests {
     use crate::config::Config;
     use egui::{RawInput, Rect, Vec2};
 
-    /// Every string egui painted, with the y of its glyph ink's centre.
+    /// Every string egui *actually shows*, with the y of its glyph ink's centre.
+    ///
+    /// Clip-aware on purpose: a shape scrolled out of a `ScrollArea` is still in
+    /// the shape list, it just is not visible. Counting it would make any test
+    /// about "is this row on screen" pass on content nobody can see.
     fn painted_ink(output: &egui::FullOutput) -> Vec<(String, f32)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
             match shape {
@@ -669,9 +707,125 @@ mod tests {
         }
         let mut out = Vec::new();
         for clipped in &output.shapes {
-            walk(&clipped.shape, &mut out);
+            let mut found = Vec::new();
+            walk(&clipped.shape, &mut found);
+            let clip = clipped.clip_rect;
+            if !clip.intersects(clipped.shape.visual_bounding_rect()) {
+                continue;
+            }
+            out.extend(
+                found
+                    .into_iter()
+                    .filter(|(_, y)| *y >= clip.top() && *y <= clip.bottom()),
+            );
         }
         out
+    }
+
+    /// App a queue and render the player bar with the popup open, then report
+    /// what is visible: the header's y and every queue row's y.
+    fn queue_popup(count: usize) -> (Vec<(String, f32)>, f32, f32) {
+        std::env::set_var("HOME", "/tmp/listenbli-queue-tests");
+        let _ = std::fs::create_dir_all("/tmp/listenbli-queue-tests");
+
+        let mut app = App::new_for_tests(Config::default());
+        app.queue = (0..count)
+            .map(|i| crate::api::models::Track {
+                bvid: format!("BV{i}"),
+                aid: 0,
+                cid: 0,
+                title: format!("队列曲目 {i}"),
+                author: "上传者".into(),
+                duration: 200,
+                cover: None,
+            })
+            .collect();
+        app.queue_pos = 0;
+        app.queue_open = true;
+
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx, None);
+        crate::ui::theme::install_style(&ctx, &app.theme);
+
+        let mut last = None;
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::bottom("player_bar")
+                        .frame(crate::ui::frames::player_bar(&app.theme))
+                        .show(ui, |ui| app.ui_player_bar(ui));
+                },
+            );
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        let out = last.unwrap();
+
+        let ink = painted_ink(&out);
+        let chip_y = ink
+            .iter()
+            .find(|(text, _)| text.starts_with("播放列表 1/"))
+            .map(|(_, y)| *y)
+            .expect("the chip is painted");
+        let header_y = ink
+            .iter()
+            .find(|(text, _)| text == "播放列表")
+            .map(|(_, y)| *y)
+            .expect("the popup header is painted");
+        let rows: Vec<(String, f32)> = ink
+            .iter()
+            .filter(|(text, _)| text.starts_with("队列曲目"))
+            .cloned()
+            .collect();
+        (rows, chip_y, header_y)
+    }
+
+    /// The popup used to shrink to its content, so a three-song queue came out a
+    /// ~120px stub floating in the middle of the window.
+    ///
+    /// Measured from the chip up to the header: that spans the header, the list
+    /// and its padding, so requiring the list's minimum height of it is the
+    /// weaker claim — and it is still one the old code failed (it managed 183px
+    /// against the 198 asked for here).
+    #[test]
+    fn a_short_queue_still_gets_a_full_height_panel() {
+        let (rows, chip_y, header_y) = queue_popup(3);
+        assert_eq!(rows.len(), 3, "all three rows should be visible: {rows:?}");
+        let panel_h = chip_y - header_y;
+        assert!(
+            panel_h >= QUEUE_LIST_MIN_H,
+            "a three-song queue left only {panel_h:.0}px of panel, want >= {QUEUE_LIST_MIN_H}"
+        );
+    }
+
+    /// A long queue fills the panel and never spills behind the player bar.
+    ///
+    /// Nine rows is what fits: `egui`'s popup area offers about 341 px of list no
+    /// matter how tall the window is, so a taller request cannot be honoured from
+    /// in here. What must hold is that the rows shown are the ones above the bar
+    /// and that the rest scroll — never that rows are painted out of sight.
+    #[test]
+    fn a_long_queue_fills_the_panel_without_spilling_behind_the_bar() {
+        let (rows, chip_y, _) = queue_popup(20);
+        assert!(
+            rows.len() >= 9,
+            "a 20-song queue should fill the panel, got {} rows: {rows:?}",
+            rows.len()
+        );
+        assert!(
+            rows.len() < 20,
+            "the rest should scroll rather than all be laid out: {}",
+            rows.len()
+        );
+        let lowest = rows.iter().map(|(_, y)| *y).fold(f32::MIN, f32::max);
+        assert!(
+            lowest < chip_y,
+            "every visible row should sit above the chip, lowest was {lowest} vs {chip_y}"
+        );
     }
 
     /// The header's icon, title, count and unit must share one centre line.

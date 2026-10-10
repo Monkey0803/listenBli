@@ -343,6 +343,17 @@ stroke_icon!(spark, |p| {
     ]);
 });
 
+// The "now playing" level meter: four filled columns where a track number would
+// otherwise sit. Filled rather than stroked — it marks a *state*, not a control,
+// and at 12px a stroked four-bar glyph turns to mush. Static on purpose: the app
+// repaints every 200 ms for the progress bar, which would animate it at 5 fps.
+stroke_icon!(equalizer, |p| {
+    p.rrect_fill(3.6, 11.5, 2.6, 8.0, 1.3);
+    p.rrect_fill(8.3, 6.5, 2.6, 13.0, 1.3);
+    p.rrect_fill(13.0, 9.0, 2.6, 10.5, 1.3);
+    p.rrect_fill(17.7, 13.0, 2.6, 6.5, 1.3);
+});
+
 stroke_icon!(target, |p| {
     p.circle(12.0, 12.0, 7.6);
     p.circle(12.0, 12.0, 2.4);
