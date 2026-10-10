@@ -680,10 +680,14 @@ fn load_track(
                 quality: resolved.source.quality,
             });
         } else if purpose == Purpose::Export {
+            // The cover is fetched here, on the calling thread, so the export thread
+            // owns plain bytes and never touches the network.
+            let tags = track_tags(sources.api, &track);
             spawn_export(
                 cache.clone(),
                 track.clone(),
                 resolved.source.quality,
+                tags,
                 evt_tx.clone(),
             );
         } else {
@@ -808,6 +812,15 @@ fn resolve_youtube(youtube: &Youtube, track: &mut Track, evt_tx: &Sender<Evt>) -
     if playable.duration > 0 {
         track.duration = playable.duration;
     }
+    if track.cover.is_none() {
+        // The same thumbnail the search path builds: a job that arrived without one —
+        // a hand-built request, a track rebuilt from the queue — should still get a
+        // cover written into its export.
+        track.cover = Some(format!(
+            "https://i.ytimg.com/vi/{}/hqdefault.jpg",
+            track.bvid
+        ));
+    }
 
     let Some(pick) = playable.best_audio().cloned() else {
         let _ = evt_tx.send(Evt::Error {
@@ -886,6 +899,25 @@ fn lyrics_loop(
 // Download worker
 // ---------------------------------------------------------------------------
 
+/// What a finished file should say about itself.
+///
+/// The cover is fetched here rather than in the export module so that the writer stays
+/// free of the network: a cover that fails to download costs the picture and nothing
+/// else, which is why the error is swallowed into `None`.
+fn track_tags(api: &Api, track: &Track) -> audio::export::TrackTags {
+    let mut tags = audio::export::TrackTags::from_track(track);
+    if let Some(url) = track.cover.as_deref() {
+        match api.get_bytes(url) {
+            Ok(bytes) => tags.cover = Some(bytes),
+            Err(err) => eprintln!(
+                "cover for {} failed, tagging without it: {err}",
+                track.key()
+            ),
+        }
+    }
+    tags
+}
+
 /// A fresh stream URL for a track whose signed one stopped working.
 ///
 /// Only the ranged sources need this: their URL is signed and expires, while a
@@ -907,7 +939,13 @@ fn refresh_stream_url(sources: &Sources<'_>, track: &Track) -> Option<String> {
 ///
 /// The copy is hundreds of megabytes and must not stall the worker that serves
 /// playback, so it gets a thread rather than a slot in the queue.
-fn spawn_export(cache: Arc<AudioCache>, track: Track, quality: AudioQuality, evt_tx: Sender<Evt>) {
+fn spawn_export(
+    cache: Arc<AudioCache>,
+    track: Track,
+    quality: AudioQuality,
+    tags: audio::export::TrackTags,
+    evt_tx: Sender<Evt>,
+) {
     let title = track.title.clone();
     let _ = std::thread::Builder::new()
         .name("listenbli-export".into())
@@ -920,7 +958,7 @@ fn spawn_export(cache: Arc<AudioCache>, track: Track, quality: AudioQuality, evt
                 return;
             };
             let out = platform::export_dir().join(audio::export::file_name(&title, &track.author));
-            match audio::export::export_any(&segment, &out) {
+            match audio::export::export_any_tagged(&segment, &out, &tags) {
                 Ok(()) => {
                     let _ = evt_tx.send(Evt::Exported { title, path: out });
                 }
@@ -1215,7 +1253,8 @@ fn stream_segment(
     // The bytes are whole: turn them into a file the rest of the world can play.
     // A failure here is not a failed download — the fragment still plays — so it
     // is reported as information, not as an error.
-    if let Err(message) = cache.finish_download(&cache_key, tag) {
+    let tags = track_tags(api, &job.track);
+    if let Err(message) = cache.finish_download(&cache_key, tag, Some(&tags)) {
         let _ = evt_tx.send(Evt::Info(format!("缓存转换失败，仍保留分片：{message}")));
     }
 
@@ -1224,6 +1263,7 @@ fn stream_segment(
             Arc::clone(cache),
             job.track.clone(),
             job.source.quality,
+            tags.clone(),
             evt_tx.clone(),
         );
     } else if !job.play {

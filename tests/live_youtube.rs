@@ -432,6 +432,29 @@ fn a_youtube_track_downloads_into_the_cache_and_becomes_playable() {
     println!("cache: {} ({size} bytes)", ready_path.display());
     assert!(size > 1_000_000, "suspiciously small: {size}");
 
+    // The file that lands in the cache is the one a person opens, so the metadata has
+    // to be inside it — not in a sidecar. Read it back the way a player would.
+    let bytes = std::fs::read(&ready_path).expect("the file should be readable");
+    let title_tag = text_atom(&bytes, b"\xA9nam").expect("an embedded title");
+    let artist_tag = text_atom(&bytes, b"\xA9ART").expect("an embedded artist");
+    println!("tags: {title_tag:?} / {artist_tag:?}");
+    assert_eq!(
+        title_tag, track.title,
+        "the embedded title is the resolved one"
+    );
+    assert_eq!(
+        artist_tag, track.author,
+        "the embedded artist is the resolved one"
+    );
+
+    let cover = atom_payload(&bytes, b"covr").expect("an embedded cover");
+    assert!(
+        cover.starts_with(&[0xFF, 0xD8]) || cover.starts_with(&[0x89, b'P', b'N', b'G']),
+        "the cover should be a real image: {:?}",
+        &cover[..4.min(cover.len())]
+    );
+    println!("cover: {} bytes", cover.len());
+
     // Ranges made this fast; an un-ranged GET of this file takes minutes.
     assert!(
         elapsed < Duration::from_secs(45),
@@ -474,4 +497,41 @@ fn the_web_client_is_refused_playback() {
             );
         }
     }
+}
+
+/// Box walking, enough to read the iTunes metadata back out of a real file.
+///
+/// Written here rather than in the library: nothing in the app reads tags, and a
+/// reader that exists only for this test belongs in the test.
+fn find_atom(bytes: &[u8], name: &[u8; 4], inside: Option<&[u8]>) -> Option<Vec<u8>> {
+    let body = inside.unwrap_or(bytes);
+    let mut at = 0usize;
+    while at + 8 <= body.len() {
+        let size = u32::from_be_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+        let kind = &body[at + 4..at + 8];
+        if size < 8 || at + size > body.len() {
+            return None;
+        }
+        if kind == name {
+            return Some(body[at + 8..at + size].to_vec());
+        }
+        at += size;
+    }
+    None
+}
+
+/// The payload of an iTunes `data` box for one named item.
+fn atom_payload(bytes: &[u8], name: &[u8; 4]) -> Option<Vec<u8>> {
+    let moov = find_atom(bytes, b"moov", None)?;
+    let udta = find_atom(&moov, b"udta", None)?;
+    let meta = find_atom(&udta, b"meta", None)?;
+    // `meta` is a full box: a version/flags word sits in front of its children.
+    let ilst = find_atom(&meta[4..], b"ilst", None)?;
+    let item = find_atom(&ilst, name, None)?;
+    let data = find_atom(&item, b"data", None)?;
+    Some(data[8..].to_vec()) // type + locale
+}
+
+fn text_atom(bytes: &[u8], name: &[u8; 4]) -> Option<String> {
+    String::from_utf8(atom_payload(bytes, name)?).ok()
 }

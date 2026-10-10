@@ -447,7 +447,12 @@ fn build_stco(offset: u32) -> RawBox {
 /// this does not understand (the sample rate table, the language, the AAC decoder
 /// configuration) survives untouched. `mvex` is dropped: it exists to promise
 /// fragments, and there are none any more.
-fn build_moov(init: &Init, samples: &[Sample], chunk_offset: u32) -> Result<RawBox, String> {
+fn build_moov(
+    init: &Init,
+    samples: &[Sample],
+    chunk_offset: u32,
+    tags: Option<&TrackTags>,
+) -> Result<RawBox, String> {
     let media_duration: u64 = samples.iter().map(|s| u64::from(s.duration)).sum();
     let movie_duration = if init.media_timescale == 0 {
         media_duration
@@ -456,6 +461,7 @@ fn build_moov(init: &Init, samples: &[Sample], chunk_offset: u32) -> Result<RawB
     };
 
     let mut moov_children: Vec<RawBox> = Vec::new();
+    let mut original_udta: Option<RawBox> = None;
     for mut child in init.moov.children()? {
         match &child.kind {
             b"mvhd" => {
@@ -544,8 +550,18 @@ fn build_moov(init: &Init, samples: &[Sample], chunk_offset: u32) -> Result<RawB
                 moov_children.push(container(*b"trak", trak_children));
             }
             b"mvex" => {}
+            // Held back when metadata is being written: the two are merged below, so
+            // the moov ends up with one `udta`, not two.
+            b"udta" if tags.is_some() => original_udta = Some(child),
             _ => moov_children.push(child),
         }
+    }
+
+    // The metadata goes in *before* the sample tables' offsets are measured. Adding
+    // it afterwards would move the `mdat` and leave every `stco` entry pointing at
+    // the wrong byte — files that play and then seek into noise.
+    if let Some(udta) = tags.and_then(|tags| build_udta(tags, original_udta.as_ref())) {
+        moov_children.push(udta);
     }
 
     Ok(container(*b"moov", moov_children))
@@ -570,6 +586,159 @@ fn m4a_ftyp() -> RawBox {
     }
 }
 
+/// The metadata a `.m4a` should carry.
+///
+/// These are iTunes-style MP4 atoms rather than literal ID3 frames: `.m4a` metadata
+/// lives under `moov.udta.meta.ilst`, and that is what Finder, Music, and every other
+/// player reads. An `id3 ` box would be ignored by all of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackTags {
+    pub title: String,
+    pub artist: String,
+    /// JPEG or PNG bytes. `None` writes no cover rather than a broken one.
+    pub cover: Option<Vec<u8>>,
+}
+
+impl TrackTags {
+    /// The tags a track carries, without its cover.
+    ///
+    /// The cover is a separate fetch, so it is filled in by the caller when it has
+    /// the bytes: a missing cover must not cost the title and artist, which are the
+    /// parts a person actually searches by.
+    pub fn from_track(track: &crate::api::models::Track) -> Self {
+        Self {
+            title: track.title.clone(),
+            artist: track.author.clone(),
+            cover: None,
+        }
+    }
+
+    /// Whether anything is worth writing. An empty set must produce no `udta` at
+    /// all, so a file whose track has no metadata stays byte-identical to before.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_empty() && self.artist.is_empty() && self.cover.is_none()
+    }
+}
+
+/// A `data` box as the iTunes atoms use it.
+///
+/// The value's *type* rides in the box's version/flags word — 1 is UTF-8 text, 13
+/// JPEG, 14 PNG — so this cannot go through the usual full-box helper, which writes a
+/// version byte and zero flags.
+fn data_box(kind: u32, payload: &[u8]) -> RawBox {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    body.extend_from_slice(&kind.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes()); // locale
+    body.extend_from_slice(payload);
+    RawBox {
+        kind: *b"data",
+        payload: body,
+    }
+}
+
+/// One `ilst` item: a named atom holding one value.
+fn text_item(name: [u8; 4], value: &str) -> Option<RawBox> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    Some(container(name, vec![data_box(1, value.as_bytes())]))
+}
+
+/// The cover item, with the type flag that matches the bytes.
+///
+/// The flag is not decorative: claiming JPEG for PNG bytes is what makes a cover show
+/// up as a broken box in a player.
+fn cover_item(cover: &[u8]) -> Option<RawBox> {
+    if cover.is_empty() {
+        return None;
+    }
+    let kind = if cover.starts_with(&[0x89, b'P', b'N', b'G']) {
+        14
+    } else {
+        13
+    };
+    Some(container(*b"covr", vec![data_box(kind, cover)]))
+}
+
+/// The `hdlr` that tells a parser the `meta` box holds iTunes metadata.
+fn metadata_handler() -> RawBox {
+    let mut payload = Vec::with_capacity(25);
+    payload.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+    payload.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
+    payload.extend_from_slice(b"mdir"); // handler type
+    payload.extend_from_slice(b"appl"); // reserved, but this is what other tools write
+    payload.extend_from_slice(&[0u8; 8]); // reserved
+    payload.push(0); // empty, null-terminated name
+    RawBox {
+        kind: *b"hdlr",
+        payload,
+    }
+}
+
+/// The `ilst` items a moov already carries.
+///
+/// An init segment is not empty of metadata: YouTube's moov holds a `udta` with an
+/// encoder tag (`©too`). Throwing it away is not this code's business.
+fn existing_items(udta: &RawBox) -> Vec<RawBox> {
+    let Some(meta) = udta
+        .children()
+        .ok()
+        .and_then(|children| children.into_iter().find(|child| child.is(b"meta")))
+    else {
+        return Vec::new();
+    };
+    // `meta` is a full box, so its children start after its version/flags word.
+    if meta.payload.len() < 4 {
+        return Vec::new();
+    }
+    let inner = RawBox {
+        kind: *b"meta",
+        payload: meta.payload[4..].to_vec(),
+    };
+    inner
+        .children()
+        .ok()
+        .and_then(|children| children.into_iter().find(|child| child.is(b"ilst")))
+        .and_then(|ilst| ilst.children().ok())
+        .unwrap_or_default()
+}
+
+/// `udta` holding the `meta` box, or `None` when there is nothing to write.
+///
+/// The metadata is *merged* into the moov's existing `udta` rather than added beside
+/// it. Two `udta` boxes in one moov is not a thing a player expects, and the one they
+/// read is the first — which is the original, so a second one leaves the tags
+/// invisible while looking perfectly correct in the writer's own test.
+fn build_udta(tags: &TrackTags, existing: Option<&RawBox>) -> Option<RawBox> {
+    let mut items: Vec<RawBox> = existing.map(existing_items).unwrap_or_default();
+    if let Some(item) = text_item(*b"\xA9nam", &tags.title) {
+        items.push(item);
+    }
+    if let Some(item) = text_item(*b"\xA9ART", &tags.artist) {
+        items.push(item);
+    }
+    if let Some(item) = tags.cover.as_deref().and_then(cover_item) {
+        items.push(item);
+    }
+    if items.is_empty() {
+        return None;
+    }
+
+    // `meta` is a full box, so its payload opens with a version/flags word. Without
+    // the handler inside it, players walk straight past the items.
+    let mut meta_payload = vec![0u8; 4];
+    metadata_handler().serialize(&mut meta_payload);
+    container(*b"ilst", items).serialize(&mut meta_payload);
+
+    Some(container(
+        *b"udta",
+        vec![RawBox {
+            kind: *b"meta",
+            payload: meta_payload,
+        }],
+    ))
+}
+
 fn container(kind: [u8; 4], children: Vec<RawBox>) -> RawBox {
     let mut payload = Vec::new();
     for child in &children {
@@ -584,6 +753,15 @@ fn container(kind: [u8; 4], children: Vec<RawBox>) -> RawBox {
 /// changes. The file is read twice — once for the boxes, once to stream the
 /// payloads — so a 200 MB segment never has to fit in memory.
 pub fn export_m4a(segment: &Path, out: &Path) -> Result<(), String> {
+    export_m4a_with(segment, out, None)
+}
+
+/// The same remux, with the track's metadata written into the file.
+pub fn export_m4a_tagged(segment: &Path, out: &Path, tags: &TrackTags) -> Result<(), String> {
+    export_m4a_with(segment, out, (!tags.is_empty()).then_some(tags))
+}
+
+fn export_m4a_with(segment: &Path, out: &Path, tags: Option<&TrackTags>) -> Result<(), String> {
     let input = File::open(segment).map_err(|err| format!("打开缓存文件失败：{err}"))?;
     let end = input
         .metadata()
@@ -602,7 +780,7 @@ pub fn export_m4a(segment: &Path, out: &Path) -> Result<(), String> {
     // The moov's size depends on the tables, which depend on the chunk offset,
     // which depends on the moov's size. The tables' length is fixed once the
     // sample count is known, so build it once with a placeholder and measure.
-    let placeholder = build_moov(&init, &samples, 0)?;
+    let placeholder = build_moov(&init, &samples, 0, tags)?;
     let mut moov_bytes = Vec::new();
     placeholder.serialize(&mut moov_bytes);
 
@@ -611,7 +789,7 @@ pub fn export_m4a(segment: &Path, out: &Path) -> Result<(), String> {
     let chunk_offset = u32::try_from(chunk_offset)
         .map_err(|_| "导出文件过大，超出了 32 位偏移（需要 co64）".to_owned())?;
 
-    let moov = build_moov(&init, &samples, chunk_offset)?;
+    let moov = build_moov(&init, &samples, chunk_offset, tags)?;
     let mut moov_bytes = Vec::new();
     moov.serialize(&mut moov_bytes);
 
@@ -754,12 +932,24 @@ pub fn file_name(title: &str, author: &str) -> String {
 /// `.m4s` fragment is remuxed first. The extension is what tells them apart,
 /// because the cache names them by what they are.
 pub fn export_any(segment: &Path, out: &Path) -> Result<(), String> {
+    export_any_with(segment, out, None)
+}
+
+/// Copy or remux, writing the tags when the file is remuxed.
+///
+/// A cache that already holds a `.m4a` is copied as it stands: it was tagged when it
+/// was built, and re-tagging a copy would need the index that was discarded.
+pub fn export_any_tagged(segment: &Path, out: &Path, tags: &TrackTags) -> Result<(), String> {
+    export_any_with(segment, out, (!tags.is_empty()).then_some(tags))
+}
+
+fn export_any_with(segment: &Path, out: &Path, tags: Option<&TrackTags>) -> Result<(), String> {
     let playable = segment
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("m4a"));
     if !playable {
-        return export_m4a(segment, out);
+        return export_m4a_with(segment, out, tags);
     }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("创建导出目录失败：{err}"))?;
@@ -771,6 +961,154 @@ pub fn export_any(segment: &Path, out: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The metadata has to land where players look for it, with the handler that
+    /// makes them look at all.
+    #[test]
+    fn the_metadata_lands_in_udta_meta_ilst() {
+        let tags = TrackTags {
+            title: "晴天".to_owned(),
+            artist: "周杰伦".to_owned(),
+            cover: Some(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A]),
+        };
+        let mut bytes = Vec::new();
+        build_udta(&tags, None)
+            .expect("a udta")
+            .serialize(&mut bytes);
+
+        // Every box in the chain, in order.
+        for (label, needle) in [
+            ("udta", b"udta".as_slice()),
+            ("meta", b"meta".as_slice()),
+            ("hdlr", b"hdlr".as_slice()),
+            ("mdir handler", b"mdir".as_slice()),
+            ("ilst", b"ilst".as_slice()),
+            ("title atom", b"\xA9nam".as_slice()),
+            ("artist atom", b"\xA9ART".as_slice()),
+            ("cover atom", b"covr".as_slice()),
+        ] {
+            assert!(
+                bytes.windows(needle.len()).any(|window| window == needle),
+                "{label} missing from the metadata"
+            );
+        }
+        assert!(
+            bytes.windows(6).any(|window| window == "晴天".as_bytes()),
+            "the title text should be in there"
+        );
+        // PNG bytes must be flagged PNG (14), or the cover renders as a broken box.
+        assert!(
+            bytes.windows(4).any(|window| window == 14u32.to_be_bytes()),
+            "the cover should be flagged as PNG"
+        );
+    }
+
+    /// A text `data` box is a UTF-8 claim (type 1) plus a zero locale, and nothing
+    /// else on top of the value.
+    #[test]
+    fn a_text_item_is_a_utf8_data_box() {
+        let item = text_item(*b"\xA9nam", "晴天").expect("an item");
+        let mut bytes = Vec::new();
+        item.serialize(&mut bytes);
+        assert_eq!(&bytes[4..8], b"\xA9nam");
+        // The item's own children follow its header: `data` is at 12, because 8..12
+        // is the child box's size.
+        assert_eq!(&bytes[12..16], b"data");
+        let payload = &bytes[16..];
+        assert_eq!(&payload[..4], &1u32.to_be_bytes(), "type 1 is UTF-8");
+        assert_eq!(&payload[4..8], &0u32.to_be_bytes(), "locale");
+        assert_eq!(&payload[8..], "晴天".as_bytes());
+    }
+
+    /// An empty value writes no atom, and no tags write no `udta`: a file whose track
+    /// has no metadata stays exactly as it was.
+    #[test]
+    fn empty_tags_write_no_metadata_at_all() {
+        assert!(text_item(*b"\xA9nam", "").is_none());
+        assert!(text_item(*b"\xA9nam", "   ").is_none());
+        assert!(cover_item(&[]).is_none());
+        assert!(build_udta(&TrackTags::default(), None).is_none());
+        assert!(TrackTags::default().is_empty());
+
+        let only_cover = TrackTags {
+            cover: Some(vec![0xFF, 0xD8, 0xFF]),
+            ..TrackTags::default()
+        };
+        assert!(!only_cover.is_empty(), "a cover alone is still metadata");
+        // JPEG bytes are flagged JPEG (13).
+        let mut bytes = Vec::new();
+        build_udta(&only_cover, None).unwrap().serialize(&mut bytes);
+        assert!(bytes.windows(4).any(|window| window == 13u32.to_be_bytes()));
+    }
+
+    /// An init segment's own `udta` must be merged into, not shadowed: a moov with two
+    /// of them makes the writer's tags invisible to every reader, including a
+    /// straightforward one.
+    #[test]
+    fn existing_metadata_is_merged_rather_than_shadowed() {
+        // What YouTube's init segment carries: `udta` > `meta` > `ilst` > `©too`.
+        let mut original_meta = vec![0u8; 4];
+        metadata_handler().serialize(&mut original_meta);
+        container(
+            *b"ilst",
+            vec![text_item(*b"\xA9too", "Lavf58.29.100").expect("an encoder tag")],
+        )
+        .serialize(&mut original_meta);
+        let original = container(
+            *b"udta",
+            vec![RawBox {
+                kind: *b"meta",
+                payload: original_meta,
+            }],
+        );
+
+        let tags = TrackTags {
+            title: "晴天".to_owned(),
+            artist: "周杰伦".to_owned(),
+            cover: None,
+        };
+        let merged = build_udta(&tags, Some(&original)).expect("a udta");
+
+        // One udta, holding both the original tag and the new ones.
+        let mut bytes = Vec::new();
+        merged.serialize(&mut bytes);
+        let occurrences = bytes.windows(4).filter(|window| *window == b"udta").count();
+        assert_eq!(occurrences, 1, "the moov must keep exactly one udta");
+        assert!(
+            bytes.windows(4).any(|window| window == b"\xA9too"),
+            "the encoder tag must survive"
+        );
+        assert!(bytes.windows(4).any(|window| window == b"\xA9nam"));
+        assert!(bytes.windows(4).any(|window| window == b"\xA9ART"));
+
+        // And with the tags already read back out of the merged box, the walk a
+        // player does finds the title on the first try.
+        let items = existing_items(&merged);
+        assert!(
+            items.iter().any(|item| item.is(b"\xA9nam")),
+            "the title must be reachable through the first udta"
+        );
+    }
+
+    /// The tags come off the track, minus the cover, which needs a fetch.
+    #[test]
+    fn tags_are_taken_from_the_track() {
+        let track = crate::api::models::Track {
+            bvid: "dQw4w9WgXcQ".to_owned(),
+            source: crate::api::models::Source::Youtube,
+            aid: 0,
+            cid: 0,
+            title: "Never Gonna Give You Up".to_owned(),
+            author: "Rick Astley".to_owned(),
+            duration: 213,
+            cover: Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".to_owned()),
+        };
+        let tags = TrackTags::from_track(&track);
+        assert_eq!(tags.title, "Never Gonna Give You Up");
+        assert_eq!(tags.artist, "Rick Astley");
+        assert!(tags.cover.is_none(), "the cover is a separate fetch");
+        assert!(!tags.is_empty());
+    }
+
     use super::*;
     use std::path::PathBuf;
 

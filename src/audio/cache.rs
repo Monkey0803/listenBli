@@ -201,10 +201,20 @@ impl AudioCache {
     /// marker is cleared either way: a failure must leave the cache exactly as the
     /// old behaviour did — a complete fragment that still plays — and must not
     /// stop a later attempt.
-    pub fn finish_download(&self, key: &str, tag: u32) -> Result<PathBuf, String> {
+    pub fn finish_download(
+        &self,
+        key: &str,
+        tag: u32,
+        tags: Option<&crate::audio::export::TrackTags>,
+    ) -> Result<PathBuf, String> {
         let fragment = self.path_for(key, tag);
         let ready = self.ready_path_for(key, tag);
-        let converted = crate::audio::export::export_m4a(&fragment, &ready);
+        // Tagged while it is remuxed, because the file that lands here *is* the one
+        // a person opens in Finder — a sidecar tag would be invisible to every player.
+        let converted = match tags {
+            Some(tags) => crate::audio::export::export_m4a_tagged(&fragment, &ready, tags),
+            None => crate::audio::export::export_m4a(&fragment, &ready),
+        };
         let _ = std::fs::remove_file(self.marker_path_for(key, tag));
         match converted {
             Ok(()) => {
