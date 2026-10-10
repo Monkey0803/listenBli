@@ -401,14 +401,14 @@ impl App {
                                         }
                                         if is_current {
                                             // A state marker, not a control: the
-                                            // text glyph this used to paint read
-                                            // as "press to play" on the row that
-                                            // is already playing.
-                                            icons::equalizer(
+                                            // text glyph this used to paint read as
+                                            // "press to play" on the row that is
+                                            // already playing.
+                                            icons::pause(
                                                 &painter,
                                                 Rect::from_center_size(
                                                     Pos2::new(rect.left() + 15.0, rect.center().y),
-                                                    Vec2::splat(12.0),
+                                                    Vec2::splat(13.0),
                                                 ),
                                                 accent.accent,
                                             );
@@ -863,8 +863,8 @@ mod tests {
             "no transport glyph belongs on a queue row: {glyphs:?}"
         );
         assert!(
-            meter_bars(&rects) >= 4,
-            "the four meter bars should be painted for the playing row, found {}",
+            meter_bars(&rects) >= 2,
+            "the pause glyph's two bars should be painted for the playing row, found {}",
             meter_bars(&rects)
         );
     }

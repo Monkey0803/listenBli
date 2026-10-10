@@ -1244,12 +1244,17 @@ pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> 
 
     let idx_rect = Rect::from_min_size(Pos2::new(inner.left(), rect.top()), Vec2::new(28.0, row_h));
     if current {
-        // The playing row says so here instead of showing its number. The tint,
-        // the side bar and the accent title already carry "this one is current",
-        // so the one part of the row that could say *playing* should say it.
-        icons::equalizer(
+        // The loaded row says so here instead of showing its number: the tint,
+        // the side bar and the accent title all carry "this one is current", so
+        // the one part of the row that could say *playing* is this column.
+        //
+        // A pause glyph, matching what the cover overlay already paints for
+        // `current && playing`. Deliberately not keyed on the paused state: a
+        // paused row would then fall back to a play triangle, which is the thing
+        // this replaced.
+        icons::pause(
             &painter,
-            Rect::from_center_size(idx_rect.center(), Vec2::splat(13.0)),
+            Rect::from_center_size(idx_rect.center(), Vec2::splat(15.0)),
             accent.accent,
         );
     } else {
@@ -1749,8 +1754,8 @@ mod tests {
             "the playing row must not show a number: {texts:?}"
         );
 
-        // And a marker is painted where that number was: the meter is four small
-        // filled bars in the left-hand column.
+        // And a marker is painted where that number was: the pause glyph is two
+        // small filled bars in the left-hand column.
         let bars = painted_rects(&output)
             .into_iter()
             .filter(|shape| {
@@ -1761,8 +1766,8 @@ mod tests {
             })
             .count();
         assert!(
-            bars >= 4,
-            "expected the four meter bars in the index column, found {bars}"
+            bars >= 2,
+            "expected the pause glyph's two bars in the index column, found {bars}"
         );
     }
 
