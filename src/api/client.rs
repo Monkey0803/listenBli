@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, COOKIE, REFERER, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, COOKIE, RANGE, REFERER, USER_AGENT,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -330,6 +330,17 @@ impl Api {
     pub fn get_stream(&self, url: &str, referer: Option<&str>) -> Result<Response, ApiError> {
         let (_, resp) = self.send(self.request(url, referer)?)?;
         Ok(resp)
+    }
+
+    /// Fetch one byte range of a stream.
+    ///
+    /// Some sources throttle a plain sequential GET to a crawl — measured on
+    /// YouTube: a 3.4 MB file took 97 seconds un-ranged and came back instantly in
+    /// ranges — so their downloads ask for the file in chunks.
+    pub fn get_stream_range(&self, url: &str, range: &str) -> Result<Response, ApiError> {
+        let request = self.request(url, None)?.header(RANGE, range);
+        let (_, response) = self.send(request)?;
+        Ok(response)
     }
 
     /// Fetch a whole body into memory (cover images).

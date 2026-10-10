@@ -24,8 +24,9 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use egui::ColorImage;
 
 use crate::api::client::{Api, ApiError, BILI_WEB};
-use crate::api::models::{AudioQuality, FavFolder, Track, UserInfo};
+use crate::api::models::{AudioQuality, FavFolder, Source, Track, UserInfo};
 use crate::api::video::AudioSource;
+use crate::api::Youtube;
 use crate::api::{library, login, search, video};
 use crate::audio::cache::looks_like_iso_bmff;
 use crate::audio::{self, AudioCache, PlaybackSource, StreamState};
@@ -152,6 +153,9 @@ pub struct Worker {
     /// Shared with the download worker, so the UI can point it at a new root the
     /// moment the user changes the setting.
     pub cache: Arc<AudioCache>,
+    /// The YouTube source, kept here so a caller can search it without the worker
+    /// having to be told which platform each request is for.
+    pub youtube: Arc<Youtube>,
 }
 
 struct DownloadJob {
@@ -167,6 +171,11 @@ struct DownloadJob {
     /// Write an `.m4a` once the bytes are in the cache. Only set for an export,
     /// which is why it is not part of `play`.
     export: bool,
+    /// How to fetch the bytes: one GET, or ranges.
+    plan: DownloadPlan,
+    /// The stream's length, when the API stated it (a ranged source must, because
+    /// a 206 response's `Content-Length` is only the chunk's own length).
+    total: Option<u64>,
 }
 
 /// Where the API worker fans its results out to.
@@ -196,9 +205,13 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
     // would write the same cache file at once.
     let request_id = Arc::new(AtomicU64::new(0));
     let cache = Arc::new(AudioCache::new());
+    // One YouTube client for the worker: it owns the page cursors, so it cannot be
+    // rebuilt per request.
+    let youtube = Arc::new(Youtube::new());
 
     {
         let api = Arc::clone(&api);
+        let youtube = Arc::clone(&youtube);
         let config = Arc::clone(&config);
         let request_id = Arc::clone(&request_id);
         let cache = Arc::clone(&cache);
@@ -209,7 +222,7 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
         };
         let _ = std::thread::Builder::new()
             .name("listenbli-api".into())
-            .spawn(move || api_loop(api, config, cmd_rx, sinks, request_id, cache));
+            .spawn(move || api_loop(api, youtube, config, cmd_rx, sinks, request_id, cache));
     }
 
     {
@@ -262,6 +275,7 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
         evt_rx,
         api,
         cache,
+        youtube,
     }
 }
 
@@ -279,6 +293,7 @@ impl Worker {
 
 fn api_loop(
     api: Arc<Api>,
+    youtube: Arc<Youtube>,
     config: SharedConfig,
     cmd_rx: Receiver<Cmd>,
     sinks: Sinks,
@@ -291,19 +306,30 @@ fn api_loop(
     }
 
     while let Ok(cmd) = cmd_rx.recv() {
-        dispatch(&api, &config, cmd, &sinks, &request_id, &cache);
+        dispatch(
+            &Sources {
+                api: &api,
+                youtube: &youtube,
+                config: &config,
+            },
+            cmd,
+            &sinks,
+            &request_id,
+            &cache,
+        );
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
-    api: &Api,
-    config: &SharedConfig,
+    sources: &Sources<'_>,
     cmd: Cmd,
     sinks: &Sinks,
     request_id: &Arc<AtomicU64>,
     cache: &Arc<AudioCache>,
 ) {
+    let api = sources.api;
+    let config = sources.config;
     let evt_tx = &sinks.events;
     match cmd {
         Cmd::Search { keyword, page } => {
@@ -325,30 +351,14 @@ fn dispatch(
         }
 
         Cmd::LoadTrack(track) => {
-            load_track(api, config, *track, sinks, request_id, cache, Purpose::Play);
+            load_track(sources, *track, sinks, request_id, cache, Purpose::Play);
         }
 
         Cmd::CacheTrack(track) => {
-            load_track(
-                api,
-                config,
-                *track,
-                sinks,
-                request_id,
-                cache,
-                Purpose::Cache,
-            );
+            load_track(sources, *track, sinks, request_id, cache, Purpose::Cache);
         }
         Cmd::ExportTrack(track) => {
-            load_track(
-                api,
-                config,
-                *track,
-                sinks,
-                request_id,
-                cache,
-                Purpose::Export,
-            );
+            load_track(sources, *track, sinks, request_id, cache, Purpose::Export);
         }
 
         Cmd::QrStart => match login::generate(api) {
@@ -525,9 +535,92 @@ impl Purpose {
     }
 }
 
+/// The clients a load needs: both platforms, and the settings that affect
+/// resolution.
+///
+/// Bundled because they travel together through every resolution step, and because
+/// passing them separately pushed `load_track` past eight arguments.
+struct Sources<'a> {
+    api: &'a Api,
+    youtube: &'a Youtube,
+    config: &'a SharedConfig,
+}
+
+/// A track's stream, resolved and ready to download.
+struct Resolved {
+    source: AudioSource,
+    /// Seconds, from whichever API answered.
+    duration_secs: u64,
+    plan: DownloadPlan,
+    /// The stream's total size, when the API states it up front (YouTube does).
+    total: Option<u64>,
+}
+
+/// How a job's bytes are fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadPlan {
+    /// One GET returns the whole stream (Bilibili).
+    Single,
+    /// Sequential ranged GETs.
+    ///
+    /// A plain GET of a `googlevideo` URL is throttled to a crawl — measured at
+    /// ~0.03 MB/s, where 3.15 MB took 97 s — while ranged requests come back at
+    /// full speed. That is the whole reason this exists.
+    Ranges { first: u64, chunk: u64 },
+}
+
+/// The slice size for a ranged source. Large enough that the request overhead
+/// disappears, small enough that a cancelled download has not wasted much.
+const RANGE_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How much media data to pull along with the container header.
+///
+/// The decoder needs `ftyp` + `moov` + `sidx` before it can be handed a single
+/// sample, and playback should start as soon as it has them — so the first request
+/// covers the header plus this much audio.
+const RANGE_OPENING_BYTES: u64 = 512 * 1024;
+
+impl DownloadPlan {
+    /// The plan for a source that must be fetched in ranges.
+    pub(crate) fn ranged(init_end: Option<u64>, index_end: Option<u64>) -> Self {
+        // `indexRange.end` already includes the `sidx`; without it, the init
+        // segment's end is the best available bound.
+        let header = index_end.or(init_end).map(|end| end + 1).unwrap_or(0);
+        DownloadPlan::Ranges {
+            first: header + RANGE_OPENING_BYTES,
+            chunk: RANGE_CHUNK_BYTES,
+        }
+    }
+
+    /// The byte ranges to request, in order.
+    ///
+    /// A range is inclusive at both ends. The list covers every byte of the stream
+    /// exactly once: a gap would corrupt the file, an overlap would duplicate
+    /// samples and put the decoder out of step.
+    pub(crate) fn ranges(self, total: u64) -> Vec<(u64, u64)> {
+        if total == 0 {
+            return Vec::new();
+        }
+        match self {
+            DownloadPlan::Single => vec![(0, total - 1)],
+            DownloadPlan::Ranges { first, chunk } => {
+                let chunk = chunk.max(1);
+                let mut ranges = Vec::new();
+                let mut start = 0;
+                while start < total {
+                    let want = if start == 0 { first.max(1) } else { chunk };
+                    let end = (start + want - 1).min(total - 1);
+                    ranges.push((start, end));
+                    start = end + 1;
+                }
+                ranges
+            }
+        }
+    }
+}
+
 fn load_track(
-    api: &Api,
-    config: &SharedConfig,
+    sources: &Sources<'_>,
     mut track: Track,
     sinks: &Sinks,
     request_id: &Arc<AtomicU64>,
@@ -538,50 +631,20 @@ fn load_track(
     let evt_tx = &sinks.events;
     let job_tx = &sinks.downloads;
     let lyrics_tx = &sinks.lyrics;
-    if let Err(err) = video::resolve_track(api, &mut track) {
-        send_error(evt_tx, "获取视频信息失败", err);
+
+    let resolved = match track.source {
+        Source::Bilibili => resolve_bilibili(sources, &mut track, evt_tx),
+        Source::Youtube => resolve_youtube(sources.youtube, &mut track, evt_tx),
+    };
+    let Some(resolved) = resolved else {
+        // The resolver has already said what went wrong.
         return;
-    }
-    if track.cid == 0 {
-        let _ = evt_tx.send(Evt::Error {
-            context: "播放失败".into(),
-            message: "该视频没有可播放的音频流".into(),
-        });
-        return;
-    }
+    };
 
     let key = track.key();
     if play {
         // Cache-only jobs must not disturb what the list shows as playing.
         let _ = evt_tx.send(Evt::TrackResolved(Box::new(track.clone())));
-    }
-
-    let prefer_flac = config.lock().unwrap().prefer_flac;
-    let playurl = match video::playurl(api, &track.bvid, track.cid) {
-        Ok(data) => data,
-        Err(err) => {
-            send_error(evt_tx, "获取音频地址失败", err);
-            return;
-        }
-    };
-
-    let Some(source) = video::pick_audio(&playurl, prefer_flac) else {
-        let _ = evt_tx.send(Evt::Error {
-            context: "播放失败".into(),
-            message: format!("没有可用的音频流（{}）", video::describe_streams(&playurl)),
-        });
-        return;
-    };
-
-    // `playurl.timelength` is authoritative: the decoded fMP4 reports no
-    // duration of its own (verified in the M0 spike).
-    let duration_secs = playurl
-        .timelength
-        .map(|ms| ms / 1000)
-        .filter(|secs| *secs > 0)
-        .unwrap_or(track.duration);
-    if duration_secs > 0 {
-        track.duration = duration_secs;
     }
 
     // Newest request wins; lets the download worker abandon older segments.
@@ -590,16 +653,21 @@ fn load_track(
     // race in both directions.
     let generation = play.then(|| request_id.fetch_add(1, Ordering::SeqCst) + 1);
 
-    if let Some(path) = cache.get(&track.cache_key(), source.quality.stream_id()) {
+    if let Some(path) = cache.get(&track.cache_key(), resolved.source.quality.stream_id()) {
         if play {
             // Fully cached: plain, non-blocking playback.
             let _ = evt_tx.send(Evt::TrackReady {
                 track: Box::new(track.clone()),
                 source: PlaybackSource::Complete(path),
-                quality: source.quality,
+                quality: resolved.source.quality,
             });
         } else if purpose == Purpose::Export {
-            spawn_export(cache.clone(), track.clone(), source.quality, evt_tx.clone());
+            spawn_export(
+                cache.clone(),
+                track.clone(),
+                resolved.source.quality,
+                evt_tx.clone(),
+            );
         } else {
             let _ = evt_tx.send(Evt::Cached {
                 title: track.title.clone(),
@@ -614,7 +682,9 @@ fn load_track(
         });
         let _ = job_tx.send(DownloadJob {
             track: track.clone(),
-            source,
+            source: resolved.source,
+            plan: resolved.plan,
+            total: resolved.total,
             play,
             generation,
             export: purpose == Purpose::Export,
@@ -627,6 +697,117 @@ fn load_track(
     if play {
         let _ = lyrics_tx.send(Box::new(track));
     }
+    // `duration_secs` is already folded into the track by the resolver.
+    let _ = resolved.duration_secs;
+}
+
+/// Resolve a Bilibili track: its `cid`, then an audio URL, then a quality.
+fn resolve_bilibili(
+    sources: &Sources<'_>,
+    track: &mut Track,
+    evt_tx: &Sender<Evt>,
+) -> Option<Resolved> {
+    let api = sources.api;
+    let config = sources.config;
+    if let Err(err) = video::resolve_track(api, track) {
+        send_error(evt_tx, "获取视频信息失败", err);
+        return None;
+    }
+    if track.cid == 0 {
+        let _ = evt_tx.send(Evt::Error {
+            context: "播放失败".into(),
+            message: "该视频没有可播放的音频流".into(),
+        });
+        return None;
+    }
+
+    let prefer_flac = config.lock().unwrap().prefer_flac;
+    let playurl = match video::playurl(api, &track.bvid, track.cid) {
+        Ok(data) => data,
+        Err(err) => {
+            send_error(evt_tx, "获取音频地址失败", err);
+            return None;
+        }
+    };
+
+    let Some(source) = video::pick_audio(&playurl, prefer_flac) else {
+        let _ = evt_tx.send(Evt::Error {
+            context: "播放失败".into(),
+            message: format!("没有可用的音频流（{}）", video::describe_streams(&playurl)),
+        });
+        return None;
+    };
+
+    // `playurl.timelength` is authoritative: the decoded fMP4 reports no
+    // duration of its own (verified in the M0 spike).
+    let duration_secs = playurl
+        .timelength
+        .map(|ms| ms / 1000)
+        .filter(|secs| *secs > 0)
+        .unwrap_or(track.duration);
+    if duration_secs > 0 {
+        track.duration = duration_secs;
+    }
+
+    Some(Resolved {
+        source,
+        duration_secs,
+        // Bilibili serves one file in one response.
+        plan: DownloadPlan::Single,
+        total: None,
+    })
+}
+
+/// Resolve a YouTube track: the player's own metadata, and a decodable stream.
+fn resolve_youtube(youtube: &Youtube, track: &mut Track, evt_tx: &Sender<Evt>) -> Option<Resolved> {
+    let playable = match youtube.resolve(&track.bvid) {
+        Ok(playable) => playable,
+        Err(err) => {
+            let _ = evt_tx.send(Evt::Error {
+                context: format!("无法播放：{}", track.title),
+                message: err.to_string(),
+            });
+            return None;
+        }
+    };
+
+    if playable.is_live {
+        let _ = evt_tx.send(Evt::Error {
+            context: "无法播放".into(),
+            message: "直播流没有固定长度，无法缓存与拖动进度".into(),
+        });
+        return None;
+    }
+
+    // Fill in what a search row could not know, so the player bar and the cache
+    // export are named properly.
+    if !playable.title.is_empty() {
+        track.title = playable.title.clone();
+    }
+    if !playable.author.is_empty() {
+        track.author = playable.author.clone();
+    }
+    if playable.duration > 0 {
+        track.duration = playable.duration;
+    }
+
+    let Some(pick) = playable.best_audio().cloned() else {
+        let _ = evt_tx.send(Evt::Error {
+            context: "无法播放".into(),
+            message: "该视频没有可解码的音轨（YouTube 未提供 AAC，只有 Opus/WebM）".into(),
+        });
+        return None;
+    };
+
+    Some(Resolved {
+        source: AudioSource {
+            quality: pick.quality,
+            urls: vec![pick.url],
+        },
+        duration_secs: playable.duration,
+        plan: DownloadPlan::ranged(pick.init_end, pick.index_end),
+        total: pick.content_length,
+    })
 }
 
 fn send_error(evt_tx: &Sender<Evt>, context: &str, err: ApiError) {
@@ -817,12 +998,24 @@ fn stream_segment(
     let quality = job.source.quality;
     let tag = quality.stream_id();
 
-    let mut response = api
-        .get_stream(url, Some(BILI_WEB))
-        .map_err(|e| e.to_string())?;
-    let total = response
-        .content_length()
-        .ok_or_else(|| "CDN 未返回 Content-Length，无法流式播放".to_string())?;
+    // A single GET answers with the whole stream and its length. A ranged source
+    // states the length up front instead — and it *must*, because the
+    // `Content-Length` of a 206 response is only the length of that chunk.
+    let mut single = match job.plan {
+        DownloadPlan::Single => Some(
+            api.get_stream(url, Some(BILI_WEB))
+                .map_err(|e| e.to_string())?,
+        ),
+        DownloadPlan::Ranges { .. } => None,
+    };
+    let total = match single.as_ref() {
+        Some(response) => response
+            .content_length()
+            .ok_or_else(|| "CDN 未返回 Content-Length，无法流式播放".to_string())?,
+        None => job
+            .total
+            .ok_or_else(|| "该接口未给出音频长度，无法按范围下载".to_string())?,
+    };
     if total == 0 {
         return Err("CDN 返回了空内容".to_string());
     }
@@ -853,44 +1046,72 @@ fn stream_segment(
     let mut announced = false;
     let mut last_reported = 0u64;
 
-    loop {
-        if is_superseded(request_id, job.generation) {
-            state.cancel();
-            cache.remove(&cache_key, tag);
-            return Err(SUPERSEDED.to_string());
-        }
-
-        let read = match response.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(err) => return Err(abort(format!("读取响应失败: {err}"))),
-        };
-
-        if let Err(err) = file.write_all(&chunk[..read]) {
-            return Err(abort(format!("写入缓存失败: {err}")));
-        }
-        written += read as u64;
-        // Publish only after the bytes have reached the OS, so a reader can
-        // never observe data that is not yet readable.
-        state.publish(written);
-
-        if job.play && !announced && written >= ANNOUNCE_AFTER_BYTES.min(total) {
-            if !head_is_iso_bmff(&path) {
-                return Err(abort(
-                    "CDN 返回的不是有效音频数据（可能已过期或被拦截）".to_string(),
-                ));
+    // Both paths copy bytes the same way, so the announce/progress/publish rules
+    // live in one place. The closure borrows the counters it advances, which is
+    // why it is scoped: the completeness check below needs them back.
+    let mut copy_into_cache = |response: &mut reqwest::blocking::Response| -> Result<(), String> {
+        loop {
+            if is_superseded(request_id, job.generation) {
+                state.cancel();
+                cache.remove(&cache_key, tag);
+                return Err(SUPERSEDED.to_string());
             }
-            announced = true;
-            announce(evt_tx, job, &path, total, &state, quality);
-        }
 
-        if written - last_reported >= PROGRESS_STEP_BYTES {
-            last_reported = written;
-            let _ = evt_tx.send(Evt::DownloadProgress {
-                key: key.clone(),
-                got: written,
-                total: Some(total),
-            });
+            let read = match response.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(err) => return Err(abort(format!("读取响应失败: {err}"))),
+            };
+
+            if let Err(err) = file.write_all(&chunk[..read]) {
+                return Err(abort(format!("写入缓存失败: {err}")));
+            }
+            written += read as u64;
+            // Publish only after the bytes have reached the OS, so a reader can
+            // never observe data that is not yet readable.
+            state.publish(written);
+
+            if job.play && !announced && written >= ANNOUNCE_AFTER_BYTES.min(total) {
+                if !head_is_iso_bmff(&path) {
+                    return Err(abort(
+                        "CDN 返回的不是有效音频数据（可能已过期或被拦截）".to_string(),
+                    ));
+                }
+                announced = true;
+                announce(evt_tx, job, &path, total, &state, quality);
+            }
+
+            if written - last_reported >= PROGRESS_STEP_BYTES {
+                last_reported = written;
+                let _ = evt_tx.send(Evt::DownloadProgress {
+                    key: key.clone(),
+                    got: written,
+                    total: Some(total),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    match single.as_mut() {
+        Some(response) => copy_into_cache(response)?,
+        None => {
+            for (start, end) in job.plan.ranges(total) {
+                let want = end - start + 1;
+                let range = format!("bytes={start}-{end}");
+                let mut response = api
+                    .get_stream_range(url, &range)
+                    .map_err(|e| e.to_string())?;
+                // A source that ignored the range would answer 200 with the whole
+                // file; writing that per chunk would corrupt the cache, so the
+                // length is checked rather than assumed.
+                if response.content_length() != Some(want) {
+                    return Err(abort(format!(
+                        "该地址忽略了范围请求（{range}：想要 {want} 字节）"
+                    )));
+                }
+                copy_into_cache(&mut response)?;
+            }
         }
     }
 
@@ -1032,6 +1253,102 @@ pub const QR_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing byte would corrupt the file, a repeated one would feed the
+    /// decoder a sample twice, so the range list has to tile the stream exactly.
+    fn covers(ranges: &[(u64, u64)], total: u64) {
+        assert!(
+            !ranges.is_empty(),
+            "a non-empty stream needs at least one range"
+        );
+        assert_eq!(ranges[0].0, 0, "the first range must start at zero");
+        let mut at = 0u64;
+        for (index, (start, end)) in ranges.iter().enumerate() {
+            assert!(*end >= *start, "range {index} is inverted: {start}-{end}");
+            assert_eq!(
+                *start, at,
+                "range {index} starts at {start} but the previous ended at {at}"
+            );
+            at = end + 1;
+        }
+        assert_eq!(at, total, "the ranges must end exactly at the stream's end");
+    }
+
+    #[test]
+    fn a_ranged_plan_tiles_the_stream_exactly() {
+        let plan = DownloadPlan::ranged(Some(722), Some(1018));
+        let total = 3_449_447;
+
+        let ranges = plan.ranges(total);
+        covers(&ranges, total);
+
+        // The first range covers the container header plus the opening audio, so
+        // the decoder can start on the very first response.
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[0].1, 1018 + RANGE_OPENING_BYTES);
+        // This stream is only three chunks long, so the second range is also the
+        // last: what a *long* stream looks like is checked separately.
+        assert_eq!(ranges.len(), 2);
+
+        let long = plan.ranges(100 * 1024 * 1024);
+        covers(&long, 100 * 1024 * 1024);
+        assert_eq!(
+            long[1].1 - long[1].0 + 1,
+            RANGE_CHUNK_BYTES,
+            "every range after the opening one is a full chunk"
+        );
+    }
+
+    /// The last range has to stop at the end of the stream rather than at the
+    /// chunk boundary, or the download would overshoot and the completeness check
+    /// would fail.
+    #[test]
+    fn the_last_range_is_clamped_to_the_stream() {
+        let plan = DownloadPlan::Ranges {
+            first: 10,
+            chunk: 100,
+        };
+        let ranges = plan.ranges(250);
+        covers(&ranges, 250);
+        assert_eq!(*ranges.last().unwrap(), (210, 249));
+    }
+
+    /// A range larger than the file, which is what a short video looks like, must
+    /// produce exactly one range rather than an empty or inverted one.
+    #[test]
+    fn a_stream_smaller_than_the_first_range_is_one_range() {
+        let plan = DownloadPlan::ranged(None, None);
+        let ranges = plan.ranges(1024);
+        covers(&ranges, 1024);
+        assert_eq!(ranges, vec![(0, 1023)]);
+    }
+
+    /// Without the response's ranges the opening chunk is still a sensible request,
+    /// and it must never be zero-length.
+    #[test]
+    fn a_plan_without_byte_ranges_still_opens_usefully() {
+        let plan = DownloadPlan::ranged(None, None);
+        match plan {
+            DownloadPlan::Ranges { first, chunk } => {
+                assert_eq!(first, RANGE_OPENING_BYTES);
+                assert!(chunk > 0);
+            }
+            other => panic!("expected ranges, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_stream_asks_for_nothing() {
+        assert!(DownloadPlan::Single.ranges(0).is_empty());
+        assert!(DownloadPlan::ranged(None, None).ranges(0).is_empty());
+    }
+
+    /// The single-GET source is one range covering everything, which is how the
+    /// Bilibili path behaves through the same code.
+    #[test]
+    fn a_single_get_is_one_whole_range() {
+        assert_eq!(DownloadPlan::Single.ranges(2048), vec![(0, 2047)]);
+    }
 
     #[test]
     fn qr_image_is_square_and_has_dark_modules() {

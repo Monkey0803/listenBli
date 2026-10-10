@@ -41,6 +41,14 @@ pub struct AudioPick {
     /// Advertised total size, used as the cache's expected length.
     pub content_length: Option<u64>,
     pub bitrate: u64,
+    /// End of the init segment (`ftyp` + `moov`) and of the `sidx`.
+    ///
+    /// The decoder can be handed nothing until it has both, so the first ranged
+    /// request covers them and the opening of the media data. `None` when the
+    /// response did not say, in which case the downloader falls back to a plain
+    /// opening chunk.
+    pub init_end: Option<u64>,
+    pub index_end: Option<u64>,
 }
 
 /// Everything needed to play one video.
@@ -176,7 +184,18 @@ fn audio_pick(format: &Value) -> Option<AudioPick> {
             .and_then(Value::as_str)
             .and_then(|len| len.parse().ok()),
         bitrate: format.get("bitrate").and_then(Value::as_u64).unwrap_or(0),
+        init_end: range_end(format, "initRange"),
+        index_end: range_end(format, "indexRange"),
     })
+}
+
+/// The inclusive end offset of one of the response's byte ranges.
+fn range_end(format: &Value, field: &str) -> Option<u64> {
+    format
+        .get(field)
+        .and_then(|range| range.get("end"))
+        .and_then(Value::as_str)
+        .and_then(|end| end.parse().ok())
 }
 
 /// The best pick: highest bitrate among the decodable ones.
@@ -204,7 +223,9 @@ mod tests {
                 { "itag": 251, "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 136544,
                   "url": "https://example.invalid/opus-hi" },
                 { "itag": 140, "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 130677,
-                  "url": "https://example.invalid/aac-hi", "contentLength": "3449447" },
+                  "url": "https://example.invalid/aac-hi", "contentLength": "3449447",
+                  "initRange": { "start": "0", "end": "722" },
+                  "indexRange": { "start": "723", "end": "1018" } },
                 { "itag": 249, "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 49496,
                   "url": "https://example.invalid/opus-lo" },
                 { "itag": 139, "mimeType": "audio/mp4; codecs=\"mp4a.40.5\"", "bitrate": 50152,
@@ -229,6 +250,9 @@ mod tests {
         assert_eq!(best.tag, 140);
         assert_eq!(best.quality, AudioQuality::YtAac128);
         assert_eq!(best.content_length, Some(3_449_447));
+        // The first ranged request needs these to cover the container header.
+        assert_eq!(best.init_end, Some(722));
+        assert_eq!(best.index_end, Some(1018));
     }
 
     /// Nothing decodable must be a clear refusal, not a silent empty playback.

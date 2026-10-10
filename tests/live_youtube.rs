@@ -136,6 +136,101 @@ fn a_resolved_stream_is_a_fragmented_mp4_in_reach() {
     );
 }
 
+/// Downloading a YouTube track through the real worker: the bytes land in the
+/// cache, the fragment is converted to a playable `.m4a`, and it happens at the
+/// speed ranges allow rather than at the speed a plain GET is throttled to.
+///
+/// The timing assertion is the point of this test. A plain sequential GET measured
+/// ~0.03 MB/s (3.15 MB took 97 s), so this file would take minutes without the
+/// range plan — and the failure mode of "someone removed the Range header" is a
+/// hang, not an error, which nothing else would catch.
+#[test]
+#[ignore = "hits the live YouTube service and writes to a temp cache"]
+fn a_youtube_track_downloads_into_the_cache_and_becomes_playable() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use listenbli::api::client::Api;
+    use listenbli::api::cookie::CookieJar;
+    use listenbli::api::models::{Source, Track};
+    use listenbli::config::{self, Config};
+    use listenbli::net::{self, Cmd, Evt};
+
+    // A cache under the test's own directory: `HOME` decides where it lands.
+    let home = std::env::temp_dir().join(format!("listenbli-yt-live-{}", std::process::id()));
+    std::env::set_var("HOME", &home);
+    let _ = std::fs::create_dir_all(&home);
+
+    let api = Arc::new(Api::new(CookieJar::default()));
+    let worker = net::spawn(Arc::clone(&api), config::shared(Config::default()));
+    let cache = Arc::clone(&worker.cache);
+
+    let track = Track {
+        bvid: VIDEO.to_owned(),
+        source: Source::Youtube,
+        aid: 0,
+        cid: 0,
+        title: "live download".to_owned(),
+        author: String::new(),
+        duration: 0,
+        cover: None,
+    };
+    let start = Instant::now();
+    worker
+        .cmd_tx
+        .send(Cmd::LoadTrack(Box::new(track)))
+        .expect("the worker should accept the job");
+
+    // The worker resolves, downloads, converts, and only then announces playback.
+    let mut ready = None;
+    while start.elapsed() < Duration::from_secs(120) {
+        match worker.evt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Evt::TrackReady { track, source, .. }) => {
+                ready = Some((track, source));
+                break;
+            }
+            Ok(Evt::Error { context, message }) => panic!("{context}: {message}"),
+            Ok(_) => {}
+            Err(err) => panic!("timed out waiting for playback: {err}"),
+        }
+    }
+    let (track, source) = ready.expect("playback should have started");
+    let elapsed = start.elapsed();
+
+    println!(
+        "ready in {:.1}s: {} — {}s",
+        elapsed.as_secs_f32(),
+        track.title,
+        track.duration
+    );
+    assert!(!track.title.is_empty(), "the metadata should be filled in");
+    assert!(track.duration > 100, "a real duration: {}", track.duration);
+    println!("source: {source:?}");
+
+    // The cache now holds a playable file, not a fragment: the download converts
+    // it once the bytes are whole.
+    let ready_path = cache.ready_path_for(&track.cache_key(), 140);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready_path.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        ready_path.is_file(),
+        "expected a playable .m4a at {ready_path:?}"
+    );
+    let size = std::fs::metadata(&ready_path).expect("metadata").len();
+    println!("cache: {} ({size} bytes)", ready_path.display());
+    assert!(size > 1_000_000, "suspiciously small: {size}");
+
+    // Ranges made this fast; an un-ranged GET of this file takes minutes.
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "the download took {elapsed:?}; the range plan is probably not in use"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A refusal must reach the user in YouTube's own words.
 #[test]
 #[ignore = "hits the live YouTube service"]
