@@ -41,6 +41,9 @@ pub struct Config {
     /// `comfortable` (62px rows) or `compact` (52px rows).
     #[serde(default = "default_density")]
     pub density: String,
+    /// The platform the app is browsing: `bilibili` (the default) or `youtube`.
+    #[serde(default)]
+    pub source: crate::api::models::Source,
     /// Where cached audio and lyrics live, when the user wants them somewhere
     /// other than the platform's cache directory.
     ///
@@ -93,6 +96,7 @@ impl Default for Config {
             accent: default_accent(),
             lyric_size: default_lyric_size(),
             density: default_density(),
+            source: crate::api::models::Source::Bilibili,
             cache_dir: None,
             cookies: CookieJar::default(),
         }

@@ -15,7 +15,7 @@ use egui::{
     TextEdit, Ui, Vec2,
 };
 
-use crate::api::models::Track;
+use crate::api::models::{Source, Track};
 use crate::util;
 
 use self::icons::Icon;
@@ -252,6 +252,23 @@ impl App {
                 self.tab = tab;
             }
             ui.add_space(8.0);
+            // The platform switch sits between the tabs and the field, so it reads
+            // as part of "what am I looking at" rather than as a setting. The label
+            // says where a click goes, which needs no explaining.
+            let on_youtube = self.source == Source::Youtube;
+            let label = if on_youtube {
+                "切到 B 站"
+            } else {
+                "切到 YouTube"
+            };
+            if chip(ui, label, None, None, on_youtube, accent).clicked() {
+                self.set_source(if on_youtube {
+                    Source::Bilibili
+                } else {
+                    Source::Youtube
+                });
+            }
+            ui.add_space(8.0);
             self.search_field(ui);
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -348,24 +365,28 @@ impl App {
             .unwrap_or(self.fav_items.len() as i64);
         let history_count = self.history.len();
 
-        let entries: [(Tab, &str, Icon, Option<String>); 3] = [
-            (Tab::Search, "搜索", icons::search, None),
-            (
+        // The account tabs need a Bilibili session, and YouTube has no equivalent
+        // in this version, so on YouTube they are not offered at all rather than
+        // shown as empty rooms.
+        let mut entries: Vec<(Tab, &str, Icon, Option<String>)> =
+            vec![(Tab::Search, "搜索", icons::search, None)];
+        if self.source == Source::Bilibili {
+            entries.push((
                 Tab::Favorites,
                 "收藏夹",
                 icons::folder,
                 logged_in.then(|| fav_count.to_string()),
-            ),
-            (
+            ));
+            entries.push((
                 Tab::History,
                 "历史",
                 icons::clock,
                 logged_in.then(|| history_count.to_string()),
-            ),
-        ];
+            ));
+        }
 
         let font = t::ui_font(12.5);
-        let mut widths = [0.0f32; 3];
+        let mut widths = vec![0.0f32; entries.len()];
         for (index, (_, label, _, count)) in entries.iter().enumerate() {
             let count_w = count
                 .as_ref()
@@ -683,7 +704,11 @@ impl App {
         // Every search the user actually runs is remembered, whichever control
         // started it (Enter, ⌘K, a suggestion chip or the history dropdown).
         self.remember_search(&keyword);
-        self.send(crate::net::Cmd::Search { keyword, page: 1 });
+        self.send(crate::net::Cmd::Search {
+            source: self.source,
+            keyword,
+            page: 1,
+        });
     }
 
     /// Signed-in account chip with its dropdown, or the login prompt.
@@ -1113,6 +1138,7 @@ impl App {
                 PaneSource::Search => {
                     self.loading_more = true;
                     self.send(crate::net::Cmd::Search {
+                        source: self.source,
                         keyword: self.last_keyword.clone(),
                         page: self.search_page + 1,
                     });
@@ -1784,6 +1810,83 @@ mod tests {
             bars >= 2,
             "expected the pause glyph's two bars in the index column, found {bars}"
         );
+    }
+
+    /// The platform switch has to be visible, and the account tabs must not be
+    /// offered on YouTube: they need a Bilibili session and have no YouTube
+    /// counterpart in this version.
+    #[test]
+    fn the_platform_switch_offers_the_other_platform_and_hides_account_tabs() {
+        let (mut app, ctx) = focused_app(&[]);
+        app.search_history_open = false;
+
+        // On Bilibili: the switch points at YouTube, and the account tabs are there.
+        let mut output = top_bar_render(&ctx, &mut app, vec![]);
+        output.textures_delta.clear();
+        let output = top_bar_render(&ctx, &mut app, vec![]);
+        let texts: Vec<String> = painted_text(&output).into_iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|text| text == "切到 YouTube"),
+            "the switch should name the platform it goes to: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "收藏夹") && texts.iter().any(|text| text == "历史"),
+            "Bilibili keeps its account tabs: {texts:?}"
+        );
+
+        // On YouTube: the switch flips, the account tabs are gone.
+        app.set_source(Source::Youtube);
+        top_bar_render(&ctx, &mut app, vec![]);
+        let output = top_bar_render(&ctx, &mut app, vec![]);
+        let texts: Vec<String> = painted_text(&output).into_iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|text| text == "切到 B 站"),
+            "the switch should now point back: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "收藏夹") && !texts.iter().any(|text| text == "历史"),
+            "YouTube must not offer the account tabs: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "搜索"),
+            "search is the one tab both platforms have: {texts:?}"
+        );
+    }
+
+    /// Switching platforms must not leave the previous platform's results on
+    /// screen under the new platform's name, and must land somewhere valid.
+    #[test]
+    fn switching_platforms_clears_the_list_and_lands_on_search() {
+        let (mut app, _ctx) = app_with_results();
+        app.tab = Tab::Favorites;
+        app.search_page = 4;
+        app.search_has_more = true;
+        app.loading_more = true;
+        assert!(!app.results.is_empty(), "the fixture has results");
+
+        app.set_source(Source::Youtube);
+
+        assert_eq!(app.source, Source::Youtube);
+        assert_eq!(app.tab, Tab::Search, "the account tab no longer exists");
+        assert!(app.results.is_empty(), "the other platform's rows are gone");
+        assert_eq!(app.search_page, 1);
+        assert!(!app.search_has_more);
+        assert!(!app.loading_more);
+        // And the choice is remembered.
+        assert_eq!(app.config_value(|config| config.source), Source::Youtube);
+
+        // Switching to where it already is changes nothing.
+        app.set_source(Source::Youtube);
+        assert_eq!(app.source, Source::Youtube);
+    }
+
+    /// The top bar, as its own render target.
+    fn top_bar_render(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
+        let mut output = ctx.run_ui(raw(events), |ui| {
+            app.ui_top_bar(ui);
+        });
+        output.textures_delta.clear();
+        output
     }
 
     /// Both paths are on screen with no scrolling and no clicking.

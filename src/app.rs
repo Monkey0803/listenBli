@@ -54,6 +54,9 @@ pub struct App {
     pub(crate) engine_error: Option<String>,
 
     pub(crate) tab: Tab,
+    /// Which platform the list is showing. Persisted, because a user who came for
+    /// YouTube should not have to say so again on every launch.
+    pub(crate) source: crate::api::models::Source,
 
     pub(crate) search_input: String,
     pub(crate) searching: bool,
@@ -151,6 +154,7 @@ impl App {
         let show_translation = config.prefer_translation;
         let theme = Theme::from_config(&config);
         let fonts_key = crate::ui::theme::fonts_key(&config);
+        let source = config.source;
         let cache_root = platform::resolve_cache_dir(config.cache_dir.as_deref());
         let cache_path_input = config
             .cache_dir
@@ -190,6 +194,7 @@ impl App {
             engine,
             engine_error,
             tab: Tab::Search,
+            source,
             search_input: String::new(),
             searching: false,
             loading_more: false,
@@ -837,6 +842,29 @@ impl App {
         } else {
             self.cache_bytes = None;
         }
+    }
+
+    /// Switch platforms.
+    ///
+    /// The list, the query and the page are dropped: results from one platform are
+    /// not results from the other, and the account-only tabs make no sense on
+    /// YouTube, so a switch lands on search.
+    pub(crate) fn set_source(&mut self, source: crate::api::models::Source) {
+        if self.source == source {
+            return;
+        }
+        self.source = source;
+        self.update_config(|config| config.source = source);
+        self.tab = Tab::Search;
+        self.results.clear();
+        self.search_page = 1;
+        self.search_has_more = false;
+        self.loading_more = false;
+        self.searching = false;
+        self.notify(match source {
+            crate::api::models::Source::Bilibili => "已切换到 B 站".to_owned(),
+            crate::api::models::Source::Youtube => "已切换到 YouTube".to_owned(),
+        });
     }
 
     /// Global shortcuts: `空格` play/pause, `←`/`→` ±5s, `⌘K` focus search,

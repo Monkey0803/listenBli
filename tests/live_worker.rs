@@ -77,6 +77,7 @@ fn worker_searches_resolves_and_downloads_a_track() {
     worker
         .cmd_tx
         .send(Cmd::Search {
+            source: listenbli::api::Source::Bilibili,
             keyword: "周杰伦 晴天".into(),
             page: 1,
         })
@@ -285,6 +286,7 @@ fn audio_engine_starts_and_advances_playback() {
     worker
         .cmd_tx
         .send(Cmd::Search {
+            source: listenbli::api::Source::Bilibili,
             keyword: "周杰伦 晴天".into(),
             page: 1,
         })

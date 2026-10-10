@@ -136,6 +136,63 @@ fn a_resolved_stream_is_a_fragmented_mp4_in_reach() {
     );
 }
 
+/// Searching YouTube through the worker, exactly as the UI does it.
+///
+/// This is the milestone-5 wiring check: the app sends one command with a platform
+/// on it, and the worker decides which client to ask.
+#[test]
+#[ignore = "hits the live YouTube service"]
+fn the_worker_routes_a_youtube_search() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use listenbli::api::client::Api;
+    use listenbli::api::cookie::CookieJar;
+    use listenbli::api::Source;
+    use listenbli::config::{self, Config};
+    use listenbli::net::{self, Cmd, Evt};
+
+    let api = Arc::new(Api::new(CookieJar::default()));
+    let worker = net::spawn(Arc::clone(&api), config::shared(Config::default()));
+    worker
+        .cmd_tx
+        .send(Cmd::Search {
+            source: Source::Youtube,
+            keyword: "周杰伦 晴天".to_owned(),
+            page: 1,
+        })
+        .expect("the worker should accept the search");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        match worker.evt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Evt::SearchResults {
+                tracks, has_more, ..
+            }) => {
+                println!(
+                    "worker returned {} YouTube tracks, has_more={has_more}",
+                    tracks.len()
+                );
+                assert!(tracks.len() >= 10, "a broad query should fill a page");
+                assert!(has_more, "a broad query should have more pages");
+                assert!(
+                    tracks.iter().all(|track| track.source == Source::Youtube),
+                    "every row must be tagged as YouTube"
+                );
+                assert!(
+                    tracks.iter().all(|track| !track.title.is_empty()),
+                    "every row needs a title"
+                );
+                break;
+            }
+            Ok(Evt::Error { context, message }) => panic!("{context}: {message}"),
+            Ok(_) => {}
+            Err(err) => panic!("waiting for results failed: {err}"),
+        }
+    }
+}
+
 /// Downloading a YouTube track through the real worker: the bytes land in the
 /// cache, the fragment is converted to a playable `.m4a`, and it happens at the
 /// speed ranges allow rather than at the speed a plain GET is throttled to.

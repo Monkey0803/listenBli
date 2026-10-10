@@ -48,6 +48,7 @@ const ANNOUNCE_AFTER_BYTES: u64 = 64 * 1024;
 #[derive(Debug)]
 pub enum Cmd {
     Search {
+        source: Source,
         keyword: String,
         page: u32,
     },
@@ -334,18 +335,32 @@ fn dispatch(
     let config = sources.config;
     let evt_tx = &sinks.events;
     match cmd {
-        Cmd::Search { keyword, page } => {
+        Cmd::Search {
+            source,
+            keyword,
+            page,
+        } => {
             let _ = evt_tx.send(Evt::SearchStarted {
                 keyword: keyword.clone(),
                 page,
             });
-            match search::search(api, &keyword, page) {
-                Ok(results) => {
+            // Two clients, one place that decides which: the caller says what it
+            // is searching, not how.
+            let outcome = match source {
+                Source::Bilibili => search::search(api, &keyword, page)
+                    .map(|results| (results.tracks, results.has_more)),
+                Source::Youtube => sources
+                    .youtube
+                    .search(&keyword, page)
+                    .map_err(|err| ApiError::Network(err.to_string())),
+            };
+            match outcome {
+                Ok((tracks, has_more)) => {
                     let _ = evt_tx.send(Evt::SearchResults {
                         keyword,
                         page,
-                        tracks: results.tracks,
-                        has_more: results.has_more,
+                        tracks,
+                        has_more,
                     });
                 }
                 Err(err) => send_error(evt_tx, "搜索失败", err),
