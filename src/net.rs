@@ -238,6 +238,24 @@ pub fn spawn(api: Arc<Api>, config: SharedConfig) -> Worker {
             .spawn(move || download_loop(api, job_rx, evt_tx, request_id, cache));
     }
 
+    // A cache built before the app stored playable files holds fragments only, and
+    // nothing outside this app can play those. Upgrade them in the background,
+    // once per run, skipping whatever is still being downloaded.
+    {
+        let cache = Arc::clone(&cache);
+        let evt_tx = evt_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("listenbli-convert".into())
+            .spawn(move || {
+                let converted = cache.convert_finished();
+                if converted > 0 {
+                    let _ = evt_tx.send(Evt::Info(format!(
+                        "已把 {converted} 首缓存转成可播放的 m4a"
+                    )));
+                }
+            });
+    }
+
     Worker {
         cmd_tx,
         cover_tx,
@@ -685,7 +703,7 @@ fn spawn_export(cache: Arc<AudioCache>, track: Track, quality: AudioQuality, evt
                 return;
             };
             let out = platform::export_dir().join(audio::export::file_name(&title, &track.author));
-            match audio::export_m4a(&segment, &out) {
+            match audio::export::export_any(&segment, &out) {
                 Ok(()) => {
                     let _ = evt_tx.send(Evt::Exported { title, path: out });
                 }
@@ -902,6 +920,13 @@ fn stream_segment(
         got: written,
         total: Some(total),
     });
+    // The bytes are whole: turn them into a file the rest of the world can play.
+    // A failure here is not a failed download — the fragment still plays — so it
+    // is reported as information, not as an error.
+    if let Err(message) = cache.finish_download(cid, quality) {
+        let _ = evt_tx.send(Evt::Info(format!("缓存转换失败，仍保留分片：{message}")));
+    }
+
     if job.export {
         spawn_export(
             Arc::clone(cache),

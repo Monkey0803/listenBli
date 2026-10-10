@@ -748,6 +748,27 @@ pub fn file_name(title: &str, author: &str) -> String {
     format!("{stem}.m4a")
 }
 
+/// Write a playable copy of a cached file at `out`.
+///
+/// A cached `.m4a` is already the file the user wants, so it is copied; a raw
+/// `.m4s` fragment is remuxed first. The extension is what tells them apart,
+/// because the cache names them by what they are.
+pub fn export_any(segment: &Path, out: &Path) -> Result<(), String> {
+    let playable = segment
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("m4a"));
+    if !playable {
+        return export_m4a(segment, out);
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("创建导出目录失败：{err}"))?;
+    }
+    std::fs::copy(segment, out)
+        .map(|_| ())
+        .map_err(|err| format!("复制到导出目录失败：{err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,6 +1067,23 @@ mod tests {
             long.chars().count()
         );
         assert!(long.ends_with(".m4a"));
+    }
+
+    #[test]
+    fn an_already_playable_file_is_copied_rather_than_remuxed() {
+        // A progressive file has no `moof`, so remuxing it would fail; the copy
+        // path is what makes exporting a converted cache work.
+        let source = temp("ready.m4a");
+        let out = temp("ready-out.m4a");
+        let bytes = b"not really an m4a, but the extension says copy me".to_vec();
+        std::fs::write(&source, &bytes).unwrap();
+        std::fs::remove_file(&out).ok();
+
+        export_any(&source, &out).expect("a copy");
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

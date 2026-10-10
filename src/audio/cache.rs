@@ -83,6 +83,23 @@ impl AudioCache {
             .join(format!("{cid}_{}.meta.json", quality.stream_id()))
     }
 
+    /// Where the *playable* copy lives: a progressive `.m4a` next to the fragment.
+    ///
+    /// The name stays keyed by `cid` so a lookup is exact and cannot collide: two
+    /// videos may share a title, and nothing may share a `cid`. Human names are
+    /// what the export action is for.
+    pub fn ready_path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
+        self.dir()
+            .join(format!("{cid}_{}.m4a", quality.stream_id()))
+    }
+
+    /// Marks a fragment as still being written, so the background converter never
+    /// rewrites a download's fragments out from under it.
+    fn marker_path_for(&self, cid: i64, quality: AudioQuality) -> PathBuf {
+        self.dir()
+            .join(format!("{cid}_{}.downloading", quality.stream_id()))
+    }
+
     /// Record the expected size before/while streaming, so a partial file is
     /// never mistaken for a complete one.
     pub fn begin(&self, cid: i64, quality: AudioQuality, total: u64) -> std::io::Result<()> {
@@ -91,11 +108,24 @@ impl AudioCache {
         let text = serde_json::to_vec(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // Write the sidecar first: a `.m4s` without a sidecar is never a hit.
-        std::fs::write(self.meta_path_for(cid, quality), text)
+        std::fs::write(self.meta_path_for(cid, quality), text)?;
+        // Then the in-flight marker, which the converter honours.
+        std::fs::write(self.marker_path_for(cid, quality), b"")
     }
 
     /// A cached segment that is complete *and* structurally valid.
     pub fn get(&self, cid: i64, quality: AudioQuality) -> Option<PathBuf> {
+        // The playable file first: that is what the cache is for. It carries no
+        // sidecar because it is only ever written whole.
+        let ready = self.ready_path_for(cid, quality);
+        if ready.is_file() {
+            // Leave no fragment behind, from before the conversion or from a
+            // platform that would not unlink a file that was still open.
+            let _ = std::fs::remove_file(self.path_for(cid, quality));
+            let _ = std::fs::remove_file(self.meta_path_for(cid, quality));
+            return Some(ready);
+        }
+
         let path = self.path_for(cid, quality);
 
         // A `.m4s` without a sidecar is a leftover from an interrupted attempt
@@ -135,10 +165,74 @@ impl AudioCache {
         serde_json::from_str(&text).ok()
     }
 
-    /// Delete a segment and its sidecar.
+    /// Delete everything the cache holds for one track: fragment, sidecar,
+    /// playable copy and in-flight marker.
     pub fn remove(&self, cid: i64, quality: AudioQuality) {
         let _ = std::fs::remove_file(self.path_for(cid, quality));
         let _ = std::fs::remove_file(self.meta_path_for(cid, quality));
+        let _ = std::fs::remove_file(self.ready_path_for(cid, quality));
+        let _ = std::fs::remove_file(self.marker_path_for(cid, quality));
+    }
+
+    /// Turn a finished download into a playable file, so the cache holds audio
+    /// rather than fragments.
+    ///
+    /// The fragment is deleted only once the remux succeeded, and the in-flight
+    /// marker is cleared either way: a failure must leave the cache exactly as the
+    /// old behaviour did — a complete fragment that still plays — and must not
+    /// stop a later attempt.
+    pub fn finish_download(&self, cid: i64, quality: AudioQuality) -> Result<PathBuf, String> {
+        let fragment = self.path_for(cid, quality);
+        let ready = self.ready_path_for(cid, quality);
+        let converted = crate::audio::export::export_m4a(&fragment, &ready);
+        let _ = std::fs::remove_file(self.marker_path_for(cid, quality));
+        match converted {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&fragment);
+                let _ = std::fs::remove_file(self.meta_path_for(cid, quality));
+                Ok(ready)
+            }
+            Err(message) => Err(message),
+        }
+    }
+
+    /// Convert every complete fragment left in the directory, returning how many
+    /// were converted.
+    ///
+    /// This is what upgrades a cache built before the app stored playable files.
+    /// A fragment is skipped unless its sidecar says it is whole *and* no download
+    /// is writing it: otherwise a half-written file could be remuxed and then
+    /// deleted as if it were complete.
+    pub fn convert_finished(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(self.dir()) else {
+            return 0;
+        };
+        let mut converted = 0;
+        for entry in entries.flatten() {
+            let fragment = entry.path();
+            if fragment.extension().and_then(|ext| ext.to_str()) != Some("m4s") {
+                continue;
+            }
+            if fragment.with_extension("downloading").exists() {
+                continue;
+            }
+            let Some(meta) = read_meta_at(&fragment.with_extension("meta.json")) else {
+                continue;
+            };
+            if std::fs::metadata(&fragment).map(|meta| meta.len()).ok() != Some(meta.total) {
+                continue;
+            }
+            let ready = fragment.with_extension("m4a");
+            if ready.exists() {
+                continue;
+            }
+            if crate::audio::export::export_m4a(&fragment, &ready).is_ok() {
+                let _ = std::fs::remove_file(&fragment);
+                let _ = std::fs::remove_file(fragment.with_extension("meta.json"));
+                converted += 1;
+            }
+        }
+        converted
     }
 
     pub fn store(&self, cid: i64, quality: AudioQuality, bytes: &[u8]) -> std::io::Result<PathBuf> {
@@ -154,7 +248,12 @@ impl AudioCache {
         self.entries().iter().map(|(_, size, _)| *size).sum()
     }
 
-    /// `(path, size, modified)` for every cached segment.
+    /// `(path, size, modified)` for every cached track.
+    ///
+    /// Both names count: the playable `.m4a` a finished download leaves behind,
+    /// and a `.m4s` fragment that is still arriving or that has not been converted
+    /// yet. Sidecars and in-flight markers are not tracks, and counting their few
+    /// bytes would only let eviction pick them off and leave the audio orphaned.
     fn entries(&self) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         let Ok(read_dir) = std::fs::read_dir(self.dir()) else {
             return Vec::new();
@@ -163,7 +262,10 @@ impl AudioCache {
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("m4s") {
+                if !matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("m4s") | Some("m4a")
+                ) {
                     return None;
                 }
                 let meta = entry.metadata().ok()?;
@@ -213,6 +315,11 @@ impl Default for AudioCache {
     }
 }
 
+/// Read a sidecar, whatever path it sits at.
+fn read_meta_at(path: &Path) -> Option<CacheMeta> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 fn read_head(path: &Path, len: usize) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;
@@ -247,6 +354,60 @@ mod tests {
         assert!(!looks_like_iso_bmff(b"<!DOCTYPE html><html>"));
         assert!(!looks_like_iso_bmff(b"short"));
         assert!(!looks_like_iso_bmff(&[]));
+    }
+
+    /// A cache file that is already playable wins, and any fragment beside it is
+    /// cleaned up as a leftover.
+    #[test]
+    fn the_playable_file_wins_and_the_fragment_is_swept_up() {
+        let dir = temp_dir("ready-preferred");
+        let cache = AudioCache::with_dir(dir.clone());
+        let fragment = cache.path_for(42, AudioQuality::K192);
+        std::fs::write(&fragment, fake_segment(128)).unwrap();
+        cache.begin(42, AudioQuality::K192, 128).unwrap();
+
+        let ready = cache.ready_path_for(42, AudioQuality::K192);
+        std::fs::write(&ready, fake_segment(64)).unwrap();
+
+        assert_eq!(cache.get(42, AudioQuality::K192), Some(ready.clone()));
+        assert!(!fragment.exists(), "the fragment should be swept up");
+        assert!(
+            !cache.meta_path_for(42, AudioQuality::K192).exists(),
+            "and so should its sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The marker is what keeps the converter from remuxing a download that is
+    /// still in flight, which would produce a truncated file that then gets
+    /// deleted as if it were complete.
+    #[test]
+    fn the_converter_skips_a_fragment_that_is_still_arriving() {
+        let dir = temp_dir("converter-skips");
+        let cache = AudioCache::with_dir(dir.clone());
+        let fragment = cache.path_for(7, AudioQuality::K192);
+        std::fs::write(&fragment, fake_segment(128)).unwrap();
+        // Whole by length, but marked as still being written.
+        cache.begin(7, AudioQuality::K192, 128).unwrap();
+
+        assert_eq!(cache.convert_finished(), 0, "nothing may be converted yet");
+        assert!(fragment.exists());
+        assert!(!cache.ready_path_for(7, AudioQuality::K192).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partial fragment is never converted, whatever the marker says.
+    #[test]
+    fn the_converter_leaves_a_partial_fragment_alone() {
+        let dir = temp_dir("converter-partial");
+        let cache = AudioCache::with_dir(dir.clone());
+        let fragment = cache.path_for(9, AudioQuality::K192);
+        std::fs::write(&fragment, fake_segment(64)).unwrap();
+        cache.begin(9, AudioQuality::K192, 4096).unwrap(); // promised more than arrived
+
+        assert_eq!(cache.convert_finished(), 0);
+        assert!(fragment.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -286,6 +447,33 @@ mod tests {
             cache.path_for(1, AudioQuality::K192),
             cache.path_for(2, AudioQuality::K192)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Eviction has to see the playable files, or the cache would grow without
+    /// bound once everything is stored as `.m4a`.
+    #[test]
+    fn eviction_counts_the_playable_files() {
+        let dir = temp_dir("evict-ready");
+        let cache = AudioCache::with_dir(dir.clone());
+        std::fs::write(
+            cache.ready_path_for(1, AudioQuality::K192),
+            fake_segment(4096),
+        )
+        .unwrap();
+        std::fs::write(
+            cache.ready_path_for(2, AudioQuality::K192),
+            fake_segment(4096),
+        )
+        .unwrap();
+
+        // `fake_segment` adds a container header, so measure rather than assume.
+        let each = std::fs::metadata(cache.ready_path_for(1, AudioQuality::K192))
+            .unwrap()
+            .len();
+        assert_eq!(cache.total_bytes(), each * 2, "the m4a files are the cache");
+        assert_eq!(cache.evict(each), 1, "one track should go");
+        assert_eq!(cache.total_bytes(), each);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

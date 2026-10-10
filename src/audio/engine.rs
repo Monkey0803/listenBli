@@ -6,7 +6,7 @@
 //! * `Player::try_seek` cannot saturate at the end when the source does not
 //!   report a duration, so positions must be clamped by us.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +106,25 @@ fn build_source(job: PrepareJob) -> Result<PreparedSource, String> {
 /// blocking read for up to `stream::READ_TIMEOUT`, and the newest click must not
 /// queue behind it. Abandoned jobs end early anyway, because the download worker
 /// cancels their `StreamState` when a newer track supersedes them.
+/// The file to re-open when a jump needs a seekable reader.
+///
+/// Usually the path we were handed, but the cache replaces a finished fragment
+/// with a progressive `.m4a` and drops the fragment, and a track that is playing
+/// right now keeps reading through its already-open handle. So the file named by
+/// `path` can be gone while the music plays on, and the copy beside it holds the
+/// same audio.
+fn seekable_path(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    let sibling = path.with_extension("m4a");
+    if sibling.exists() {
+        sibling
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn spawn_prepare(job: PrepareJob) -> Receiver<Result<PreparedSource, String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -285,6 +304,12 @@ impl AudioEngine {
     /// Reports like [`AudioEngine::poll`] does, so a caller that is waiting for a
     /// jump to happen can see it: the audio keeps playing throughout, so there is
     /// no other signal that the swap occurred.
+    /// The path to hand to a seekable re-open, resolved when the jump is made
+    /// rather than when the source was installed.
+    fn seekable_source(&self) -> PathBuf {
+        seekable_path(&self.path)
+    }
+
     fn poll_upgrade(&mut self) -> Option<Result<(), String>> {
         let upgrade = self.upgrade.as_ref()?;
         let arrived = match upgrade.rx.try_recv() {
@@ -442,7 +467,7 @@ impl AudioEngine {
 
         if self.stream_is_complete() && !self.path.as_os_str().is_empty() {
             self.upgrade = Some(Upgrade {
-                rx: spawn_prepare(PrepareJob::Complete(self.path.clone())),
+                rx: spawn_prepare(PrepareJob::Complete(self.seekable_source())),
                 target,
             });
             return SeekOutcome::Upgrading;
