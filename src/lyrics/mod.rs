@@ -3,12 +3,13 @@
 
 pub mod bilibili;
 pub mod lrc;
+pub mod lrclib;
 pub mod netease;
 
 use std::path::{Path, PathBuf};
 
 use crate::api::client::Api;
-use crate::api::models::Track;
+use crate::api::models::{Source, Track};
 use crate::platform;
 
 pub use lrc::{LyricLine, Lyrics, LyricsSource};
@@ -93,7 +94,7 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
     // return it until NetEase has had its turn — and only keep it if it reaches
     // far enough into the video to be credible.
     let mut machine_fallback: Option<Lyrics> = None;
-    if track.cid != 0 {
+    if track.source == Source::Bilibili && track.cid != 0 {
         match bilibili::fetch(api, &track.bvid, track.cid) {
             Ok(Some(subtitle)) if subtitle.machine_generated => {
                 if machine_subtitle_reaches_into(track.duration, &subtitle.lyrics) {
@@ -112,16 +113,49 @@ pub fn fetch_for(api: &Api, track: &Track, cache_root: &Path) -> Lyrics {
         }
     }
 
+    // LRCLib goes first for YouTube: it is the provider built around music, and
+    // what YouTube holds is mostly music videos. For a Bilibili upload it is tried
+    // after NetEase, because NetEase's catalogue covers Chinese pop better and its
+    // translations are merged into the document.
+    if track.source == Source::Youtube {
+        if let Some(lyrics) = try_lrclib(api, track) {
+            return finish(cache_root, &track.key(), lyrics);
+        }
+    }
+
     let netease = netease::fetch(api, track);
     if let Err(err) = &netease {
         eprintln!("netease lyrics for {} failed: {err}", track.bvid);
     }
     match netease {
-        Ok(Some(lyrics)) => finish(cache_root, &track.key(), lyrics),
-        Ok(None) | Err(_) => match machine_fallback {
-            Some(lyrics) => finish(cache_root, &track.key(), lyrics),
-            None => Lyrics::empty(LyricsSource::None),
-        },
+        Ok(Some(lyrics)) => return finish(cache_root, &track.key(), lyrics),
+        Ok(None) | Err(_) => {}
+    }
+
+    if track.source == Source::Bilibili {
+        if let Some(lyrics) = try_lrclib(api, track) {
+            return finish(cache_root, &track.key(), lyrics);
+        }
+    }
+
+    match machine_fallback {
+        Some(lyrics) => finish(cache_root, &track.key(), lyrics),
+        None => Lyrics::empty(LyricsSource::None),
+    }
+}
+
+/// LRCLib, with its failures logged rather than propagated.
+///
+/// It is one source among several: a network hiccup here must not stop the chain,
+/// and a miss is the normal case for an obscure track.
+fn try_lrclib(api: &Api, track: &Track) -> Option<Lyrics> {
+    match lrclib::fetch(api, track) {
+        Ok(Some(lyrics)) => Some(lyrics),
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!("lrclib lyrics for {} failed: {err}", track.key());
+            None
+        }
     }
 }
 

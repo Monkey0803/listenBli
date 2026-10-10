@@ -136,6 +136,52 @@ fn a_resolved_stream_is_a_fragmented_mp4_in_reach() {
     );
 }
 
+/// LRCLib is the one lyric provider that serves both platforms, which is exactly
+/// why it was worth adding when YouTube turned out to have no usable native source.
+#[test]
+#[ignore = "hits the live LRCLib service"]
+fn lrclib_serves_a_track_from_either_platform() {
+    use listenbli::api::client::Api;
+    use listenbli::api::cookie::CookieJar;
+    use listenbli::api::models::{Source, Track};
+
+    let api = Api::new(CookieJar::default());
+    // The same song, once as each platform would describe it.
+    for source in [Source::Youtube, Source::Bilibili] {
+        let track = Track {
+            bvid: "dQw4w9WgXcQ".to_owned(),
+            source,
+            aid: 0,
+            cid: 0,
+            title: "Never Gonna Give You Up".to_owned(),
+            author: "Rick Astley".to_owned(),
+            duration: 213,
+            cover: None,
+        };
+        let lyrics = listenbli::lyrics::lrclib::fetch(&api, &track)
+            .expect("the request should succeed")
+            .expect("a synced document");
+        println!(
+            "{source:?}: {} lines from {:?}, first {:?}",
+            lyrics.lines.len(),
+            lyrics.source,
+            lyrics.lines.first().map(|line| (&line.text, line.time))
+        );
+        assert!(
+            lyrics.lines.len() > 5,
+            "a real document: {}",
+            lyrics.lines.len()
+        );
+        assert!(
+            lyrics
+                .lines
+                .windows(2)
+                .all(|pair| pair[0].time <= pair[1].time),
+            "timestamps must ascend"
+        );
+    }
+}
+
 /// The case that broke on a real desktop: a long music compilation that the
 /// headset client answers with "Sign in to confirm you're not a bot".
 ///

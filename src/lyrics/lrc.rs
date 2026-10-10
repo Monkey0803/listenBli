@@ -17,6 +17,8 @@ pub struct LyricLine {
 pub enum LyricsSource {
     BilibiliSubtitle,
     Netease,
+    /// LRCLib, which serves both platforms.
+    Lrclib,
     None,
 }
 
@@ -25,6 +27,7 @@ impl LyricsSource {
         match self {
             LyricsSource::BilibiliSubtitle => "B站字幕",
             LyricsSource::Netease => "网易云",
+            LyricsSource::Lrclib => "LRCLib",
             LyricsSource::None => "无",
         }
     }
