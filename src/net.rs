@@ -948,6 +948,25 @@ fn refresh_stream_url(
     }
 }
 
+/// The ranges still needed, given how many bytes are already on disk.
+///
+/// The same list [`DownloadPlan::ranges`] produces, cut to what is missing: whole ranges
+/// behind the file's end are dropped, and the range the file stops inside is shortened
+/// to start at the end. That is what makes a resumed download gapless and
+/// non-overlapping by construction rather than by luck.
+fn remaining_ranges(plan: DownloadPlan, total: u64, written: u64) -> Vec<(u64, u64)> {
+    plan.ranges(total)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            if end < written {
+                return None;
+            }
+            let start = start.max(written);
+            (start <= end).then_some((start, end))
+        })
+        .collect()
+}
+
 /// What to say when a range keeps being refused.
 ///
 /// `bytes=525319-3636946 … HTTP 403` is precise and useless: it names neither the
@@ -1138,28 +1157,55 @@ fn stream_segment(
     platform::ensure_dir(&cache.dir()).map_err(|e| format!("创建缓存目录失败: {e}"))?;
     let path = cache.path_for(&cache_key, tag);
 
-    // Fresh attempt: drop any stale partial data and record what to expect.
-    // The sidecar is written first, so a `.m4s` without one is never a hit.
-    cache.remove(&cache_key, tag);
+    // A previous attempt may have left bytes behind, and they are still good: the file
+    // is a fragment being appended to, not a file that has to start over. The marker is
+    // what makes them trustworthy — it is written before the first byte and only removed
+    // by a successful finish, so a `.m4s` without one is never resumed.
+    let existing = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let resume_from = if existing > 0 && existing < total && cache.is_downloading(&cache_key, tag) {
+        eprintln!("resuming {cache_key} from {existing} of {total} bytes");
+        existing
+    } else {
+        // Everything else is stale partial data, not a resume.
+        cache.remove(&cache_key, tag);
+        0
+    };
     cache
         .begin(&cache_key, tag, total)
         .map_err(|e| format!("写入缓存元数据失败: {e}"))?;
-    let mut file = std::fs::File::create(&path).map_err(|e| format!("创建缓存文件失败: {e}"))?;
+    let mut file = if resume_from > 0 {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("打开缓存文件失败: {e}"))?
+    } else {
+        std::fs::File::create(&path).map_err(|e| format!("创建缓存文件失败: {e}"))?
+    };
 
     let state = Arc::new(StreamState::new(total));
 
     // Any failure must also fail the stream state, otherwise a decoder already
-    // reading this file would block until the read timeout.
+    // reading this file would block until the read timeout. The bytes themselves are
+    // *not* removed: they are what the next attempt resumes from, and what a decoder
+    // was playing while the download ran.
     let abort = |message: String| -> String {
         state.fail(message.clone());
-        cache.remove(&cache_key, tag);
         message
     };
 
     let mut chunk = vec![0u8; 64 * 1024];
-    let mut written = 0u64;
+    // `announced`/`last_reported` start at zero even on a resume: `announced` is what
+    // publishes the stream to the player, and skipping it leaves the decoder waiting for
+    // a source that never arrives. The first progress event then reports the bytes
+    // already on disk, which is the truth.
+    let mut written = resume_from;
     let mut announced = false;
     let mut last_reported = 0u64;
+
+    // Worked out before the copy loop borrows the counter: the ranges a resumed
+    // download still needs, with the one it stopped inside shortened rather than
+    // repeated. Overlapping would duplicate samples, a gap would corrupt the file.
+    let ranges = remaining_ranges(job.plan, total, resume_from);
 
     // Both paths copy bytes the same way, so the announce/progress/publish rules
     // live in one place. The closure borrows the counters it advances, which is
@@ -1223,7 +1269,7 @@ fn stream_segment(
             // One refresh for the other client, one more in case the same client signs
             // something better on a second try.
             let mut refreshes_left = 2usize;
-            for (start, end) in job.plan.ranges(total) {
+            for (start, end) in ranges.iter().copied() {
                 let want = end - start + 1;
                 let range = format!("bytes={start}-{end}");
                 let mut response = match api.get_stream_range(&url, &range) {
@@ -1418,6 +1464,40 @@ mod tests {
             at = end + 1;
         }
         assert_eq!(at, total, "the ranges must end exactly at the stream's end");
+    }
+
+    /// A resumed download must ask for exactly what is missing: a gap corrupts the
+    /// file, an overlap duplicates samples and puts the decoder out of step.
+    #[test]
+    fn a_resumed_download_asks_only_for_what_is_missing() {
+        let plan = DownloadPlan::Ranges {
+            first: 100,
+            chunk: 50,
+        };
+        // Nothing yet: the whole list, unchanged.
+        assert_eq!(remaining_ranges(plan, 120, 0), plan.ranges(120));
+
+        // Stopped inside the first range: it is shortened, not repeated.
+        assert_eq!(
+            remaining_ranges(plan, 120, 60),
+            vec![(60, 99), (100, 119)],
+            "the first range must resume at the file's end"
+        );
+
+        // Stopped exactly on a boundary: that range is gone.
+        assert_eq!(remaining_ranges(plan, 120, 100), vec![(100, 119)]);
+
+        // Everything is there: nothing left to ask for.
+        assert!(remaining_ranges(plan, 120, 120).is_empty());
+        assert!(remaining_ranges(plan, 120, 999).is_empty());
+
+        // And the result still tiles the file exactly when laid end to end.
+        let mut at = 60u64;
+        for (start, end) in remaining_ranges(plan, 120, 60) {
+            assert_eq!(start, at);
+            at = end + 1;
+        }
+        assert_eq!(at, 120);
     }
 
     /// The message a person reads instead of `bytes=… HTTP 403`. It has to name the

@@ -201,6 +201,15 @@ impl AudioCache {
     /// marker is cleared either way: a failure must leave the cache exactly as the
     /// old behaviour did — a complete fragment that still plays — and must not
     /// stop a later attempt.
+    /// Whether a download for this key and quality is in progress.
+    ///
+    /// The marker is written before the first byte and removed only by a successful
+    /// finish, so it is what makes a partial `.m4s` trustworthy enough to resume from
+    /// rather than treat as garbage.
+    pub fn is_downloading(&self, key: &str, tag: u32) -> bool {
+        self.marker_path_for(key, tag).is_file()
+    }
+
     pub fn finish_download(
         &self,
         key: &str,
