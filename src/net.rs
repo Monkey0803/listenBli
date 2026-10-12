@@ -1214,7 +1214,10 @@ fn stream_segment(
         loop {
             if is_superseded(request_id, job.generation) {
                 state.cancel();
-                cache.remove_partial(&cache_key, tag);
+                // The partial is *not* removed here: a decoder may be reading it right
+                // now, and unlinking it turns playback into "No such file or directory";
+                // on a failed download there is no converted `.m4a` to fall back to.
+                // The next attempt resumes from its end instead.
                 return Err(SUPERSEDED.to_string());
             }
 
