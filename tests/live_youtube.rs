@@ -464,6 +464,141 @@ fn a_youtube_track_downloads_into_the_cache_and_becomes_playable() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A long compilation — the kind YouTube serves only the opening of to a client
+/// with no PoToken. Measured 2026-10-12 on four such videos: the last readable byte
+/// was 1,071,03x–1,071,067, while a 3.4 MB video was readable end to end.
+const CAPPED_VIDEO: &str = "AL_7jyuGNhc";
+
+/// A source that serves only the opening must still be used to its edge, and the
+/// limit must arrive as a limit rather than as a failure.
+///
+/// This is the regression test for both halves of that: the download walks past the
+/// opening chunk the plan asks for first (`header + 512 KiB` ⇒ 524,723 bytes), and
+/// what it has is announced as information, because the audio plays.
+#[test]
+#[ignore = "hits the live YouTube service and downloads ~20 MB"]
+fn a_capped_video_keeps_the_opening_and_says_so() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use listenbli::api::client::Api;
+    use listenbli::api::cookie::CookieJar;
+    use listenbli::api::models::{Source, Track};
+    use listenbli::config::{self, Config};
+    use listenbli::net::{self, Cmd, Evt};
+
+    // A cache of its own, pointed at rather than inherited: `set_root` is how the app
+    // itself redirects the worker when the setting changes.
+    let dir = std::env::temp_dir().join(format!("listenbli-yt-capped-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = Config {
+        cache_dir: Some(dir.clone()),
+        ..Config::default()
+    };
+    let api = Arc::new(Api::new(CookieJar::default()));
+    let worker = net::spawn(api, config::shared(config));
+    worker.cache.set_root(&dir);
+
+    let track = Track {
+        bvid: CAPPED_VIDEO.to_owned(),
+        source: Source::Youtube,
+        aid: 0,
+        cid: 0,
+        title: "capped".to_owned(),
+        author: String::new(),
+        duration: 0,
+        cover: None,
+    };
+    worker
+        .cmd_tx
+        .send(Cmd::LoadTrack(Box::new(track.clone())))
+        .expect("the worker should accept the job");
+
+    let files = |dir: &std::path::Path| -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                out.push((name, size));
+            }
+        }
+        out
+    };
+
+    let mut ready = false;
+    let mut limit = None;
+    let mut failure = None;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(240) {
+        match worker.evt_rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Evt::TrackReady { .. }) => ready = true,
+            Ok(Evt::Info(message)) if message.contains("只允许试听") => {
+                limit = Some(message);
+                break;
+            }
+            Ok(Evt::Error { context, message }) => {
+                failure = Some(format!("{context}：{message}"));
+                break;
+            }
+            Ok(_) => {}
+            // Silence means the download either finished or stopped without a word:
+            // the files on disk say which.
+            Err(_) => {
+                if files(&worker.cache.dir())
+                    .iter()
+                    .any(|(name, _)| name.ends_with(".m4a"))
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(ready, "playback should have started from the opening");
+    assert!(
+        failure.is_none(),
+        "a source's limit is not a failure to announce: {failure:?}"
+    );
+
+    let files = files(&worker.cache.dir());
+    let names: Vec<String> = files
+        .iter()
+        .map(|(name, size)| format!("{name} ({size})"))
+        .collect();
+    println!("cache: {}", names.join(", "));
+
+    let Some(limit) = limit else {
+        // YouTube lifted the cap, or this video is no longer capped. Nothing is wrong,
+        // and there is nothing left to assert.
+        println!("the source no longer caps this video; nothing to check");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    println!("reported: {limit}");
+
+    let kept = files
+        .iter()
+        .filter(|(name, _)| name.ends_with(".m4s"))
+        .map(|(_, size)| *size)
+        .max()
+        .unwrap_or(0);
+    // `header + 512 KiB` for this video is 524,723 bytes: stopping there is exactly what
+    // the shrink walk exists to avoid. Anything above a megabyte means it walked.
+    assert!(
+        kept > 1_000_000,
+        "the opening was not used in full: {kept} bytes kept"
+    );
+    // And it is not the whole file, so the cache must not be holding a playable `.m4a`
+    // that would make a later hit look like a complete download.
+    assert!(
+        !files.iter().any(|(name, _)| name.ends_with(".m4a")),
+        "an incomplete download was converted into a playable file: {names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A refusal must reach the user in YouTube's own words.
 #[test]
 #[ignore = "hits the live YouTube service"]

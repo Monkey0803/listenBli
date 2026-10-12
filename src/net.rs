@@ -596,6 +596,14 @@ pub(crate) enum DownloadPlan {
 /// disappears, small enough that a cancelled download has not wasted much.
 const RANGE_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The smallest a refused ranged request shrinks to before the download gives up.
+///
+/// A source that serves only the opening of a file refuses any request whose end
+/// reaches past it, so halving walks down to the edge. This floor stops the walk: at
+/// this size the bytes left over are a fraction of a second of audio, and each further
+/// halving is one more request to a CDN that has already said no.
+const RANGE_SHRINK_FLOOR: u64 = 32 * 1024;
+
 /// How much media data to pull along with the container header.
 ///
 /// The decoder needs `ftyp` + `moov` + `sidx` before it can be handed a single
@@ -993,15 +1001,32 @@ fn remaining_ranges(plan: DownloadPlan, total: u64, written: u64) -> Vec<(u64, u
 /// measured on 2026-10-10 — YouTube hands out URLs that carry only the opening of the
 /// file, and re-resolving does not lift it — while the bytes that did arrive are still
 /// on disk and still playable, which is the part a person needs to hear.
-fn range_refused_message(start: u64, error: &str) -> String {
-    if error.contains("403") && start > 0 {
+///
+/// `found_opening` is the evidence, not the status code: it is set only once a
+/// *shorter* request to the same URL has been accepted, which is what a source that
+/// serves the opening of a file does and a source that refuses the URL outright does
+/// not. The raw 403 alone cannot tell those apart, and naming a byte limit that was
+/// never measured is worse than saying nothing.
+fn range_refused_message(start: u64, found_opening: bool, error: &str) -> String {
+    if found_opening && start > 0 {
         format!(
-            "该视频的直链只允许前 {start} 字节（YouTube 对无 PoToken 客户端的限制），无法完整下载；\
+            "该视频的直链只允许试听前 {start} 字节（YouTube 对无 PoToken 客户端的限制），无法完整下载；\
              已下载的部分仍可继续试听"
         )
     } else {
         format!("下载中断：{error}；已下载的部分仍可继续试听")
     }
+}
+
+/// The shorter range to ask for after a refusal, or `None` when asking for less has
+/// stopped being worth a request.
+///
+/// Halving rather than stepping down by a byte: the window is found in about twenty
+/// requests whatever its size, and every byte that does come back is kept, so nothing
+/// is downloaded twice.
+fn shorter_request(start: u64, end: u64) -> Option<u64> {
+    let want = end - start + 1;
+    (want >= RANGE_SHRINK_FLOOR * 2).then(|| start + want / 2 - 1)
 }
 
 /// Remux a cached segment into a normal audio file on its own thread.
@@ -1063,7 +1088,10 @@ fn download_loop(
             config: &config,
         };
         if let Err(message) = run_download(&sources, &job, &evt_tx, &request_id, &cache) {
-            if message == SUPERSEDED {
+            // Both sentinels mean the caller has nothing left to say: one because a
+            // newer request replaced this one, the other because the source's limit was
+            // already sent as information.
+            if message == SUPERSEDED || message == PARTIAL_BY_SOURCE {
                 continue;
             }
             let _ = evt_tx.send(Evt::Error {
@@ -1076,6 +1104,14 @@ fn download_loop(
 
 /// Sentinel for "a newer request replaced this one"; not a user-facing failure.
 const SUPERSEDED: &str = "__superseded__";
+
+/// Sentinel for "the source served only the opening of the file, and what arrived plays".
+///
+/// Unlike [`SUPERSEDED`] this *is* worth telling someone, so the message has already
+/// been sent — as information, because the download did not break: the source declined.
+/// Returning here instead of the message keeps the caller from announcing it twice, and
+/// from announcing it as a failure.
+const PARTIAL_BY_SOURCE: &str = "__partial_by_source__";
 
 fn is_superseded(request_id: &AtomicU64, generation: Option<u64>) -> bool {
     generation.is_some_and(|generation| request_id.load(Ordering::SeqCst) != generation)
@@ -1115,7 +1151,11 @@ fn run_download(
                 let _ = cache.evict_to_fit();
                 return Ok(());
             }
-            Err(err) if err == SUPERSEDED => return Err(SUPERSEDED.to_string()),
+            Err(err) if err == SUPERSEDED || err == PARTIAL_BY_SOURCE => {
+                // The second URL would meet the same limit; the opening is already on
+                // disk and already reported.
+                return Err(err);
+            }
             Err(err) => {
                 eprintln!("segment download from {url} failed: {err}");
                 last_err = err;
@@ -1221,15 +1261,12 @@ fn stream_segment(
     let mut announced = false;
     let mut last_reported = 0u64;
 
-    // Worked out before the copy loop borrows the counter: the ranges a resumed
-    // download still needs, with the one it stopped inside shortened rather than
-    // repeated. Overlapping would duplicate samples, a gap would corrupt the file.
-    let ranges = remaining_ranges(job.plan, total, resume_from);
-
     // Both paths copy bytes the same way, so the announce/progress/publish rules
     // live in one place. The closure borrows the counters it advances, which is
     // why it is scoped: the completeness check below needs them back.
-    let mut copy_into_cache = |response: &mut reqwest::blocking::Response| -> Result<(), String> {
+    // Returns how much of the file is on disk afterwards, so the ranged path can derive
+    // its next range from it: the counter itself is owned by this closure.
+    let mut copy_into_cache = |response: &mut reqwest::blocking::Response| -> Result<u64, String> {
         loop {
             if is_superseded(request_id, job.generation) {
                 state.cancel();
@@ -1273,11 +1310,13 @@ fn stream_segment(
                 });
             }
         }
-        Ok(())
+        Ok(written)
     };
 
     match single.as_mut() {
-        Some(response) => copy_into_cache(response)?,
+        Some(response) => {
+            copy_into_cache(response)?;
+        }
         None => {
             // A signed stream URL is short-lived, and a long download can outlive
             // it. One refresh is allowed, and the retry asks for the same range:
@@ -1291,29 +1330,84 @@ fn stream_segment(
             // One refresh for the other client, one more in case the same client signs
             // something better on a second try.
             let mut refreshes_left = 2usize;
-            for (start, end) in ranges.iter().copied() {
-                let want = end - start + 1;
-                let range = format!("bytes={start}-{end}");
-                let mut response = match api.get_stream_range(&url, &range) {
-                    Ok(response) => response,
+            // Set once a *shorter* request to this URL has been accepted. That is the
+            // evidence a source serves only the opening of the file, as opposed to
+            // refusing this URL outright — the status code says 403 either way.
+            let mut found_opening = false;
+
+            // One ranged GET, re-signing once if this URL is refused. Re-signing is the
+            // remedy for an expired signature and for nothing else.
+            let mut fetch = |range: &str| -> Result<reqwest::blocking::Response, String> {
+                match api.get_stream_range(&url, range) {
+                    Ok(response) => Ok(response),
                     Err(err) => {
                         if refreshes_left == 0 {
-                            return Err(abort(range_refused_message(start, &err.to_string())));
+                            return Err(err.to_string());
                         }
                         refreshes_left -= 1;
                         let Some((fresh, signer)) = refresh_stream_url(sources, &job.track, client)
                         else {
-                            return Err(abort(range_refused_message(start, &err.to_string())));
+                            return Err(err.to_string());
                         };
                         eprintln!(
                             "{range} refused ({err}); re-signing with {signer:?}, not {client:?}"
                         );
                         url = fresh;
                         client = Some(signer);
-                        api.get_stream_range(&url, &range)
-                            .map_err(|err| abort(range_refused_message(start, &err.to_string())))?
+                        api.get_stream_range(&url, range)
+                            .map_err(|err| err.to_string())
+                    }
+                }
+            };
+
+            // The ranges are re-derived from what is actually on disk rather than walked
+            // from a list built up front. A shortened request stops *before* the planned
+            // boundary, so a list would send the next one to its own, further start and
+            // leave a hole between them — the file would be silently short a chunk.
+            let mut position = resume_from;
+            while position < total {
+                let (start, planned_end) = remaining_ranges(job.plan, total, position)
+                    .into_iter()
+                    .next()
+                    .expect("a range remains while bytes do");
+                // A refusal does not have to be the end of the download: YouTube hands
+                // out URLs that serve only the opening of a file and answers 403 to any
+                // request whose *end* goes past it — one starting inside the opening
+                // fails all the same. Asking for less finds the edge, and every byte
+                // that comes back is kept, so the opening is used in full instead of
+                // stopping at whichever chunk boundary happened to land past it.
+                let mut end = planned_end;
+                let mut shortened = false;
+                let mut response = loop {
+                    let range = format!("bytes={start}-{end}");
+                    match fetch(&range) {
+                        Ok(response) => break response,
+                        Err(err) => {
+                            let Some(shorter) = shorter_request(start, end) else {
+                                let message = range_refused_message(position, found_opening, &err);
+                                state.fail(message.clone());
+                                if found_opening {
+                                    // Part of the file is on disk and plays, so this is a
+                                    // limit to state, not a failure to announce.
+                                    let _ = evt_tx.send(Evt::Info(format!(
+                                        "{}：{}",
+                                        job.track.title, message
+                                    )));
+                                    return Err(PARTIAL_BY_SOURCE.to_string());
+                                }
+                                return Err(message);
+                            };
+                            eprintln!("{range} refused ({err}); asking for less");
+                            shortened = true;
+                            end = shorter;
+                        }
                     }
                 };
+                if shortened {
+                    found_opening = true;
+                }
+                let want = end - start + 1;
+                let range = format!("bytes={start}-{end}");
                 // A source that ignored the range would answer 200 with the whole
                 // file; writing that per chunk would corrupt the cache, so the
                 // length is checked rather than assumed.
@@ -1322,7 +1416,13 @@ fn stream_segment(
                         "该地址忽略了范围请求（{range}：想要 {want} 字节）"
                     )));
                 }
-                copy_into_cache(&mut response)?;
+                let before = position;
+                position = copy_into_cache(&mut response)?;
+                // Re-derived ranges are only safe while the file grows; a zero-byte
+                // answer would ask for the same range for ever.
+                if position == before {
+                    return Err(abort("下载没有前进：该地址返回了空响应".to_string()));
+                }
             }
         }
     }
@@ -1526,10 +1626,11 @@ mod tests {
     /// cause and say that the audio already on disk still plays.
     #[test]
     fn a_refused_range_explains_itself() {
-        // The measured case: a signed URL that carries only the opening of the file.
-        let capped = range_refused_message(525_319, "网络请求失败: HTTP 403");
+        // The measured case: a signed URL that carries only the opening of the file,
+        // proven by a shorter request to the same URL having been accepted.
+        let capped = range_refused_message(525_319, true, "网络请求失败: HTTP 403");
         println!("{capped}");
-        assert!(capped.contains("只允许前 525319 字节"), "got {capped}");
+        assert!(capped.contains("只允许试听前 525319 字节"), "got {capped}");
         assert!(capped.contains("PoToken"), "got {capped}");
         assert!(capped.contains("仍可继续试听"), "got {capped}");
         assert!(
@@ -1537,16 +1638,56 @@ mod tests {
             "the raw range helps nobody: {capped}"
         );
 
-        // A failure on the very first range is not the cap: nothing has arrived to
-        // reassure anyone about, and 403 there means something else.
-        let first = range_refused_message(0, "网络请求失败: HTTP 403");
-        assert!(first.contains("下载中断"), "got {first}");
-        assert!(first.contains("403"), "the raw error must survive: {first}");
+        // A refusal with no evidence that asking for less would work must not name a
+        // byte limit: the number would be made up. This is also the first-range case —
+        // nothing has arrived yet, so there is nothing to reassure anyone about.
+        for start in [0, 1024] {
+            let raw = range_refused_message(start, false, "网络请求失败: HTTP 403");
+            assert!(raw.contains("下载中断"), "got {raw}");
+            assert!(
+                !raw.contains("只允许试听"),
+                "no limit was measured, so none may be named: {raw}"
+            );
+            assert!(raw.contains("403"), "the raw error must survive: {raw}");
+        }
 
         // And a failure that is not a refusal at all.
-        let other = range_refused_message(1024, "网络请求失败: 连接被重置");
+        let other = range_refused_message(1024, false, "网络请求失败: 连接被重置");
         assert!(other.contains("连接被重置"), "got {other}");
         assert!(other.contains("仍可继续试听"), "got {other}");
+    }
+
+    /// Asking for less has to reach the window's edge, and then stop.
+    ///
+    /// This is the arithmetic the download runs after a refusal. The window is the one
+    /// measured against four real videos (1,071,03x bytes; see the README), and the
+    /// assertion that matters is that the halving lands *inside* it in a handful of
+    /// requests rather than walking down a byte at a time.
+    #[test]
+    fn asking_for_less_finds_the_opening() {
+        const WINDOW_LAST: u64 = 1_071_067;
+        let start = 524_723;
+        let mut end = start + RANGE_CHUNK_BYTES - 1;
+        let mut requests = 0;
+
+        while end > WINDOW_LAST {
+            end = shorter_request(start, end).expect("the window is above the floor");
+            requests += 1;
+        }
+        println!("{requests} requests, last end {end}");
+        assert!(requests <= 8, "the walk is too long: {requests} requests");
+        assert!(
+            end >= WINDOW_LAST - 2 * RANGE_SHRINK_FLOOR,
+            "the walk stopped far short of the edge: {end} vs {WINDOW_LAST}"
+        );
+
+        // At the floor the walk ends, and it says so rather than looping.
+        assert_eq!(shorter_request(0, RANGE_SHRINK_FLOOR), None);
+        assert_eq!(shorter_request(0, RANGE_SHRINK_FLOOR * 2 - 2), None);
+        assert_eq!(
+            shorter_request(0, RANGE_SHRINK_FLOOR * 2 - 1),
+            Some(RANGE_SHRINK_FLOOR - 1)
+        );
     }
 
     #[test]
