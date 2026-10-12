@@ -232,10 +232,21 @@ impl AudioCache {
         let ready = self.ready_path_for(key, tag);
         // Tagged while it is remuxed, because the file that lands here *is* the one
         // a person opens in Finder — a sidecar tag would be invisible to every player.
+        // Written beside the real name and moved into place. A decoder may open the
+        // converted file the moment it appears — a backward seek rebuilds one, and the
+        // fragment it was reading may already be gone — and reading a *half-written*
+        // file is an IO error rather than a clean "not found". `rename` is atomic on one
+        // filesystem, so the file a decoder sees is either absent or complete.
+        let pending = ready.with_extension("m4a.part");
+        let _ = std::fs::remove_file(&pending);
         let converted = match tags {
-            Some(tags) => crate::audio::export::export_m4a_tagged(&fragment, &ready, tags),
-            None => crate::audio::export::export_m4a(&fragment, &ready),
+            Some(tags) => crate::audio::export::export_m4a_tagged(&fragment, &pending, tags),
+            None => crate::audio::export::export_m4a(&fragment, &pending),
         };
+        let converted = converted.and_then(|()| {
+            std::fs::rename(&pending, &ready).map_err(|err| format!("替换缓存文件失败：{err}"))
+        });
+        let _ = std::fs::remove_file(&pending);
         let _ = std::fs::remove_file(self.marker_path_for(key, tag));
         match converted {
             Ok(()) => {
