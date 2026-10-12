@@ -21,7 +21,33 @@
 //! ```text
 //! cargo run --example yt_limit_probe -- <keyword | videoId>
 //! cargo run --example yt_limit_probe -- --clients <videoId>
+//! LISTENBLI_YT_POT=… LISTENBLI_YT_VISITOR=… LISTENBLI_YT_GVS_POT=… \
+//!   cargo run --example yt_limit_probe -- --pot <videoId>
 //! ```
+//!
+//! `--pot` is the one route that needs something from outside: a Proof-of-Origin token,
+//! which only a JavaScript runtime can produce. It answers the question the other modes
+//! cannot — whether the opening limit is a *client* restriction that a token lifts, or a
+//! per-video policy that it does not.
+//!
+//! **Measured 2026-10-12, with a real token: it does not.** The token came from
+//! `bgutil-ytdlp-pot-provider` 2.0.2 (Node, `bgutils-js` + jsdom), which produced a
+//! fresh visitor data, a session token and a video-bound player token. Against the same
+//! capped video:
+//!
+//! * `&pot=<session token>` on the stream URL → middle range still 403,
+//! * `&pot=<player token>` on the stream URL → still 403,
+//! * `IOS` player request with `serviceIntegrityDimensions.poToken` and the session's
+//!   visitor data → still 403 (and `ANDROID_VR` stays `LOGIN_REQUIRED`),
+//! * the `web` client, which the player token exists for, answered
+//!   `UNPLAYABLE / Video unavailable` for *every* video tried — including
+//!   `jNQXAC9IVRw` — with or without the token, and with the visitor-data and client
+//!   headers yt-dlp sends. That route could not be exercised at all here, so it is
+//!   untested rather than disproved.
+//!
+//! So for the clients this app can actually use, a token buys nothing. Upstream says the
+//! same thing in its own words: "Providing a POT token does not guarantee bypassing 403
+//! errors or bot checks, but it _may_ help your traffic seem more legitimate."
 
 use listenbli::api::client::Api;
 use listenbli::api::cookie::CookieJar;
@@ -32,20 +58,136 @@ const KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("--clients") {
-        let video = args.get(1).cloned().unwrap_or_else(|| "dQw4w9WgXcQ".into());
-        clients(&video);
+    match args.first().map(String::as_str) {
+        Some("--clients") => {
+            let video = args.get(1).cloned().unwrap_or_else(|| "dQw4w9WgXcQ".into());
+            clients(&video);
+        }
+        Some("--pot") => {
+            let video = args.get(1).cloned().unwrap_or_else(|| "AL_7jyuGNhc".into());
+            web_with_pot(&video);
+        }
+        _ => {
+            let arg = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "dQw4w9WgXcQ".into());
+            if arg.len() != 11 {
+                search(&arg);
+            } else {
+                ranges(&arg);
+            }
+        }
+    }
+}
+
+/// The `web` client, with a token: does it get more than the opening?
+///
+/// Reads three things from the environment, all of them produced by a POT provider:
+/// `LISTENBLI_YT_POT` (a player token, bound to the video id), `LISTENBLI_YT_VISITOR`
+/// (the visitor data the session token is bound to) and `LISTENBLI_YT_GVS_POT` (that
+/// session token, which streaming URLs take as a `pot` parameter).
+fn web_with_pot(video: &str) {
+    let pot = std::env::var("LISTENBLI_YT_POT").unwrap_or_default();
+    let visitor = std::env::var("LISTENBLI_YT_VISITOR").unwrap_or_default();
+    let gvs = std::env::var("LISTENBLI_YT_GVS_POT").unwrap_or_default();
+    if pot.is_empty() || visitor.is_empty() {
+        println!("set LISTENBLI_YT_POT and LISTENBLI_YT_VISITOR first");
         return;
     }
-    let arg = args
-        .first()
+    let api = Api::new(CookieJar::default());
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("client");
+
+    // The version YouTube's own page is serving right now; a stale one is a refusal that
+    // has nothing to do with the token.
+    let body = serde_json::json!({
+        "videoId": video,
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+        "context": { "client": {
+            "clientName": "WEB",
+            "clientVersion": "2.20261009.01.00",
+            "hl": "en",
+            "visitorData": visitor,
+        }},
+        "serviceIntegrityDimensions": { "poToken": pot },
+    });
+    let url = format!("https://www.youtube.com/youtubei/v1/player?key={KEY}&prettyPrint=false");
+    let value: serde_json::Value = match http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .json(&body)
+        .send()
+        .and_then(|response| response.json())
+    {
+        Ok(value) => value,
+        Err(err) => {
+            println!("transport: {err}");
+            return;
+        }
+    };
+
+    let status = value
+        .pointer("/playabilityStatus/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(none)");
+    let reason = value
+        .pointer("/playabilityStatus/reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    println!("web + pot -> {status} {reason}");
+    if status != "OK" {
+        return;
+    }
+
+    let formats = value
+        .pointer("/streamingData/adaptiveFormats")
+        .and_then(serde_json::Value::as_array)
         .cloned()
-        .unwrap_or_else(|| "dQw4w9WgXcQ".into());
-    if arg.len() != 11 {
-        search(&arg);
-        return;
+        .unwrap_or_default();
+    println!("{} adaptive formats", formats.len());
+    for format in &formats {
+        let mime = format
+            .get("mimeType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !mime.starts_with("audio/mp4") {
+            continue;
+        }
+        let len = format
+            .get("contentLength")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let Some(pick) = format.get("url").and_then(serde_json::Value::as_str) else {
+            println!("  {mime} len={len}: no url (ciphered)");
+            continue;
+        };
+        println!("  {mime} len={len} pot_in_url={}", pick.contains("pot="));
+        let Ok(full) = len.parse::<u64>() else {
+            continue;
+        };
+        let mid = full / 2;
+        println!("    open   -> {}", ask(&api, pick, 0, 1023));
+        println!("    middle -> {}", ask(&api, pick, mid, mid + 1023));
+        println!("    end    -> {}", ask(&api, pick, full - 1024, full - 1));
+        if !gvs.is_empty() {
+            let sep = if pick.contains('?') { '&' } else { '?' };
+            let with_pot = format!("{pick}{sep}pot={gvs}");
+            println!(
+                "    middle with &pot= -> {}",
+                ask(&api, &with_pot, mid, mid + 1023)
+            );
+        }
     }
-    ranges(&arg);
 }
 
 fn search(keyword: &str) {
