@@ -1393,6 +1393,10 @@ fn stream_segment(
                         Ok(response) => break response,
                         Err(err) => {
                             let Some(shorter) = shorter_request(start, end) else {
+                                eprintln!(
+                                    "segment download stopped at {position} bytes, client \
+                                     {client:?}: nothing shorter was accepted either"
+                                );
                                 // The state carries the reason without the download framing:
                                 // it is what the UI reports if playback runs out of bytes.
                                 state.fail(range_refused_reason(position, found_opening, &err));

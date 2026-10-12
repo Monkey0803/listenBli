@@ -263,17 +263,23 @@ mod tests {
     #[test]
     fn a_retry_prefers_a_different_client() {
         let all = super::client_order(None);
-        assert_eq!(all, vec![ClientKind::AndroidVr, ClientKind::Ios]);
-
-        let avoiding_vr = super::client_order(Some(ClientKind::AndroidVr));
         assert_eq!(
-            avoiding_vr,
-            vec![ClientKind::Ios, ClientKind::AndroidVr],
+            all,
+            vec![ClientKind::VisionOs, ClientKind::AndroidVr, ClientKind::Ios]
+        );
+
+        let avoiding_vision = super::client_order(Some(ClientKind::VisionOs));
+        assert_eq!(
+            avoiding_vision,
+            vec![ClientKind::AndroidVr, ClientKind::Ios, ClientKind::VisionOs],
             "the avoided client is tried last, not dropped"
         );
 
         let avoiding_ios = super::client_order(Some(ClientKind::Ios));
-        assert_eq!(avoiding_ios, vec![ClientKind::AndroidVr, ClientKind::Ios]);
+        assert_eq!(
+            avoiding_ios,
+            vec![ClientKind::VisionOs, ClientKind::AndroidVr, ClientKind::Ios]
+        );
     }
 
     /// A player response without captions is the common case, and must read as

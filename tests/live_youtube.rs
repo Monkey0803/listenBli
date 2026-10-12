@@ -464,20 +464,21 @@ fn a_youtube_track_downloads_into_the_cache_and_becomes_playable() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A long compilation — the kind YouTube serves only the opening of to a client
-/// with no PoToken. Measured 2026-10-12 on four such videos: the last readable byte
-/// was 1,071,03x–1,071,067, while a 3.4 MB video was readable end to end.
-const CAPPED_VIDEO: &str = "AL_7jyuGNhc";
-
-/// A source that serves only the opening must still be used to its edge, and the
-/// limit must arrive as a limit rather than as a failure.
+/// A long compilation — the kind the app used to be served only the opening of.
 ///
-/// This is the regression test for both halves of that: the download walks past the
-/// opening chunk the plan asks for first (`header + 512 KiB` ⇒ 524,723 bytes), and
-/// what it has is announced as information, because the audio plays.
+/// Measured 2026-10-12: with `IOS` the last readable byte was 1,071,067, and with the
+/// headset client the same file is readable end to end.
+const LONG_VIDEO: &str = "AL_7jyuGNhc";
+
+/// A large video downloads in full.
+///
+/// The regression test for the client that made this possible. Before it, this video
+/// stopped at about 1 MB, the download announced a limit, and playback died a minute in.
+/// The assertion is deliberately about the whole file: a client or a policy that caps
+/// again has to fail here rather than quietly go back to serving the opening.
 #[test]
-#[ignore = "hits the live YouTube service and downloads ~20 MB"]
-fn a_capped_video_keeps_the_opening_and_says_so() {
+#[ignore = "hits the live YouTube service and downloads ~22 MB"]
+fn a_long_video_downloads_in_full() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -489,7 +490,7 @@ fn a_capped_video_keeps_the_opening_and_says_so() {
 
     // A cache of its own, pointed at rather than inherited: `set_root` is how the app
     // itself redirects the worker when the setting changes.
-    let dir = std::env::temp_dir().join(format!("listenbli-yt-capped-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("listenbli-yt-long-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let config = Config {
         cache_dir: Some(dir.clone()),
@@ -500,11 +501,11 @@ fn a_capped_video_keeps_the_opening_and_says_so() {
     worker.cache.set_root(&dir);
 
     let track = Track {
-        bvid: CAPPED_VIDEO.to_owned(),
+        bvid: LONG_VIDEO.to_owned(),
         source: Source::Youtube,
         aid: 0,
         cid: 0,
-        title: "capped".to_owned(),
+        title: "long".to_owned(),
         author: String::new(),
         duration: 0,
         cover: None,
@@ -525,139 +526,55 @@ fn a_capped_video_keeps_the_opening_and_says_so() {
         }
         out
     };
+    let converted = |dir: &std::path::Path| -> Option<u64> {
+        files(dir)
+            .into_iter()
+            .find(|(name, _)| name.ends_with(".m4a"))
+            .map(|(_, size)| size)
+    };
 
-    let mut handed = None;
-    let mut limit = None;
-    let mut failure = None;
+    // Nothing at all should be reported: a download that completes has nothing to say.
+    let mut ready = false;
+    let mut complaints = Vec::new();
+    let mut size = None;
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(240) {
-        match worker.evt_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Evt::TrackReady { source, .. }) => handed = Some(source),
-            Ok(Evt::Info(message)) if message.contains("只允许试听") => {
-                limit = Some(message);
-                break;
-            }
+    while started.elapsed() < Duration::from_secs(300) {
+        match worker.evt_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(Evt::TrackReady { .. }) => ready = true,
+            Ok(Evt::Info(message)) => complaints.push(format!("info: {message}")),
             Ok(Evt::Error { context, message }) => {
-                failure = Some(format!("{context}：{message}"));
-                break;
+                complaints.push(format!("error: {context}：{message}"))
             }
             Ok(_) => {}
-            // Silence means the download either finished or stopped without a word:
-            // the files on disk say which.
-            Err(_) => {
-                if files(&worker.cache.dir())
-                    .iter()
-                    .any(|(name, _)| name.ends_with(".m4a"))
-                {
-                    break;
-                }
-            }
+            // A quiet worker means the download is over, one way or the other; the cache
+            // is what says which.
+            Err(_) => {}
+        }
+        if let Some(bytes) = converted(&worker.cache.dir()) {
+            size = Some(bytes);
+            break;
         }
     }
 
-    assert!(
-        handed.is_some(),
-        "playback should have started from the opening"
-    );
-    assert!(
-        failure.is_none(),
-        "a source's limit is not a failure to announce: {failure:?}"
-    );
-
-    let files = files(&worker.cache.dir());
-    let names: Vec<String> = files
+    let listed = files(&worker.cache.dir());
+    let names: Vec<String> = listed
         .iter()
-        .map(|(name, size)| format!("{name} ({size})"))
+        .map(|(name, bytes)| format!("{name} ({bytes})"))
         .collect();
     println!("cache: {}", names.join(", "));
 
-    let Some(limit) = limit else {
-        // YouTube lifted the cap, or this video is no longer capped. Nothing is wrong,
-        // and there is nothing left to assert.
-        println!("the source no longer caps this video; nothing to check");
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
-    };
-    println!("reported: {limit}");
-
-    let kept = files
-        .iter()
-        .filter(|(name, _)| name.ends_with(".m4s"))
-        .map(|(_, size)| *size)
-        .max()
-        .unwrap_or(0);
-    // `header + 512 KiB` for this video is 524,723 bytes: stopping there is exactly what
-    // the shrink walk exists to avoid. Anything above a megabyte means it walked.
+    assert!(ready, "playback should have been offered from the opening");
     assert!(
-        kept > 1_000_000,
-        "the opening was not used in full: {kept} bytes kept"
+        complaints.is_empty(),
+        "a download that completes must not complain: {complaints:?}"
     );
-    // And it is not the whole file, so the cache must not be holding a playable `.m4a`
-    // that would make a later hit look like a complete download.
+    let size = size.unwrap_or_else(|| panic!("no playable file was produced: {names:?}"));
+    println!("downloaded {size} bytes");
+    // The 129 kbps AAC track is ~22.5 MB. A cap would leave about 1 MB here, which is
+    // exactly what this is watching for.
     assert!(
-        !files.iter().any(|(name, _)| name.ends_with(".m4a")),
-        "an incomplete download was converted into a playable file: {names:?}"
-    );
-
-    // What a person actually experiences. Playback runs on from the bytes that did
-    // arrive and stops at the frontier — and it has to stop *saying why*. From the
-    // player's side a source that errored is indistinguishable from one that ended
-    // (rodio turns the read error into a plain end of stream), so this is the part that
-    // decides between playing the next track and staying put with an explanation.
-    let source = handed.expect("a streaming handoff");
-    let state = source
-        .stream_state()
-        .expect("a capped download is a streaming source")
-        .clone();
-    let reason = state
-        .failure()
-        .expect("the state must carry the reason playback is about to stop for");
-    println!("state reason: {reason}");
-    assert!(
-        reason.contains("只允许试听前"),
-        "the reason has to be the measured one: {reason}"
-    );
-
-    let mut engine = match listenbli::audio::AudioEngine::new(0.0) {
-        Ok(engine) => engine,
-        Err(err) => {
-            eprintln!("skipping the playback phase: no audio device ({err})");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-    };
-    engine.play_stream(&source, Duration::from_secs(1395), track.key());
-
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match engine.poll() {
-            Some(Ok(())) => break,
-            Some(Err(err)) => panic!("the decoder failed to open: {err}"),
-            None => {
-                assert!(Instant::now() < deadline, "the decoder never installed");
-                std::thread::sleep(Duration::from_millis(15));
-            }
-        }
-    }
-    assert!(engine.is_playing(), "the opening should be playing");
-
-    // The prefix is about 65 seconds of audio, so this waits roughly a minute: the
-    // point is the real thing, not a re-enactment.
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while !engine.is_finished() {
-        assert!(
-            Instant::now() < deadline,
-            "playback never reached the end of the bytes the source allowed"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let stopped = engine
-        .stream_failure()
-        .expect("a stream that ran out must say so when the player empties");
-    println!("playback stopped after the opening: {stopped}");
-    assert!(
-        stopped.contains("只允许试听前"),
-        "the reason has to survive to the end of playback: {stopped}"
+        size > 20_000_000,
+        "the file stopped short of the whole track: {size} bytes"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

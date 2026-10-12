@@ -28,7 +28,8 @@
 //! tried and did *not* lift the gate. `IOS` answers 400 to a partial context: the
 //! device fields *and* a `userAgent`, both inside `context.client`, are required.
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, USER_AGENT};
@@ -42,6 +43,27 @@ use serde_json::{json, Value};
 /// rotate it occasionally.
 pub const API_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
+/// Where the anonymous visitor id comes from.
+///
+/// Any YouTube page carries one; the home page is the cheapest stable one, and it was
+/// measured to work as well as the watch page's (2026-10-12).
+const YOUTUBE_HOME: &str = "https://www.youtube.com/";
+
+/// How long a failed attempt is believed before the page is asked again.
+///
+/// A miss is remembered only this long, to stop a burst of requests from each retrying
+/// it. Remembering it forever — which is what the first version did — lets one unlucky
+/// page decide the whole session, and the app then quietly falls back to a client that
+/// serves only the opening.
+const VISITOR_RETRY: Duration = Duration::from_secs(30);
+
+/// The visitor id, and when it was last missed.
+#[derive(Default)]
+struct VisitorCache {
+    value: Option<String>,
+    failed_at: Option<Instant>,
+}
+
 const WEB_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                       (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const VR_UA: &str =
@@ -51,6 +73,15 @@ const VR_UA: &str =
 /// must agree.
 const IOS_VERSION: &str = "20.10.4";
 const IOS_UA: &str = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)";
+
+/// The visionOS client, taken from what `yt-dlp` sends as its first choice.
+///
+/// The user agent is a Safari one — this client is a browser engine wearing a headset,
+/// not an app, and the `osName`/`osVersion`/`deviceModel` fields are part of that story.
+const VISIONOS_VERSION: &str = "1.02";
+const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 \
+                           (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+const VISIONOS_OS_VERSION: &str = "26.5.23O471";
 
 /// Which client identity a request claims to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,15 +94,22 @@ pub enum ClientKind {
     /// The iPhone client. Answers with direct URLs for the videos `ANDROID_VR`
     /// refuses.
     Ios,
+    /// The headset client. The only one measured *not* to be limited to the opening of a
+    /// large file, and it needs no token and no JavaScript runtime — but it will not
+    /// serve playback without a [`InnerTube::visitor_data`], and it refuses "made for
+    /// kids" videos, which is what the other two are still for.
+    VisionOs,
 }
 
 impl ClientKind {
     /// The playback clients to try, in order.
     ///
-    /// One entry today because it is the one that was verified. The list exists so
-    /// that adding a fallback — or removing a dead one — is a one-line change in
-    /// the place that documents why.
-    pub const PLAYBACK_FALLBACKS: &'static [ClientKind] = &[ClientKind::AndroidVr, ClientKind::Ios];
+    /// The list exists so that adding a fallback — or removing a dead one — is a one-line
+    /// change in the place that documents why. `VISIONOS` goes first because it is the
+    /// one that serves a whole large file (measured 2026-10-12); the other two answer
+    /// where it refuses, which is "made for kids" videos and a few gated ones.
+    pub const PLAYBACK_FALLBACKS: &'static [ClientKind] =
+        &[ClientKind::VisionOs, ClientKind::AndroidVr, ClientKind::Ios];
 
     /// The `context.client` object this identity sends.
     ///
@@ -103,6 +141,15 @@ impl ClientKind {
                 "osVersion": "18.3.2.22D82",
                 "userAgent": IOS_UA,
             }),
+            ClientKind::VisionOs => json!({
+                "clientName": "VISIONOS",
+                "clientVersion": VISIONOS_VERSION,
+                "deviceMake": "Apple",
+                "deviceModel": "RealityDevice17,1",
+                "osName": "visionOS",
+                "osVersion": VISIONOS_OS_VERSION,
+                "userAgent": VISIONOS_UA,
+            }),
         }
     }
 
@@ -111,6 +158,7 @@ impl ClientKind {
             ClientKind::Web => WEB_UA,
             ClientKind::AndroidVr => VR_UA,
             ClientKind::Ios => IOS_UA,
+            ClientKind::VisionOs => VISIONOS_UA,
         }
     }
 }
@@ -135,6 +183,15 @@ pub enum YoutubeError {
 pub struct InnerTube {
     http: Client,
     api_key: String,
+    /// The anonymous id a visit to YouTube leaves behind, fetched at most once.
+    ///
+    /// Not a login and not a cookie. It is what the `VISIONOS` client needs to be served
+    /// playback at all: without it YouTube answers `LOGIN_REQUIRED`, and with it the same
+    /// video is served in full (measured 2026-10-12, on five videos from 3 MB to 591 MB).
+    ///
+    /// The outer `Option` is "has the page been asked", so a failure is not retried on
+    /// every request that follows it.
+    visitor_data: Mutex<VisitorCache>,
 }
 
 impl InnerTube {
@@ -157,6 +214,51 @@ impl InnerTube {
         Self {
             http,
             api_key: api_key.into(),
+            visitor_data: Mutex::new(VisitorCache::default()),
+        }
+    }
+
+    /// The `visitorData` every request carries, asked for on first use.
+    ///
+    /// Video-independent session state, so one value serves every video until the process
+    /// ends. A miss is not fatal — the request goes out without it and the headset client
+    /// answers `LOGIN_REQUIRED`, which the client list then falls through — but it is
+    /// retried, and said out loud, because silently falling back is how a client that
+    /// serves the opening only gets used without anyone noticing.
+    pub fn visitor_data(&self) -> Option<String> {
+        {
+            let cache = self.visitor_data.lock().unwrap();
+            if let Some(value) = &cache.value {
+                return Some(value.clone());
+            }
+            if cache
+                .failed_at
+                .is_some_and(|at| at.elapsed() < VISITOR_RETRY)
+            {
+                return None;
+            }
+        }
+
+        let found = self
+            .get_text(ClientKind::Web, YOUTUBE_HOME)
+            .ok()
+            .and_then(|page| visitor_data_from_page(&page));
+
+        let mut cache = self.visitor_data.lock().unwrap();
+        match found {
+            Some(value) => {
+                cache.value = Some(value.clone());
+                cache.failed_at = None;
+                Some(value)
+            }
+            None => {
+                cache.failed_at = Some(Instant::now());
+                eprintln!(
+                    "youtube: {YOUTUBE_HOME} carried no visitor id; playback will fall back \
+                     to a client that may serve only the opening"
+                );
+                None
+            }
         }
     }
 
@@ -175,7 +277,16 @@ impl InnerTube {
             self.api_key
         );
         if let Some(object) = body.as_object_mut() {
-            object.insert("context".to_owned(), json!({ "client": client.context() }));
+            let mut context = client.context();
+            // The visitor id goes in every client's context. It is what lifts
+            // `LOGIN_REQUIRED` on the headset client, and it can only make the others
+            // look less like a scraper.
+            if let Some(visitor) = self.visitor_data() {
+                if let Some(fields) = context.as_object_mut() {
+                    fields.insert("visitorData".to_owned(), Value::String(visitor));
+                }
+            }
+            object.insert("context".to_owned(), json!({ "client": context }));
         }
 
         let mut headers = HeaderMap::new();
@@ -232,6 +343,19 @@ impl InnerTube {
     }
 }
 
+/// The anonymous visitor id a YouTube page carries, if it carries one.
+///
+/// A substring scan rather than a JSON parse: the value lives inside a `<script>` blob
+/// that is not the document, and `yt-dlp` reads it the same way.
+fn visitor_data_from_page(html: &str) -> Option<String> {
+    const NEEDLE: &str = "\"VISITOR_DATA\":\"";
+    let start = html.find(NEEDLE)? + NEEDLE.len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    let value = &rest[..end];
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 impl Default for InnerTube {
     fn default() -> Self {
         Self::new()
@@ -255,10 +379,15 @@ mod tests {
 
     #[test]
     fn every_identity_has_its_own_user_agent() {
-        let mut agents: Vec<&str> = [ClientKind::Web, ClientKind::AndroidVr, ClientKind::Ios]
-            .iter()
-            .map(|client| client.user_agent())
-            .collect();
+        let mut agents: Vec<&str> = [
+            ClientKind::Web,
+            ClientKind::AndroidVr,
+            ClientKind::Ios,
+            ClientKind::VisionOs,
+        ]
+        .iter()
+        .map(|client| client.user_agent())
+        .collect();
         let before = agents.len();
         agents.sort_unstable();
         agents.dedup();
@@ -270,11 +399,12 @@ mod tests {
     fn playback_has_a_fallback_for_gated_videos() {
         assert_eq!(
             ClientKind::PLAYBACK_FALLBACKS.first(),
-            Some(&ClientKind::AndroidVr)
+            Some(&ClientKind::VisionOs),
+            "the headset client is the one that serves a whole large file"
         );
         assert!(
             ClientKind::PLAYBACK_FALLBACKS.contains(&ClientKind::Ios),
-            "IOS is what answers when AndroidVr says LOGIN_REQUIRED"
+            "IOS is what answers when the others say LOGIN_REQUIRED"
         );
         // A partial IOS context is a 400, so the fields that lift it must be there.
         let ios = ClientKind::Ios.context();
@@ -287,5 +417,39 @@ mod tests {
         ] {
             assert!(ios.get(field).is_some(), "IOS needs {field}: {ios}");
         }
+        // The same applies to the headset client, whose fields are what make it a
+        // headset rather than a bare client name.
+        let vision = ClientKind::VisionOs.context();
+        assert_eq!(vision["clientName"], "VISIONOS");
+        for field in [
+            "deviceMake",
+            "deviceModel",
+            "osName",
+            "osVersion",
+            "userAgent",
+        ] {
+            assert!(
+                vision.get(field).is_some(),
+                "VISIONOS needs {field}: {vision}"
+            );
+        }
+    }
+
+    /// The visitor id is read off a page, and a page without one is not a panic.
+    #[test]
+    fn the_visitor_id_is_read_off_the_page() {
+        let page = r#"<script>var x = {"VISITOR_DATA":"Cgtabc-123","OTHER":1};</script>"#;
+        assert_eq!(visitor_data_from_page(page).as_deref(), Some("Cgtabc-123"));
+
+        assert_eq!(visitor_data_from_page("no field here"), None);
+        assert_eq!(
+            visitor_data_from_page(r#""VISITOR_DATA":"""#),
+            None,
+            "an empty id is not an id"
+        );
+        assert_eq!(
+            visitor_data_from_page(r#""VISITOR_DATA":"unterminated"#),
+            None
+        );
     }
 }
