@@ -1167,7 +1167,7 @@ fn stream_segment(
         existing
     } else {
         // Everything else is stale partial data, not a resume.
-        cache.remove(&cache_key, tag);
+        cache.remove_partial(&cache_key, tag);
         0
     };
     cache
@@ -1214,7 +1214,7 @@ fn stream_segment(
         loop {
             if is_superseded(request_id, job.generation) {
                 state.cancel();
-                cache.remove(&cache_key, tag);
+                cache.remove_partial(&cache_key, tag);
                 return Err(SUPERSEDED.to_string());
             }
 

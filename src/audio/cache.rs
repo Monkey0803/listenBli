@@ -194,6 +194,18 @@ impl AudioCache {
         let _ = std::fs::remove_file(self.marker_path_for(key, tag));
     }
 
+    /// Drop a partial download's own files, keeping anything finished.
+    ///
+    /// [`AudioCache::remove`] deletes the playable `.m4a` as well, which is right when a
+    /// key is being evicted and wrong when an attempt is about to start over: a retry
+    /// that wipes the finished file loses what the cache already had, and the download
+    /// it replaces it with is exactly the one that just failed.
+    pub fn remove_partial(&self, key: &str, tag: u32) {
+        let _ = std::fs::remove_file(self.path_for(key, tag));
+        let _ = std::fs::remove_file(self.meta_path_for(key, tag));
+        let _ = std::fs::remove_file(self.marker_path_for(key, tag));
+    }
+
     /// Turn a finished download into a playable file, so the cache holds audio
     /// rather than fragments.
     ///
@@ -629,6 +641,43 @@ mod tests {
         let dir = temp_dir("remove");
         let cache = AudioCache::with_dir(dir.clone());
         cache.store("2", 30280, &fake_segment(64)).unwrap();
+        /// A retry must not delete a finished file: it is the only copy of the audio, and a
+        /// download that wipes it has nothing better to put back.
+        #[test]
+        fn removing_a_partial_download_keeps_the_finished_file() {
+            let dir =
+                std::env::temp_dir().join(format!("listenbli-partial-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = AudioCache::with_dir(dir.clone());
+
+            std::fs::write(cache.path_for("k", 30280), b"fragment").unwrap();
+            std::fs::write(cache.meta_path_for("k", 30280), b"{}").unwrap();
+            std::fs::write(cache.marker_path_for("k", 30280), b"").unwrap();
+            std::fs::write(cache.ready_path_for("k", 30280), b"finished audio").unwrap();
+
+            cache.remove_partial("k", 30280);
+
+            assert!(!cache.path_for("k", 30280).exists(), "the fragment goes");
+            assert!(
+                !cache.meta_path_for("k", 30280).exists(),
+                "the sidecar goes"
+            );
+            assert!(
+                !cache.marker_path_for("k", 30280).exists(),
+                "the marker goes"
+            );
+            assert_eq!(
+                std::fs::read(cache.ready_path_for("k", 30280)).unwrap(),
+                b"finished audio",
+                "the finished file must survive"
+            );
+
+            // The full removal still takes everything, for an eviction.
+            cache.remove("k", 30280);
+            assert!(!cache.ready_path_for("k", 30280).exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         cache.remove("2", 30280);
         assert!(cache.get("2", 30280).is_none());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
