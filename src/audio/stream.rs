@@ -207,17 +207,51 @@ impl PlaybackSource {
 /// download frontier for the end of the stream.
 pub struct BlockingFileReader {
     file: File,
+    /// `None` while the download is still growing the fragment; `Some(len)` when this
+    /// reader is serving the finished `.m4a` that replaced it.
+    complete: Option<u64>,
     state: Arc<StreamState>,
     position: u64,
 }
 
 impl BlockingFileReader {
+    /// Open the stream's bytes.
+    ///
+    /// The fragment a decoder was handed does not always survive: a finished download
+    /// converts it to a playable `.m4a` and removes the fragment, and a *backward seek
+    /// builds a new decoder* — so the second decoder can find nothing there. The
+    /// converted file holds the same audio and is complete, so it is served instead of
+    /// failing; there is nothing to wait for, and the download's counters describe the
+    /// fragment rather than this file.
+    ///
+    /// Only `NotFound` falls back. Any other error is the download's own (a permission,
+    /// a vanished directory) and deserves to be reported as it is.
     pub fn open(path: &Path, state: Arc<StreamState>) -> io::Result<Self> {
-        Ok(Self {
-            file: File::open(path)?,
-            state,
-            position: 0,
-        })
+        match File::open(path) {
+            Ok(file) => Ok(Self {
+                file,
+                complete: None,
+                state,
+                position: 0,
+            }),
+            Err(original) if original.kind() == io::ErrorKind::NotFound => {
+                let converted = path.with_extension("m4a");
+                let file = File::open(&converted).map_err(|_| original)?;
+                let len = file.metadata()?.len();
+                Ok(Self {
+                    file,
+                    complete: Some(len),
+                    state,
+                    position: 0,
+                })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The byte length of whatever is being served.
+    fn source_len(&self) -> u64 {
+        self.complete.unwrap_or_else(|| self.state.total())
     }
 }
 
@@ -226,13 +260,18 @@ impl Read for BlockingFileReader {
         if buf.is_empty() {
             return Ok(0);
         }
-        let total = self.state.total();
+        let total = self.source_len();
         // Past the real end of the stream: a genuine, non-blocking EOF.
         if self.position >= total {
             return Ok(0);
         }
 
-        let available = self.state.wait_available(self.position, READ_TIMEOUT)?;
+        let available = match self.complete {
+            // A converted file is whole: waiting for bytes that are already there would
+            // only stall, and the download may be long finished.
+            Some(_) => total,
+            None => self.state.wait_available(self.position, READ_TIMEOUT)?,
+        };
         if available == 0 {
             return Ok(0);
         }
@@ -249,7 +288,7 @@ impl Seek for BlockingFileReader {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         // Seeking never blocks: only reads wait for data. The decoder seeks a
         // lot while probing and building its tables.
-        let total = self.state.total() as i64;
+        let total = self.source_len() as i64;
         let target = match position {
             SeekFrom::Start(offset) => offset as i64,
             SeekFrom::End(offset) => total + offset,
@@ -273,6 +312,57 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("listenbli-stream-{tag}-{}.bin", std::process::id()))
+    }
+
+    /// A finished download removes the fragment a decoder was handed, and a backward
+    /// seek builds a new decoder — which then has to read the converted file.
+    #[test]
+    fn a_converted_file_is_served_when_the_fragment_is_gone() {
+        let fragment = temp_path("converted");
+        let converted = fragment.with_extension("m4a");
+        std::fs::write(&converted, b"progressive bytes").unwrap();
+        let _ = std::fs::remove_file(&fragment);
+
+        // A state that still claims a large download, to prove the reads do not consult
+        // it: the fragment is gone and its counter is meaningless now.
+        let state = Arc::new(StreamState::new(1_000_000));
+        let mut reader = BlockingFileReader::open(&fragment, state).unwrap();
+        assert_eq!(
+            reader.seek(SeekFrom::End(0)).unwrap(),
+            17,
+            "the length must be the converted file's, not the fragment's total"
+        );
+        // Measuring the length left the cursor at the end, so rewind before reading.
+        assert_eq!(reader.seek(SeekFrom::Start(0)).unwrap(), 0);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"progressive bytes");
+        // And it is still there for the next decoder.
+        assert_eq!(reader.seek(SeekFrom::Start(0)).unwrap(), 0);
+        let mut again = String::new();
+        reader.read_to_string(&mut again).unwrap();
+        assert_eq!(
+            again, "progressive bytes",
+            "a re-seek still serves the file"
+        );
+
+        let _ = std::fs::remove_file(&converted);
+    }
+
+    /// With neither file there, the original error is what surfaces: falling back must
+    /// not hide a genuinely missing stream.
+    #[test]
+    fn a_missing_fragment_with_no_converted_twin_still_fails() {
+        let fragment = temp_path("no-twin");
+        let _ = std::fs::remove_file(&fragment);
+        let _ = std::fs::remove_file(fragment.with_extension("m4a"));
+
+        let state = Arc::new(StreamState::new(10));
+        let err = match BlockingFileReader::open(&fragment, state) {
+            Ok(_) => panic!("there is no file to read"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
