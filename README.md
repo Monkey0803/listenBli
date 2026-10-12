@@ -275,7 +275,7 @@ open dist/ListenBli.app
 ### 离线单元测试（默认，CI 运行）
 
 ```bash
-cargo test          # 181 个测试，不联网
+cargo test          # 253 个测试，不联网
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
