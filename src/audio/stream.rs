@@ -77,6 +77,19 @@ impl StreamState {
         self.inner.lock().unwrap().status.clone()
     }
 
+    /// Why the download stopped short, when it did.
+    ///
+    /// A stream that finished, or is still running, has nothing to report. This is what
+    /// lets a caller tell "the track played to its end" from "the bytes ran out because
+    /// the download died": from the player's side the two are identical — it is simply
+    /// empty.
+    pub fn failure(&self) -> Option<String> {
+        match &self.inner.lock().unwrap().status {
+            StreamStatus::Failed(message) => Some(message.clone()),
+            _ => None,
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         matches!(self.status(), StreamStatus::Running)
     }
@@ -298,7 +311,18 @@ impl Read for BlockingFileReader {
             // A converted file is whole: waiting for bytes that are already there would
             // only stall, and the download may be long finished.
             Some(_) => total,
-            None => self.state.wait_available(self.position, READ_TIMEOUT)?,
+            None => match self.state.wait_available(self.position, READ_TIMEOUT) {
+                Ok(available) => available,
+                Err(err) => {
+                    // Giving up on a read means the download is not coming back, and the
+                    // state has to say so: a decoder that stops because its source died is
+                    // indistinguishable from one that reached the end of the file, and this
+                    // is the only place that knows which happened. `fail` leaves a
+                    // cancellation — someone else's decision — alone.
+                    self.state.fail(err.to_string());
+                    return Err(err);
+                }
+            },
         };
         if available == 0 {
             return Ok(0);
@@ -416,6 +440,57 @@ mod tests {
         assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), 1000);
         assert_eq!(reader.stream_position().unwrap(), 1000);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failed download must be distinguishable from a finished one.
+    ///
+    /// The decoder stops either way and rodio reports both as "the source ended", so this
+    /// is the only place that knows which happened — it is what the UI asks before it
+    /// decides between playing the next track and saying why playback stopped.
+    #[test]
+    fn a_failed_download_reports_its_reason_once_the_reader_catches_up() {
+        // Its own tag: `temp_path` is keyed by tag alone, and two tests sharing one would
+        // overwrite each other's file while running in parallel.
+        let path = temp_path("ran-out");
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        let state = Arc::new(StreamState::new(1000));
+        state.publish(64);
+        state.fail("只允许试听前 64 字节");
+
+        let mut reader = BlockingFileReader::open(&path, Arc::clone(&state)).unwrap();
+        // Bytes that did arrive are still served: the failure ends the stream where it
+        // stopped, it does not take back what is on disk.
+        let mut buf = [0u8; 32];
+        assert_eq!(reader.read(&mut buf).unwrap(), 32);
+        assert_eq!(reader.read(&mut buf).unwrap(), 32);
+
+        // At the frontier the reason surfaces, instead of a silent end.
+        let err = reader
+            .read(&mut buf)
+            .expect_err("the frontier of a failed download is not an end of file");
+        assert!(
+            err.to_string().contains("只允许试听前 64 字节"),
+            "got {err}"
+        );
+        assert_eq!(state.failure().as_deref(), Some("只允许试听前 64 字节"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stream that finished has nothing to report, and a finish is not undone by a
+    /// later failure: these are the two states the caller must never confuse.
+    #[test]
+    fn a_finished_stream_reports_no_failure() {
+        let state = StreamState::new(10);
+        assert_eq!(state.failure(), None, "still running is not failed");
+
+        state.finish();
+        assert_eq!(state.failure(), None, "finished is not failed");
+
+        // Only a running stream can be failed, so a finish cannot be turned into a
+        // failure by whatever happens to the download afterwards.
+        state.fail("下载中断：超时");
+        assert_eq!(state.failure(), None, "a finished stream stays finished");
     }
 
     #[test]

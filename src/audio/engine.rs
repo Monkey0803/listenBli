@@ -402,6 +402,15 @@ impl AudioEngine {
         self.loaded_key.as_deref()
     }
 
+    /// Why the current track's download stopped short, if it did.
+    ///
+    /// The player going empty means *something* ended, and the two possibilities want
+    /// different reactions: a track that played to its end should advance, while one
+    /// whose bytes ran out has to say so. Only the stream state knows which happened.
+    pub fn stream_failure(&self) -> Option<String> {
+        self.stream.as_ref().and_then(|state| state.failure())
+    }
+
     pub fn duration(&self) -> Duration {
         self.duration
     }

@@ -526,13 +526,13 @@ fn a_capped_video_keeps_the_opening_and_says_so() {
         out
     };
 
-    let mut ready = false;
+    let mut handed = None;
     let mut limit = None;
     let mut failure = None;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(240) {
         match worker.evt_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Evt::TrackReady { .. }) => ready = true,
+            Ok(Evt::TrackReady { source, .. }) => handed = Some(source),
             Ok(Evt::Info(message)) if message.contains("只允许试听") => {
                 limit = Some(message);
                 break;
@@ -555,7 +555,10 @@ fn a_capped_video_keeps_the_opening_and_says_so() {
         }
     }
 
-    assert!(ready, "playback should have started from the opening");
+    assert!(
+        handed.is_some(),
+        "playback should have started from the opening"
+    );
     assert!(
         failure.is_none(),
         "a source's limit is not a failure to announce: {failure:?}"
@@ -594,6 +597,67 @@ fn a_capped_video_keeps_the_opening_and_says_so() {
     assert!(
         !files.iter().any(|(name, _)| name.ends_with(".m4a")),
         "an incomplete download was converted into a playable file: {names:?}"
+    );
+
+    // What a person actually experiences. Playback runs on from the bytes that did
+    // arrive and stops at the frontier — and it has to stop *saying why*. From the
+    // player's side a source that errored is indistinguishable from one that ended
+    // (rodio turns the read error into a plain end of stream), so this is the part that
+    // decides between playing the next track and staying put with an explanation.
+    let source = handed.expect("a streaming handoff");
+    let state = source
+        .stream_state()
+        .expect("a capped download is a streaming source")
+        .clone();
+    let reason = state
+        .failure()
+        .expect("the state must carry the reason playback is about to stop for");
+    println!("state reason: {reason}");
+    assert!(
+        reason.contains("只允许试听前"),
+        "the reason has to be the measured one: {reason}"
+    );
+
+    let mut engine = match listenbli::audio::AudioEngine::new(0.0) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("skipping the playback phase: no audio device ({err})");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+    engine.play_stream(&source, Duration::from_secs(1395), track.key());
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match engine.poll() {
+            Some(Ok(())) => break,
+            Some(Err(err)) => panic!("the decoder failed to open: {err}"),
+            None => {
+                assert!(Instant::now() < deadline, "the decoder never installed");
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    assert!(engine.is_playing(), "the opening should be playing");
+
+    // The prefix is about 65 seconds of audio, so this waits roughly a minute: the
+    // point is the real thing, not a re-enactment.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !engine.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "playback never reached the end of the bytes the source allowed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let stopped = engine
+        .stream_failure()
+        .expect("a stream that ran out must say so when the player empties");
+    println!("playback stopped after the opening: {stopped}");
+    assert!(
+        stopped.contains("只允许试听前"),
+        "the reason has to survive to the end of playback: {stopped}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

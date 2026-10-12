@@ -1559,10 +1559,12 @@ impl App {
         let rect = ui.max_rect();
         hline(ui, rect.top() + 0.5, t::LINE);
 
+        // A sticky status waits to be replaced: it explains why something stopped, and
+        // there is no later moment for it to arrive at.
         let expired = self
             .status
             .as_ref()
-            .is_some_and(|status| status.at.elapsed() > super::app::STATUS_TTL);
+            .is_some_and(|status| !status.sticky && status.at.elapsed() > super::app::STATUS_TTL);
         if expired {
             self.status = None;
         }

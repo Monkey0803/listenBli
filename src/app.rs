@@ -30,10 +30,42 @@ pub enum Tab {
     History,
 }
 
+/// What the player going empty means.
+///
+/// The decision is kept apart from its reaction so it can be tested without an audio
+/// device, and so the two cases cannot be quietly confused again: a track that played to
+/// its end advances, one whose bytes ran out says why and stays put.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndOfTrack {
+    Advance,
+    RanOut(String),
+}
+
+/// The decision itself, kept free of the engine so it can be tested without a device.
+///
+/// `finished` is the player being empty; `failure` is why the download stopped, when it
+/// did. A track whose bytes ran out must never be mistaken for one that ended.
+fn ending_of(finished: bool, failure: Option<String>) -> Option<EndOfTrack> {
+    if !finished {
+        return None;
+    }
+    Some(match failure {
+        Some(reason) => EndOfTrack::RanOut(reason),
+        None => EndOfTrack::Advance,
+    })
+}
+
 pub struct Status {
     pub text: String,
     pub is_error: bool,
     pub at: Instant,
+    /// Whether this message waits to be replaced instead of fading on its own.
+    ///
+    /// A status is normally a passing note about something that just happened. One that
+    /// explains why playback *stopped* is not: the player is silent, nothing else is
+    /// going to happen, and a line that erases itself after a few seconds leaves a person
+    /// with a song that ended for no visible reason.
+    pub sticky: bool,
 }
 
 /// State for the QR login modal.
@@ -404,6 +436,20 @@ impl App {
             text: text.into(),
             is_error,
             at: Instant::now(),
+            sticky: false,
+        });
+    }
+
+    /// The same, but it stays until something replaces it.
+    ///
+    /// Used for the one message that is the only explanation a person gets: why the song
+    /// they were listening to stopped.
+    pub(crate) fn set_sticky_status(&mut self, text: impl Into<String>, is_error: bool) {
+        self.status = Some(Status {
+            text: text.into(),
+            is_error,
+            at: Instant::now(),
+            sticky: true,
         });
     }
 
@@ -415,6 +461,9 @@ impl App {
     }
 
     fn start_current(&mut self, track: Track) {
+        // Picking a song is an answer to whatever the last message said, including the
+        // sticky one about why playback stopped.
+        self.status = None;
         self.lyrics = Lyrics::empty(crate::lyrics::LyricsSource::None);
         self.lyrics_for = None;
         self.follow_lyrics = true;
@@ -424,6 +473,16 @@ impl App {
         self.request_cover(&track);
         self.current = Some(track.clone());
         self.send(Cmd::LoadTrack(Box::new(track)));
+    }
+
+    /// Which of the two endings just happened, if either.
+    ///
+    /// The player going empty says only that *something* ended. A track that played to
+    /// its end should advance; one whose bytes ran out has to say so, and the difference
+    /// is invisible from the player — hence the question goes to the download's state.
+    fn track_ending(&self) -> Option<EndOfTrack> {
+        let engine = self.engine.as_ref()?;
+        ending_of(engine.is_finished(), engine.stream_failure())
     }
 
     pub(crate) fn play_next(&mut self) {
@@ -807,12 +866,26 @@ impl App {
             None => {}
         }
 
-        if self
-            .engine
-            .as_ref()
-            .is_some_and(|engine| engine.is_finished())
-        {
-            self.play_next();
+        match self.track_ending() {
+            Some(EndOfTrack::Advance) => self.play_next(),
+            Some(EndOfTrack::RanOut(reason)) => {
+                // Stop in place rather than advancing, and say why. A song that is cut off
+                // and silently followed by another is indistinguishable from a bug; the
+                // reason is the whole difference. Stopping also clears the loaded key, so
+                // this is reported once instead of on every tick.
+                let title = self
+                    .current
+                    .as_ref()
+                    .map(|track| track.title.clone())
+                    .unwrap_or_default();
+                self.loading = false;
+                self.download = None;
+                self.set_sticky_status(format!("{title}：{reason}，只能播放到这里"), true);
+                if let Some(engine) = self.engine.as_mut() {
+                    engine.stop();
+                }
+            }
+            None => {}
         }
 
         // Poll the QR status from the UI thread so the API worker stays free.
@@ -1277,6 +1350,51 @@ mod tests {
         assert!(
             app.cache_track(&track("BV2")),
             "another track is unaffected"
+        );
+    }
+
+    /// A player that goes empty means two different things, and telling them apart is
+    /// the whole point: one advance, the other explain.
+    #[test]
+    fn a_track_that_ran_out_is_not_a_track_that_finished() {
+        assert_eq!(ending_of(false, None), None, "still playing: nothing ended");
+        assert_eq!(
+            ending_of(true, None),
+            Some(EndOfTrack::Advance),
+            "a track that played to its end advances"
+        );
+        assert_eq!(
+            ending_of(true, Some("只允许试听前 1051011 字节".into())),
+            Some(EndOfTrack::RanOut("只允许试听前 1051011 字节".into())),
+            "a track whose bytes ran out must say so, not advance"
+        );
+        // The failure is reported even while the player is not empty yet: the reaction is
+        // driven by the ending, and this is just the state alongside it.
+        assert_eq!(
+            ending_of(false, Some("下载中断".into())),
+            None,
+            "nothing has ended until the player is empty"
+        );
+    }
+
+    /// The message explaining why playback stopped must not erase itself: the player is
+    /// silent, and there is no later moment for it to arrive at.
+    #[test]
+    fn only_a_passing_status_fades_on_its_own() {
+        let (mut app, _ctx) = an_app();
+        app.set_status("已退出登录", false);
+        assert!(!app.status.as_ref().expect("a status").sticky);
+
+        app.set_sticky_status("只能播放到这里", true);
+        let status = app.status.as_ref().expect("a status");
+        assert!(status.sticky, "the explanation has to wait to be replaced");
+        assert!(status.is_error);
+
+        // Picking a song is an answer to it, so it goes away.
+        app.start_current(track("BV9"));
+        assert!(
+            app.status.is_none(),
+            "starting a track replaces the last message"
         );
     }
 }

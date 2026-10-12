@@ -994,27 +994,36 @@ fn remaining_ranges(plan: DownloadPlan, total: u64, written: u64) -> Vec<(u64, u
         .collect()
 }
 
-/// What to say when a range keeps being refused.
+/// Why the source stopped giving bytes, in one clause.
 ///
-/// `bytes=525319-3636946 … HTTP 403` is precise and useless: it names neither the
-/// cause nor what to do. A refusal past the first range of a signed URL is the limit
-/// measured on 2026-10-10 — YouTube hands out URLs that carry only the opening of the
-/// file, and re-resolving does not lift it — while the bytes that did arrive are still
-/// on disk and still playable, which is the part a person needs to hear.
+/// This is what the stream state carries, so it has to stand on its own: it is what the
+/// UI says when the track runs out of bytes mid-playback, where the surrounding words
+/// are "…，只能播放到这里" rather than anything about downloads.
 ///
-/// `found_opening` is the evidence, not the status code: it is set only once a
-/// *shorter* request to the same URL has been accepted, which is what a source that
-/// serves the opening of a file does and a source that refuses the URL outright does
-/// not. The raw 403 alone cannot tell those apart, and naming a byte limit that was
-/// never measured is worse than saying nothing.
-fn range_refused_message(start: u64, found_opening: bool, error: &str) -> String {
+/// `found_opening` is the evidence, not the status code: it is set only once a *shorter*
+/// request to the same URL has been accepted, which is what a source that serves the
+/// opening of a file does and a source that refuses the URL outright does not. The raw
+/// 403 alone cannot tell those apart, and naming a byte limit that was never measured is
+/// worse than saying nothing.
+fn range_refused_reason(start: u64, found_opening: bool, error: &str) -> String {
     if found_opening && start > 0 {
-        format!(
-            "该视频的直链只允许试听前 {start} 字节（YouTube 对无 PoToken 客户端的限制），无法完整下载；\
-             已下载的部分仍可继续试听"
-        )
+        format!("该视频的直链只允许试听前 {start} 字节（YouTube 对无 PoToken 客户端的限制）")
     } else {
-        format!("下载中断：{error}；已下载的部分仍可继续试听")
+        format!("下载中断：{error}")
+    }
+}
+
+/// What to say in the status line when a range keeps being refused.
+///
+/// `bytes=525319-3636946 … HTTP 403` is precise and useless: it names neither the cause
+/// nor what to do. The reason comes from [`range_refused_reason`]; this adds what it
+/// means for the audio, which is the part a person needs to hear.
+fn range_refused_message(start: u64, found_opening: bool, error: &str) -> String {
+    let reason = range_refused_reason(start, found_opening, error);
+    if found_opening && start > 0 {
+        format!("{reason}，无法完整下载；已下载的部分仍可继续试听")
+    } else {
+        format!("{reason}；已下载的部分仍可继续试听")
     }
 }
 
@@ -1384,8 +1393,10 @@ fn stream_segment(
                         Ok(response) => break response,
                         Err(err) => {
                             let Some(shorter) = shorter_request(start, end) else {
+                                // The state carries the reason without the download framing:
+                                // it is what the UI reports if playback runs out of bytes.
+                                state.fail(range_refused_reason(position, found_opening, &err));
                                 let message = range_refused_message(position, found_opening, &err);
-                                state.fail(message.clone());
                                 if found_opening {
                                     // Part of the file is on disk and plays, so this is a
                                     // limit to state, not a failure to announce.
@@ -1655,6 +1666,26 @@ mod tests {
         let other = range_refused_message(1024, false, "网络请求失败: 连接被重置");
         assert!(other.contains("连接被重置"), "got {other}");
         assert!(other.contains("仍可继续试听"), "got {other}");
+    }
+
+    /// The short form is what a decoder's state carries, so it must stand on its own:
+    /// the UI frames it as "…，只能播放到这里", not as anything about a download.
+    #[test]
+    fn the_failure_reason_stands_on_its_own() {
+        let capped = range_refused_reason(1_051_011, true, "网络请求失败: HTTP 403");
+        println!("{capped}");
+        assert!(capped.contains("只允许试听前 1051011 字节"), "got {capped}");
+        assert!(
+            !capped.contains("仍可继续试听") && !capped.contains("无法完整下载"),
+            "the download framing belongs to the status line, not the reason: {capped}"
+        );
+
+        // No evidence of an opening, so no byte limit may be named — and the raw error
+        // has to survive, because it is the only thing that is ever exactly right.
+        let raw = range_refused_reason(0, false, "网络请求失败: HTTP 403");
+        assert!(raw.contains("下载中断"), "got {raw}");
+        assert!(raw.contains("403"), "got {raw}");
+        assert!(!raw.contains("只允许试听"), "got {raw}");
     }
 
     /// Asking for less has to reach the window's edge, and then stop.
