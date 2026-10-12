@@ -275,7 +275,7 @@ open dist/ListenBli.app
 ### 离线单元测试（默认，CI 运行）
 
 ```bash
-cargo test          # 259 个测试，不联网
+cargo test          # 260 个测试，不联网
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
@@ -317,12 +317,12 @@ cargo run --example yt_limit_probe -- --clients <视频 id>
 「解码器打开后继续追加数据」是无效的（前缀 10.0s → 追加 5.99 MB 后仍是 10.0s）。
 它也是判断"是否真的在流式"的可复现证据。
 
-`yt_limit_probe` 量出 YouTube 无 PoToken 客户端那条「只给开头」的限制：逐步二分找到
-最后一个可读字节，并逐条排除看似可行的绕法（超出开头的 range、`bytes=0-`、URL 里塞
-`&range=`、重新签名、清单路由、换客户端身份）。2026-10-12 在四个 22 MB–591 MB 的视频
-上测得最后可读字节都是 1,071,03x–1,071,067，而一个 3.4 MB 的视频可以整段读完；决定
-成败的是请求的**结束位置**，起点在里面也没用。这是外部限制，应用侧只能把手头允许的
-开头用满并如实说明（见「已知限制」）。
+`yt_limit_probe` 量出 YouTube 那条「只给开头」的限制，并把它一步步逼到出路：逐步二分找到
+最后一个可读字节，逐条排除看似可行的绕法（超出开头的 range、`bytes=0-`、URL 里塞 `&range=`、
+重新签名、清单路由、换客户端身份、PoToken），最后确认 **visionOS 客户端 + 一段匿名
+visitorData** 能拿到完整直链。2026-10-12 在 3 MB–591 MB 的五个视频上验证：其他客户端最后
+可读字节都是 1,071,03x–1,071,067，headset 客户端整段可读。`--worker` 模式走应用自己选客户端的
+那条路（用来回答「探针说行、应用却不行」这类问题）。
 
 ### 跨平台验证
 
@@ -366,22 +366,23 @@ src/
 - 不做音频下载/导出功能。
 - 歌曲的发现方式为搜索 + 收藏夹 + 历史；未实现每日推荐/分区浏览。
 - 网易云为第三方非官方接口，可能被限流或失效；届时歌词会优雅降级为「暂无歌词」。
-- **YouTube 的大视频只能试听开头**：它给出的直链只开放约 1 MB。2026-10-12 在四个
-  22 MB–591 MB 的视频上实测，最后可读字节都是 1,071,03x–1,071,067，而一个 3.4 MB 的
-  视频可以整段读完；决定成败的是请求的**结束位置**，起点落在开头之内也没用。所以下载
-  会在那里停下，并把「只允许试听前 N 字节」作为提示说明（不是红色失败）——已下载的
-  部分仍可继续试听，但这类视频听到约一分钟就会停：**停下时要说明原因并停在原地**，
-  而不是静默跳下一首（rodio 把「读取失败」和「读到结尾」都报成源结束，两者只能靠下载
-  状态区分）。换客户端身份、重新签名、`bytes=0-`、把 range 塞进 URL、HLS/DASH 清单都
-  试过且都无效；量出这些的探针是 `examples/yt_limit_probe.rs`。
-- **PoToken 已实测：对本应用无效**（2026-10-12）。用 `bgutil-ytdlp-pot-provider` 2.0.2
-  生成真实的 visitorData + 会话 token + 视频绑定 player token 后逐条试过：把 `pot=`
-  挂在流地址上（会话 token 与 player token 都试了）、在 IOS 的 player 请求里带
-  `serviceIntegrityDimensions.poToken`、在 ANDROID_VR 上带 token——中间段仍然 403，
-  ANDROID_VR 仍然 `LOGIN_REQUIRED`。player token 本来服务的 `web` 客户端在这台机器上
-  对任何视频都返回 `UNPLAYABLE / Video unavailable`（带齐 visitorData 与 yt-dlp 那套
-  请求头也一样），所以 web 那条路是**未验证**而非已证否。结论：不值得为一个没量到收益的
-  东西引入 Node/Deno 运行时。复现方式见 `examples/yt_limit_probe.rs --pot`。
+- **YouTube 的大视频需要 headset 客户端加一段匿名 visitorData**。用 `IOS` 这类客户端时，
+  大视频的直链只开放开头约 1 MB（2026-10-12 在四个 22 MB–591 MB 的视频上实测，最后可读
+  字节都是 1,071,03x–1,071,067，而一个 3.4 MB 的视频可以整段读完；决定成败的是请求的
+  **结束位置**，起点落在开头之内也没用）。改用 visionOS 客户端、并在 context 里带上
+  visitorData 之后，同样的视频整段可读——3 MB 到 591 MB 的五个视频都验证过。应用已经这么
+  做（`InnerTube::visitor_data`），所以大视频现在能完整缓存与播放。
+- visitorData **不是登录，也不是 cookie**：它只是访问一次 youtube.com 留下的匿名 id，取一次
+  就能服务所有视频。取不到时会退回 `IOS`，那就只能试听开头约一分钟——此时状态栏会说明原因
+  并**停在原地**，而不是静默跳下一首（rodio 把「读取失败」和「读到结尾」都报成源结束，两者
+  只能靠下载状态区分）。
+- 已排除的绕法（都实测过）：换客户端身份、重新签名、`bytes=0-`、把 range 塞进 URL、
+  HLS/DASH 清单、以及 **PoToken**。PoToken 对本应用无效：用
+  `bgutil-ytdlp-pot-provider` 2.0.2 生成真实的会话 token 与 player token 后，挂 `pot=` 到
+  流地址、在 player 请求里带 `serviceIntegrityDimensions.poToken`，中间段仍然 403；所以没有
+  为一个没量到收益的东西引入 Node/Deno 运行时。量出这些的探针是
+  `examples/yt_limit_probe.rs`（`--clients`、`--pot`、`--worker`）。
+- visionOS 客户端不提供「面向儿童」的视频，那种情况会回落到另外两个客户端。
 - 收藏夹/历史接口的完整字段未经真实账号逐一核对，缺失字段会跳过而非崩溃。
 - **开播后最初的几秒内**，向前拖到尚未缓冲的位置会被拒绝并提示"音频仍在缓冲"；
   缓冲完成后（本机约 4 秒、6 MB 的歌曲）任意位置均可跳转。这是为避免 UI 线程
