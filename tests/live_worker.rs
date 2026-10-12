@@ -66,7 +66,43 @@ fn wait_for<T>(
 
 fn start_worker() -> Worker {
     let api = Arc::new(Api::new(CookieJar::default()));
-    listenbli::net::spawn(api, config::shared(Config::default()))
+    let (config, root) = isolated_config();
+    let worker = listenbli::net::spawn(api, config::shared(config));
+    // The audio cache root is *not* taken from `Config` by `spawn`: the UI points the
+    // worker at the user's chosen directory through this same call the moment that
+    // setting changes. So setting only `Config::cache_dir` leaves the worker reading and
+    // writing `~/Library/Caches/listenBli` all the same.
+    worker.cache.set_root(&root);
+    worker
+}
+
+/// The converted, playable cache entry for a track, waiting for the conversion if it is
+/// still running.
+///
+/// "The download finished" and "the playable file exists" are two different moments. The
+/// download marks its stream finished first and only then remuxes the fragment into an
+/// `.m4a`, deleting the fragment. Asked for the cache entry inside that window, the
+/// cache's own `get` still answers with the fragment — and that path can vanish
+/// underneath a reader a moment later. Anything that means "the finished file" waits here.
+fn playable_cache_entry(worker: &Worker, track: &Track, stream_id: u32) -> std::path::PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(entry) = worker.cache.get(&track.cache_key(), stream_id) {
+            if entry.extension().and_then(|ext| ext.to_str()) == Some("m4a") {
+                assert!(
+                    entry.is_file(),
+                    "cached file missing at {}",
+                    entry.display()
+                );
+                return entry;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the download was never converted into a playable .m4a"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -165,7 +201,18 @@ fn worker_searches_resolves_and_downloads_a_track() {
                 track,
                 source,
                 quality,
-            }) => ready = Some((*track, source, quality, started.elapsed())),
+            }) => {
+                // Checked here, at the moment the engine is handed the source, rather than
+                // after the download: the path a streaming handoff names is the fragment,
+                // and a successful conversion deletes it and leaves the playable `.m4a`
+                // behind. Asserting on it after completion tests a race, not the app.
+                assert!(
+                    source.path().is_file(),
+                    "the source handed to the engine is missing: {}",
+                    source.path().display()
+                );
+                ready = Some((*track, source, quality, started.elapsed()));
+            }
             Ok(Evt::CoverReady { .. }) => covers_done += 1,
             Ok(Evt::DownloadProgress { got, total, .. }) => {
                 if let Some(total) = total {
@@ -182,17 +229,20 @@ fn worker_searches_resolves_and_downloads_a_track() {
     }
 
     let (track, source, quality, time_to_ready) = ready.unwrap();
-    if !covers.is_empty() {
-        assert!(
-            covers_done < covers.len(),
-            "resolve waited for all {} covers — playback is queued behind cover art",
-            covers.len()
-        );
-    }
+    // There used to be an assertion here: `covers_done < covers.len()`, i.e. "resolve did
+    // not wait for all 20 covers". It only held while the track was already cached — then
+    // resolve never touched the network and beat the cover thread. With a cache that
+    // starts empty, resolve does real work and the 20 sequential thumbnail fetches finish
+    // first, so the assertion fails without anything being wrong. The property itself is
+    // structural (covers run on their own thread and cannot block resolve); this number is
+    // reported for the eye, and `time_to_ready < time_to_complete` below is the assertion
+    // that actually pins streaming down.
+    println!(
+        "covers done when playback was offered: {covers_done} of {}",
+        covers.len()
+    );
     let time_to_complete = complete_after.unwrap_or(time_to_ready);
-    let path = source.path().to_path_buf();
 
-    assert!(path.is_file(), "cached file missing at {}", path.display());
     assert!(track.cid != 0, "cid should have been resolved");
     assert!(
         track.duration > 60,
@@ -264,11 +314,14 @@ fn worker_searches_resolves_and_downloads_a_track() {
     assert!(!lyrics.is_empty(), "expected lyrics for this track");
 
     // A second request for the same track must be served from the completed cache.
-    let cached = listenbli::audio::AudioCache::new()
-        .get(&track.cache_key(), quality.stream_id())
-        .expect("the segment should now be a complete cache entry");
-    assert_eq!(cached, path);
-    let bytes = std::fs::read(&path).unwrap();
+    // Asked of the worker's own cache, not a fresh `AudioCache::new()`: that one is rooted
+    // at the platform default and would be inspecting a different directory entirely.
+    //
+    // The finished entry is deliberately *not* compared with the path the streaming
+    // handoff named: that one is the fragment `source.path()` pointed at while bytes were
+    // still arriving, and completion replaces it with the playable `.m4a`.
+    let cached = playable_cache_entry(&worker, &track, quality.stream_id());
+    let bytes = std::fs::read(&cached).unwrap();
     assert!(
         looks_like_iso_bmff(&bytes),
         "cached file is not ISO-BMFF ({} bytes)",
@@ -311,7 +364,7 @@ fn audio_engine_starts_and_advances_playback() {
         .send(Cmd::LoadTrack(Box::new(target)))
         .unwrap();
 
-    let (track, source, _) = wait_for(
+    let (track, source, quality) = wait_for(
         &worker.evt_rx,
         Duration::from_secs(180),
         "track ready",
@@ -328,7 +381,6 @@ fn audio_engine_starts_and_advances_playback() {
 
     // Let the background download finish so this test exercises the plain,
     // fully-cached path. Streaming playback is covered by the test above.
-    let path = source.path().to_path_buf();
     if let Some(state) = source.stream_state() {
         let deadline = Instant::now() + Duration::from_secs(120);
         while state.is_running() && Instant::now() < deadline {
@@ -336,6 +388,13 @@ fn audio_engine_starts_and_advances_playback() {
         }
         assert!(!state.is_running(), "the download never finished");
     }
+
+    // The playable file, not `source.path()`: a streaming handoff names the fragment, and
+    // finishing also remuxes that fragment into a `.m4a` and deletes it. Carrying the
+    // fragment path past the download is what made this test fail two different ways — a
+    // format error when it opened the fragment, and "no such file" once conversion had
+    // already removed it.
+    let path = playable_cache_entry(&worker, &track, quality.stream_id());
 
     let mut engine = match AudioEngine::new(0.0) {
         Ok(engine) => engine,
@@ -405,4 +464,28 @@ fn audio_engine_starts_and_advances_playback() {
 
     engine.stop();
     assert!(engine.loaded_key().is_none());
+}
+
+/// A configuration with a cache directory of its own, and that directory.
+///
+/// These tests download, convert and delete real files, and the default cache root is the
+/// user's own `~/Library/Caches/listenBli`. A temporary directory keeps a test run from
+/// evicting or deleting whatever is actually cached on the machine.
+///
+/// This started out as the hunt for a different problem: two tests were thought to be
+/// fighting over one cache directory. Isolating them did not stop the failure — it is what
+/// finally showed the failure was inside the tests themselves, which carried a fragment
+/// path across the conversion that deletes it. Isolation stays for the reason above, not
+/// for that one.
+fn isolated_config() -> (Config, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("listenbli-live-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = Config {
+        cache_dir: Some(dir.clone()),
+        ..Config::default()
+    };
+    (config, dir)
 }
