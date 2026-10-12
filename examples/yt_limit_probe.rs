@@ -67,6 +67,10 @@ fn main() {
             let video = args.get(1).cloned().unwrap_or_else(|| "AL_7jyuGNhc".into());
             web_with_pot(&video);
         }
+        Some("--worker") => {
+            let video = args.get(1).cloned().unwrap_or_else(|| "AL_7jyuGNhc".into());
+            worker_path(&video);
+        }
         _ => {
             let arg = args
                 .first()
@@ -79,6 +83,41 @@ fn main() {
             }
         }
     }
+}
+
+/// Resolve exactly the way the app's download worker does, and report which client
+/// answered plus whether its URL serves a deep range.
+///
+/// `ranges` above asks every client in turn; this asks the one the app would actually
+/// use, which is the question when the app and the probe disagree.
+fn worker_path(video: &str) {
+    let api = Api::new(CookieJar::default());
+    let youtube = listenbli::api::youtube::Youtube::new();
+    let (playable, client) = match youtube.resolve_client(video) {
+        Ok(answer) => answer,
+        Err(err) => {
+            println!("resolve failed: {err}");
+            return;
+        }
+    };
+    println!("the worker would use {client:?}");
+    let Some(pick) = playable.best_audio().cloned() else {
+        println!("no decodable pick");
+        return;
+    };
+    let len = pick.content_length.unwrap_or(0);
+    println!("itag {} len {len}", pick.tag);
+    if len == 0 {
+        return;
+    }
+    println!("   opening -> {}", ask(&api, &pick.url, 0, 1023));
+    let mid = len / 2;
+    println!("   middle  -> {}", ask(&api, &pick.url, mid, mid + 1023));
+    println!(
+        "   the app's first two ranges -> {} / {}",
+        ask(&api, &pick.url, 0, 524_722),
+        ask(&api, &pick.url, 524_723, 524_723 + 8 * 1024 * 1024 - 1)
+    );
 }
 
 /// The `web` client, with a token: does it get more than the opening?
