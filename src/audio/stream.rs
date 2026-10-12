@@ -205,6 +205,22 @@ impl PlaybackSource {
 /// `total` is the *real* final size, reported by `seek(SeekFrom::End(0))` and
 /// used as the decoder's byte length, so the decoder never mistakes the current
 /// download frontier for the end of the stream.
+/// Whether to narrate the reader's opens, reads and seeks.
+///
+/// A decoder failing to open a stream reports one sentence and nothing about where it
+/// failed; this turns that into a trace. Off unless `LISTENBLI_STREAM_TRACE` is set,
+/// and the flag is read once so the read path stays free.
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LISTENBLI_STREAM_TRACE").is_some())
+}
+
+fn trace(args: std::fmt::Arguments<'_>) {
+    if tracing() {
+        eprintln!("[stream] {args}");
+    }
+}
+
 pub struct BlockingFileReader {
     file: File,
     /// `None` while the download is still growing the fragment; `Some(len)` when this
@@ -228,16 +244,28 @@ impl BlockingFileReader {
     /// a vanished directory) and deserves to be reported as it is.
     pub fn open(path: &Path, state: Arc<StreamState>) -> io::Result<Self> {
         match File::open(path) {
-            Ok(file) => Ok(Self {
-                file,
-                complete: None,
-                state,
-                position: 0,
-            }),
+            Ok(file) => {
+                trace(format_args!("open {} (live)", path.display()));
+                Ok(Self {
+                    file,
+                    complete: None,
+                    state,
+                    position: 0,
+                })
+            }
             Err(original) if original.kind() == io::ErrorKind::NotFound => {
                 let converted = path.with_extension("m4a");
+                trace(format_args!(
+                    "open {} failed ({}), trying the converted twin",
+                    path.display(),
+                    original
+                ));
                 let file = File::open(&converted).map_err(|_| original)?;
                 let len = file.metadata()?.len();
+                trace(format_args!(
+                    "open {} (converted, {len} bytes)",
+                    converted.display()
+                ));
                 Ok(Self {
                     file,
                     complete: Some(len),
@@ -277,8 +305,15 @@ impl Read for BlockingFileReader {
         }
 
         let want = buf.len().min(available as usize);
-        self.file.seek(SeekFrom::Start(self.position))?;
+        if let Err(err) = self.file.seek(SeekFrom::Start(self.position)) {
+            trace(format_args!("seek to {} failed: {err}", self.position));
+            return Err(err);
+        }
         let read = self.file.read(&mut buf[..want])?;
+        trace(format_args!(
+            "read at {} want {want} got {read} (of {total})",
+            self.position
+        ));
         self.position += read as u64;
         Ok(read)
     }
@@ -295,11 +330,18 @@ impl Seek for BlockingFileReader {
             SeekFrom::Current(offset) => self.position as i64 + offset,
         };
         if target < 0 {
+            trace(format_args!(
+                "seek {position:?} from {} is negative (total {total})",
+                self.position
+            ));
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "试图定位到负数偏移",
             ));
         }
+        trace(format_args!(
+            "seek {position:?} -> {target} (total {total})"
+        ));
         self.position = target as u64;
         Ok(self.position)
     }
