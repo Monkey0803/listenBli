@@ -678,10 +678,22 @@ fn load_track(
 
     if let Some(path) = cache.get(&track.cache_key(), resolved.source.quality.stream_id()) {
         if play {
-            // Fully cached: plain, non-blocking playback.
+            // A `.m4a` is a plain progressive file and plays directly. A `.m4s` is *not*:
+            // it is a DASH fragment whose `moov` has no sample tables, so handing it to a
+            // decoder as an ordinary file is what produces "音频格式可能不受支持 / IO
+            // error". It plays through the streaming reader — which is what that reader
+            // exists for — with a state that is already finished, so reads never wait.
+            let source = if is_fragment(&path) {
+                let total = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                let state = Arc::new(StreamState::new(total));
+                state.finish();
+                PlaybackSource::Streaming { path, total, state }
+            } else {
+                PlaybackSource::Complete(path)
+            };
             let _ = evt_tx.send(Evt::TrackReady {
                 track: Box::new(track.clone()),
-                source: PlaybackSource::Complete(path),
+                source,
                 quality: resolved.source.quality,
             });
         } else if purpose == Purpose::Export {
@@ -907,6 +919,13 @@ fn lyrics_loop(
 // ---------------------------------------------------------------------------
 // Download worker
 // ---------------------------------------------------------------------------
+
+/// Whether a cached path is a DASH fragment rather than a playable file.
+fn is_fragment(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("m4s"))
+}
 
 /// What a finished file should say about itself.
 ///
