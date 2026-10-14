@@ -3,3 +3,8 @@
 *.lrc
 .DS_Store
 /dist
+
+# 设计阶段的渲染快照（6.4M），不是代码需要的输入：定稿的依据是同一目录下的
+# jsx/css/html/DESIGN-NOTES.md，这些 PNG 只是当时的留档。要一起提交就
+# `git add -f designs/listenbli-aggregator/screens`。
+/designs/listenbli-aggregator/screens

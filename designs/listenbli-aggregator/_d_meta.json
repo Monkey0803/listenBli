@@ -1,0 +1,51 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "listenBli 聚合版 · 三方向对比": {
+      "versions": [
+        {
+          "path": "ListenBli Aggregator.html",
+          "createdAt": "2026-10-12T12:29:07.013Z",
+          "status": "needs-review",
+          "subtitle": "聚合音频播放器重设计：混音台 / 索引 / 潮汐线 三个方向并排对比（1440×900，含合并/展开两态）",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    },
+    "listenBli 聚合版 · 混音台可点击原型": {
+      "versions": [
+        {
+          "path": "ListenBli Mixer.html",
+          "createdAt": "2026-10-13T02:23:27.100Z",
+          "status": "needs-review",
+          "subtitle": "方向 A 做深：监听 / 队列 / 存储 / 输入 四页 + 接入来源浮层（1440×900，可点击）",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    },
+    "listenBli 聚合版 · 聚合听歌（我的歌）": {
+      "versions": [
+        {
+          "path": "ListenBli Library.html",
+          "createdAt": "2026-10-13T02:57:53.831Z",
+          "status": "needs-review",
+          "subtitle": "当前版本：以「我的歌 + 正在播放」为中心，平台默认完全不露；含歌单只读语义与来源详情（1440×900，可点击）",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-10-12T12:29:07.014Z",
+  "updatedAt": "2026-10-13T02:57:53.833Z"
+}

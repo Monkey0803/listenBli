@@ -1,0 +1,358 @@
+/* ==========================================================================
+   mixer.css — the deep prototype in direction A's language.
+   --------------------------------------------------------------------------
+   Same console, four more pages. A hardware desk does not open modal dialogs to
+   change what it is doing: it has PAGE KEYS. So 监听 / 队列 / 存储 / 输入 are keys on
+   the master section, and the workspace behind them changes while the transport
+   deck and the input meters stay put.
+
+   Loads after dir-a.css and reuses its tokens (.a-eng, .a-led, .a-mono, .a-readout,
+   .a-tag, .a-btn, .a-cols, .a-rows …). Everything new is scoped under .dira.
+   ========================================================================== */
+
+/* ========================== PAGE KEYS (in the rail) ===================== */
+.a-pages {
+  padding: 11px 14px 12px;
+  border-bottom: 1px solid var(--a-line);
+}
+.a-pages__keys { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
+.a-pagekey {
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  color: var(--a-fg3);
+  text-align: left;
+}
+.a-pagekey:hover { background: var(--a-ink3); color: var(--a-fg2); }
+.a-pagekey.is-on {
+  background: var(--a-ink4);
+  border-color: var(--a-line2);
+  color: var(--a-fg);
+  box-shadow: inset 2px 0 0 var(--a-amber);
+}
+.a-pagekey__led { display: flex; }
+.a-pagekey__t { font-family: var(--a-label); font-size: 12px; font-weight: 600; letter-spacing: 0.06em; }
+.a-pagekey__k { font-family: var(--a-mono); font-size: 8.5px; color: var(--a-fg4); letter-spacing: 0.08em; }
+.a-pagekey.is-on .a-pagekey__k { color: var(--a-amber); }
+
+/* ========================== QUEUE PAGE ================================== */
+.mq__cols { grid-template-columns: 40px 34px 1fr 210px 84px 56px 92px; }
+.mq__row {
+  display: grid;
+  grid-template-columns: 40px 34px 1fr 210px 84px 56px 92px;
+  align-items: center;
+  gap: 0 8px;
+  padding: 0 16px;
+  height: 52px;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  position: relative;
+  border-bottom: 1px solid var(--a-line);
+}
+.mq__row:hover { background: var(--a-ink2); }
+.mq__row.is-now { background: linear-gradient(90deg, rgba(255, 180, 84, 0.1), transparent 70%); }
+.mq__row.is-now::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--a-amber);
+}
+.mq__no { font-family: var(--a-mono); font-size: 11px; color: var(--a-fg3); display: flex; align-items: center; gap: 6px; }
+.mq__row.is-now .mq__no { color: var(--a-amber); }
+.mq__origin { font-family: var(--a-mono); font-size: 9.5px; color: var(--a-fg4); }
+.mq__acts { display: flex; gap: 4px; opacity: 0.34; justify-content: flex-end; transition: opacity 0.12s; }
+.mq__row:hover .mq__acts { opacity: 1; }
+.mq__foot {
+  border-top: 1px solid var(--a-line2);
+  background: var(--a-ink1);
+  padding: 9px 16px 11px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ========================== STORE PAGE ================================== */
+.md__meters {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  padding: 13px 16px 14px;
+  border-bottom: 1px solid var(--a-line);
+  background: var(--a-ink1);
+}
+.md__cols { grid-template-columns: 34px 1fr 108px 96px 80px 118px 106px 60px; }
+.md__row {
+  display: grid;
+  grid-template-columns: 34px 1fr 108px 96px 80px 118px 106px 60px;
+  align-items: center;
+  gap: 0 8px;
+  padding: 0 16px;
+  height: 46px;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  border-bottom: 1px solid var(--a-line);
+}
+.md__row:hover { background: var(--a-ink2); }
+.md__row.is-partial { background: linear-gradient(90deg, rgba(242, 99, 95, 0.07), transparent 60%); }
+.md__size { font-family: var(--a-mono); font-size: 11px; color: var(--a-fg2); text-align: right; }
+.md__acts { display: flex; gap: 4px; opacity: 0.34; justify-content: flex-end; transition: opacity 0.12s; }
+.md__row:hover .md__acts { opacity: 1; }
+
+
+/* ========================== SOURCE PAGE ================================= */
+.mi__module {
+  border-bottom: 1px solid var(--a-line2);
+  padding: 13px 16px 15px;
+  position: relative;
+}
+.mi__module.is-live::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--a-amber);
+  opacity: 0.7;
+}
+.mi__head { display: flex; align-items: center; gap: 10px; }
+.mi__grip { color: var(--a-fg4); display: flex; cursor: grab; }
+.mi__letter {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--a-line3);
+  border-radius: 2px;
+  background: var(--a-ink3);
+  font-family: var(--a-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.mi__name { font-size: 13.5px; color: var(--a-fg); }
+.mi__body { display: grid; grid-template-columns: 236px 1fr 214px; gap: 18px; margin-top: 12px; }
+.mi__col { min-width: 0; }
+.mi__sess {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--a-line);
+  border-radius: 2px;
+  background: var(--a-ink1);
+}
+.mi__avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 2px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(150deg, #3a2a1c, #6b4520);
+  color: var(--a-amber);
+  font-family: var(--a-label);
+  font-size: 12px;
+  font-weight: 700;
+  flex: none;
+}
+.mi__avatar.is-anon { background: var(--a-ink3); color: var(--a-fg3); }
+.mi__acts { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+.mi__caps { display: flex; flex-wrap: wrap; gap: 5px; }
+.cap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--a-line2);
+  border-radius: 2px;
+  background: var(--a-ink2);
+  font-size: 11px;
+  color: var(--a-fg2);
+  white-space: nowrap;
+}
+.cap i { width: 4px; height: 4px; border-radius: 50%; background: var(--a-green); flex: none; }
+.cap.is-off { color: var(--a-fg4); border-color: var(--a-line); background: transparent; }
+.cap.is-off i { background: var(--a-ink5); }
+.mi__qual { display: flex; flex-direction: column; gap: 4px; }
+.mi__qrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--a-line);
+  border-radius: 2px;
+  background: var(--a-ink1);
+  font-family: var(--a-mono);
+  font-size: 10.5px;
+  color: var(--a-fg2);
+}
+.mi__qrow.is-off { color: var(--a-fg4); background: transparent; }
+.mi__qrank { color: var(--a-fg4); font-size: 9px; }
+.mi__foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 13px;
+  padding-top: 12px;
+  border-top: 1px solid var(--a-line);
+}
+.mi__data { display: flex; gap: 16px; margin-left: auto; }
+
+/* ========================== CONNECT SHEET =============================== */
+.mx-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(6, 6, 10, 0.72);
+  backdrop-filter: blur(3px);
+  display: grid;
+  place-items: center;
+}
+.mx-sheet {
+  width: 940px;
+  max-height: 820px;
+  background: var(--a-ink1);
+  border: 1px solid var(--a-line3);
+  border-radius: 3px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.mx__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--a-line2);
+  background: var(--a-ink2);
+}
+.mx__head h2 {
+  margin: 0;
+  font-family: var(--a-label);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.mx__body { padding: 16px 18px; display: flex; flex-direction: column; gap: 16px; overflow: hidden; }
+.mx__step { display: grid; grid-template-columns: 132px 1fr; gap: 16px; align-items: start; }
+.mx__steplbl { display: flex; align-items: baseline; gap: 8px; }
+.mx__n {
+  font-family: var(--a-mono);
+  font-size: 11px;
+  color: var(--a-amber);
+  border: 1px solid rgba(255, 180, 84, 0.4);
+  border-radius: 2px;
+  padding: 0 5px;
+  background: var(--a-amber-dim);
+}
+.mx__fields { display: flex; gap: 14px; flex-wrap: wrap; }
+.mx__field { display: flex; flex-direction: column; gap: 6px; }
+.mx__field label { font-family: var(--a-label); font-size: 9.5px; font-weight: 600; letter-spacing: 0.17em; text-transform: uppercase; color: var(--a-fg4); }
+.mx__input {
+  height: 30px;
+  padding: 0 10px;
+  background: var(--a-ink0);
+  border: 1px solid var(--a-line2);
+  border-radius: 2px;
+  color: var(--a-fg);
+  font-family: var(--a-ui);
+  font-size: 13px;
+  outline: none;
+}
+.mx__input:focus { border-color: var(--a-amber-deep); }
+.mx__input.is-mono { font-family: var(--a-mono); width: 74px; text-align: center; }
+.mx__hint { font-family: var(--a-mono); font-size: 9.5px; color: var(--a-fg4); }
+.mx__hint.is-warn { color: var(--a-red); }
+.mx__caps { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 22px; }
+.mx__group { display: flex; flex-direction: column; gap: 6px; }
+.mx__cap {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border: 1px solid var(--a-line);
+  border-radius: 2px;
+  background: var(--a-ink0);
+  color: var(--a-fg3);
+  text-align: left;
+}
+.mx__cap:hover { border-color: var(--a-line3); color: var(--a-fg2); }
+.mx__cap.is-on { border-color: rgba(255, 180, 84, 0.45); color: var(--a-fg); background: var(--a-amber-dim); }
+.mx__box {
+  width: 13px;
+  height: 13px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.mx__box i { width: 7px; height: 7px; background: currentColor; opacity: 0; }
+.mx__cap.is-on .mx__box i { opacity: 1; }
+.mx__cap__t { font-size: 11.5px; }
+.mx__cap__why { font-family: var(--a-mono); font-size: 9px; color: var(--a-fg4); margin-left: auto; }
+.mx__radio { display: flex; gap: 6px; }
+.mx__readout {
+  border: 1px solid var(--a-line2);
+  border-radius: 2px;
+  background: var(--a-ink0);
+  padding: 11px 12px;
+}
+.mx__readout__t { font-size: 11px; line-height: 1.7; color: var(--a-fg3); }
+.mx__readout__t b { color: var(--a-fg); font-weight: 500; }
+.mx__surfaces { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.mx__foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 18px;
+  border-top: 1px solid var(--a-line2);
+  background: var(--a-ink2);
+}
+
+/* ========================== CAPABILITY TABLE ============================ */
+/* One line per capability: what it is, which surface it grows, and whether each
+   of the two current sources declares it. This table IS the extensibility
+   argument, so it has to be scannable at a glance. */
+.caprow {
+  display: grid;
+  grid-template-columns: 96px 1fr 9px 9px;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 2px;
+  font-size: 10.5px;
+  color: var(--a-fg2);
+}
+.caprow:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
+.caprow__s {
+  font-family: var(--a-mono);
+  font-size: 9px;
+  color: var(--a-fg4);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.caprow__d { width: 7px; height: 7px; border-radius: 50%; background: var(--a-ink5); }
+.caprow__d.is-on { background: var(--a-green); box-shadow: 0 0 5px rgba(95, 211, 154, 0.4); }
+
+/* ========================== RAIL, TIGHTENED FOR THE KEYS ================ */
+/* The prototype's rail carries four page keys the comparison artboard does not,
+   and it came out 13px too tall. Tighten only when those keys are present, so
+   the artboard on the canvas keeps its original spacing. */
+.a-rail:has(.a-pages) .a-chan { padding: 10px 14px 11px; }
+.a-rail:has(.a-pages) .a-buf { margin-top: 7px; }
+.a-rail:has(.a-pages) .a-master { padding: 10px 14px 11px; }
+.a-rail:has(.a-pages) .a-connect { margin: 10px 14px 12px; }
+.a-rail:has(.a-pages) .a-pages { padding: 9px 14px 10px; }
