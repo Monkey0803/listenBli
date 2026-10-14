@@ -6,9 +6,10 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{Align, Align2, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use egui::{Align, Align2, Color32, Layout, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use super::icons;
+use super::songs;
 use super::theme::{self as t, Accent};
 use super::widgets;
 use crate::app::App;
@@ -33,34 +34,37 @@ impl App {
         ui.painter()
             .vline(rect.left() + 0.5, rect.y_range(), t::hairline());
 
+        self.now_playing_head(ui, accent);
         self.lyrics_header(ui, accent);
-        self.lyrics_meta(ui, accent);
 
         if self.lyrics.is_empty() {
-            let (icon, title, desc): (icons::Icon, &str, &str) = if self.current.is_none() {
-                (
+            // Nothing playing is a pane with nothing in it, and gets the centred
+            // empty state. A song that simply has no lyrics is a working pane with
+            // one thing to say, which the design says quietly, in a note.
+            if let Some(track) = &self.current {
+                let _ = track;
+                let text = if self.loading {
+                    "正在获取歌词 —— 先匹配 B 站 CC 字幕，再回退到网易云与 LRCLib。"
+                } else {
+                    "这首歌没有找到歌词 —— 歌词来源是自动匹配的，找不到就如实空着。"
+                };
+                widgets::note(ui, icons::lyrics, text);
+            } else {
+                widgets::empty_state(
+                    ui,
                     icons::lyrics,
                     "还没有在播放",
                     "从左侧选一首开始，歌词会自动跟随高亮、居中滚动。点击任意一行可以跳到那一句。",
-                )
-            } else if self.loading {
-                (
-                    icons::lyrics,
-                    "正在获取歌词",
-                    "先匹配 B 站 CC 字幕，再回退到网易云音乐；两者都没有时会显示为无歌词。",
-                )
-            } else {
-                (
-                    icons::translate,
-                    "暂无歌词",
-                    "这个视频没有 CC 字幕，也没能在网易云匹配到可用的歌词。合集与纯音乐类投稿通常都没有。",
-                )
-            };
-            widgets::empty_state(ui, icon, title, desc, &[], accent);
+                    &[],
+                    accent,
+                );
+            }
+            self.now_playing_foot(ui, accent);
             return;
         }
 
         self.lyrics_body(ui, accent, lyric_size);
+        self.now_playing_foot(ui, accent);
     }
 
     fn lyrics_header(&mut self, ui: &mut Ui, accent: Accent) {
@@ -141,24 +145,219 @@ impl App {
         super::hline(ui, ui.min_rect().bottom() - 0.5, t::LINE);
     }
 
-    fn lyrics_meta(&mut self, ui: &mut Ui, accent: Accent) {
-        let source = self.lyrics.source;
-        let lines = self.lyrics.lines.len();
-        ui.add_space(9.0);
-        ui.horizontal(|ui| {
-            ui.add_space(18.0);
-            ui.label(RichText::new("来源").size(11.0).color(t::FG_3));
-            source_badge(ui, source);
-            if lines > 0 {
-                ui.label(
-                    RichText::new(format!("· {lines} 行"))
-                        .size(11.0)
-                        .color(t::FG_3),
-                );
+    /// 正在播放: the cover, what is playing, and a way into 来源.
+    ///
+    /// Painted into one allocation rather than laid out, because the design
+    /// centres everything in a fixed 140px column and a stack of centred widgets
+    /// would drift with the text.
+    fn now_playing_head(&mut self, ui: &mut Ui, accent: Accent) {
+        let position = self.position();
+        let line_count = self.lyrics.lines.len();
+        // The design keeps a lyric timing offset in this corner. This player has
+        // no such setting, and the line the lyrics are on is what the slot can
+        // honestly hold.
+        let readout = if line_count == 0 {
+            "—".to_owned()
+        } else {
+            match self.lyrics.current_index(position) {
+                Some(index) => format!("{} / {line_count} 行", index + 1),
+                // Before the first line the lyrics have not started yet, which is
+                // what 前奏 means; showing "1 / 48" there would be a lie.
+                None => format!("前奏 / {line_count} 行"),
             }
-            let _ = accent;
-        });
-        ui.add_space(5.0);
+        };
+        let (head, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
+        let painter = ui.painter().clone();
+        painter.hline(
+            head.x_range(),
+            head.bottom() - 0.5,
+            Stroke::new(1.0, t::LINE),
+        );
+        widgets::engraved_at(
+            ui,
+            Pos2::new(head.left() + 14.0, head.center().y),
+            Align2::LEFT_CENTER,
+            "NOW PLAYING",
+            9.5,
+            t::FG_4,
+        );
+        widgets::label_at(
+            ui,
+            Pos2::new(head.right() - 14.0, head.center().y),
+            Align2::RIGHT_CENTER,
+            &readout,
+            t::mono_font(9.5),
+            t::FG_4,
+        );
+
+        let Some(track) = self.current.clone() else {
+            return;
+        };
+
+        const COVER: f32 = 140.0;
+        let title_gap = 13.0;
+        let sub_gap = 21.0;
+        let facts_gap = 15.0;
+        let block_h = 18.0 + COVER + title_gap + sub_gap + facts_gap + 20.0;
+        let (block, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), block_h), Sense::hover());
+        let painter = ui.painter().clone();
+
+        let cover = Rect::from_min_size(
+            Pos2::new(block.center().x - COVER / 2.0, block.top() + 18.0),
+            Vec2::splat(COVER),
+        );
+        widgets::paint_cover(&painter, cover, Some(&track), self.covers.get(&track.key()));
+        // The equaliser over the cover, which is what makes a still image read as
+        // "on air" — the same overlay the deck uses.
+        if self.is_playing() {
+            painter.rect_filled(cover, t::R_LG, Color32::from_black_alpha(107));
+            widgets::equalizer(
+                ui,
+                Rect::from_center_size(cover.center(), Vec2::splat(34.0)),
+                true,
+                accent.accent,
+            );
+        }
+
+        let title_y = cover.bottom() + title_gap + 9.0;
+        widgets::label_at(
+            ui,
+            Pos2::new(block.center().x, title_y),
+            Align2::CENTER_CENTER,
+            &track.title,
+            t::ui_font(17.0),
+            t::FG,
+        );
+        let sub = songs::subtitle(&track);
+        if !sub.is_empty() {
+            widgets::label_at(
+                ui,
+                Pos2::new(block.center().x, title_y + sub_gap),
+                Align2::CENTER_CENTER,
+                &sub,
+                t::ui_font(12.0),
+                t::FG_3,
+            );
+        }
+
+        // ---- facts: state, quality, and the way into 来源 --------------------
+        // Measured before anything is placed, because the row is centred and each
+        // tag is a different width.
+        let state = self
+            .library
+            .find(&crate::library::LocalLibrary::key_of(&track))
+            .map(|entry| self.entry_state(entry))
+            .unwrap_or(songs::SongState::Online);
+        let quality = self.quality.map(|quality| quality.label());
+        let state_size = widgets::tag_size(ui, state.label(), None, true);
+        let quality_size = quality
+            .map(|label| widgets::tag_size(ui, label, None, false))
+            .unwrap_or(Vec2::ZERO);
+        let source_size = widgets::tag_size(ui, "来源", None, false);
+        let gap = 7.0;
+        let mut tags = vec![state.label()];
+        if let Some(quality) = quality {
+            tags.push(quality);
+        }
+        let total = state_size.x + quality_size.x + source_size.x + gap * 2.0;
+        let mut x = block.center().x - total / 2.0;
+        let facts_y = title_y + sub_gap + facts_gap;
+
+        widgets::tag_at(
+            ui,
+            Rect::from_min_size(Pos2::new(x, facts_y), state_size),
+            state.label(),
+            None,
+            Some(state.led()),
+            None,
+            accent,
+        );
+        x += state_size.x + gap;
+
+        if let Some(quality) = quality {
+            widgets::tag_at(
+                ui,
+                Rect::from_min_size(Pos2::new(x, facts_y), quality_size),
+                quality,
+                None,
+                None,
+                None,
+                accent,
+            );
+            x += quality_size.x + gap;
+        }
+
+        // 来源 ▸ — the one place a platform is allowed to show, and only because
+        // the person asked which copy this is.
+        let source_rect = Rect::from_min_size(Pos2::new(x, facts_y), source_size);
+        let response = ui.interact(
+            source_rect,
+            ui.make_persistent_id(("now-source", track.key())),
+            Sense::click(),
+        );
+        widgets::tag_at(
+            ui,
+            source_rect,
+            "来源",
+            Some(icons::chevron_right),
+            None,
+            if response.hovered() {
+                Some(accent.accent)
+            } else {
+                None
+            },
+            accent,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            self.source_open = true;
+        }
+        let _ = tags;
+    }
+
+    /// The two readouts under the lyrics: where they came from, and the rule that
+    /// chose this edition.
+    fn now_playing_foot(&mut self, ui: &mut Ui, accent: Accent) {
+        let width = ui.available_width();
+        let (foot, _) = ui.allocate_exact_size(Vec2::new(width, 46.0), Sense::hover());
+        let painter = ui.painter().clone();
+        painter.hline(foot.x_range(), foot.top() + 0.5, Stroke::new(1.0, t::LINE));
+
+        let lyrics_source = if self.lyrics.is_empty() {
+            "无".to_owned()
+        } else {
+            self.lyrics.source.label().to_owned()
+        };
+        for (index, (label, value)) in [
+            ("歌词来源", lyrics_source),
+            ("优先规则", "音质 › 已下载 › 可用性".to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = foot.top() + 14.0 + index as f32 * 18.0;
+            widgets::engraved_at(
+                ui,
+                Pos2::new(foot.left() + 14.0, y),
+                Align2::LEFT_CENTER,
+                label,
+                9.0,
+                t::FG_4,
+            );
+            widgets::label_at(
+                ui,
+                Pos2::new(foot.right() - 14.0, y),
+                Align2::RIGHT_CENTER,
+                &value,
+                t::mono_font(9.5),
+                t::FG_3,
+            );
+        }
+        let _ = accent;
     }
 
     fn lyrics_body(&mut self, ui: &mut Ui, accent: Accent, lyric_size: f32) {
@@ -406,54 +605,6 @@ fn mini_toggle(
     response
 }
 
-/// The lyric-source badge (B station subtitles / NetEase / none).
-fn source_badge(ui: &mut Ui, source: crate::lyrics::LyricsSource) {
-    let (label, tone) = match source {
-        crate::lyrics::LyricsSource::BilibiliSubtitle => ("B 站 CC 字幕", true),
-        crate::lyrics::LyricsSource::Netease => ("网易云音乐", true),
-        crate::lyrics::LyricsSource::Lrclib => ("LRCLib", true),
-        crate::lyrics::LyricsSource::YoutubeCaptions => ("YouTube 字幕", true),
-        crate::lyrics::LyricsSource::None => ("无", false),
-    };
-    let font = t::ui_font(10.5);
-    let width = widgets::measure(ui, label, &font).x + 14.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
-    let painter = ui.painter().clone();
-    if tone {
-        painter.rect_filled(rect, 5.0, t::fade(t::BLUE, 0.13));
-        painter.rect_stroke(
-            rect,
-            5.0,
-            Stroke::new(1.0, t::fade(t::BLUE, 0.22)),
-            egui::StrokeKind::Inside,
-        );
-        widgets::paint_label(
-            &painter,
-            rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            font,
-            t::BLUE_INK,
-        );
-    } else {
-        painter.rect_filled(rect, 5.0, t::white(0.05));
-        painter.rect_stroke(
-            rect,
-            5.0,
-            Stroke::new(1.0, t::LINE),
-            egui::StrokeKind::Inside,
-        );
-        widgets::paint_label(
-            &painter,
-            rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            font,
-            t::FG_3,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! The lyrics panel is hand-painted, so these drive the real `App` inside a
@@ -461,13 +612,12 @@ mod tests {
     //! the only way to catch "the switch looks fine but does nothing".
 
     use super::*;
+    use crate::api::models::{AudioQuality, Source, Track};
     use crate::config::Config;
     use crate::lyrics::{LyricLine, Lyrics, LyricsSource};
     use egui::{Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, Vec2};
 
     /// The 跟随 and 翻译 pills, in screen coordinates.
-    const FOLLOW_PILL: Pos2 = Pos2::new(1160.0, 86.0);
-    const TRANSLATE_PILL: Pos2 = Pos2::new(1230.0, 86.0);
     /// Somewhere over the history list, well clear of the lyrics panel.
     const HISTORY_PANE: Pos2 = Pos2::new(400.0, 400.0);
     /// Over the lyric body.
@@ -489,10 +639,6 @@ mod tests {
                 .exact_size(crate::ui::theme::TOP_BAR_H)
                 .frame(crate::ui::frames::top_bar())
                 .show(ui, |ui| app.ui_top_bar(ui));
-            egui::Panel::bottom("status_bar")
-                .exact_size(crate::ui::theme::STATUS_BAR_H)
-                .frame(crate::ui::frames::status_bar())
-                .show(ui, |ui| app.ui_status_bar(ui));
             egui::Panel::bottom("player_bar")
                 .frame(crate::ui::frames::player_bar(&theme))
                 .show(ui, |ui| app.ui_player_bar(ui));
@@ -509,6 +655,42 @@ mod tests {
         });
         output.textures_delta.clear();
         output
+    }
+
+    /// The rect of a painted label, by its text.
+    ///
+    /// These tests used to click fixed coordinates, which broke the moment
+    /// 正在播放 was added above the lyrics: the switch had moved and the click
+    /// landed on the cover. Aiming at where the label was actually painted keeps
+    /// the test about the switch.
+    fn label_rect(output: &egui::FullOutput, label: &str) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.visual_bounding_rect()));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        for shape in &output.shapes {
+            walk(&shape.shape, &mut all);
+        }
+        all.into_iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, rect)| rect)
+    }
+
+    fn click_label(ctx: &egui::Context, app: &mut App, label: &str) {
+        let output = frame(ctx, app, vec![]);
+        let rect = label_rect(&output, label)
+            .unwrap_or_else(|| panic!("{label} should be painted somewhere"));
+        click(ctx, app, rect.center());
     }
 
     fn click(ctx: &egui::Context, app: &mut App, pos: Pos2) {
@@ -602,6 +784,7 @@ mod tests {
     }
 
     fn app_with_lyrics(translated: bool) -> (App, egui::Context) {
+        crate::platform::serialise_home_tests();
         std::env::set_var("HOME", "/tmp/listenbli-lyrics-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-lyrics-tests");
         let mut app = App::new_for_tests(Config::default());
@@ -632,6 +815,134 @@ mod tests {
             frame(&ctx, &mut app, vec![]);
         }
         (app, ctx)
+    }
+
+    /// An app playing a song that is in its library.
+    ///
+    /// 正在播放 describes a song rather than lyrics, so these tests need one — and
+    /// it has to be *in the library*, because that is where its state and its
+    /// platform come from.
+    fn app_with_now_playing() -> (App, egui::Context) {
+        let (mut app, ctx) = app_with_lyrics(true);
+        let track = Track {
+            bvid: "BV1nowplaying".to_owned(),
+            source: Source::Bilibili,
+            aid: 1,
+            cid: 2,
+            title: "晴天".to_owned(),
+            author: "杰威尔音乐".to_owned(),
+            duration: 269,
+            cover: None,
+            album: Some("叶惠美".to_owned()),
+            artist: Some("周杰伦".to_owned()),
+        };
+        app.library_mut().add(track.clone());
+        app.show_as_playing(track, Some(AudioQuality::Flac));
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        (app, ctx)
+    }
+
+    /// The column answers four questions in one screen: what is playing, how it
+    /// is doing, which copy this is, and where the words came from.
+    #[test]
+    fn the_now_playing_column_names_the_song_and_the_rule_that_chose_it() {
+        let (mut app, ctx) = app_with_now_playing();
+        let output = frame(&ctx, &mut app, vec![]);
+        let text = painted_text(&output);
+        for needle in [
+            "晴天",
+            "周杰伦 · 叶惠美",
+            "在线",
+            "无损 FLAC",
+            "来源",
+            "歌词来源",
+            "优先规则",
+            "音质 › 已下载 › 可用性",
+        ] {
+            assert!(
+                text.iter().any(|painted| painted == needle),
+                "{needle} should be painted; painted instead: {text:?}"
+            );
+        }
+    }
+
+    /// A song with no lyrics is a working column with one thing to say, not an
+    /// empty pane — and the design says it in a note.
+    #[test]
+    fn a_song_without_lyrics_says_so_in_a_note() {
+        let (mut app, ctx) = app_with_now_playing();
+        app.lyrics = Lyrics::empty(LyricsSource::None);
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(
+            painted(&output, "这首歌没有找到歌词"),
+            "the column should admit there are no lyrics"
+        );
+        assert!(
+            !painted(&output, "还没有在播放"),
+            "a loaded song must not read as nothing playing"
+        );
+    }
+
+    /// With nothing loaded the column is genuinely empty, and says what to do.
+    #[test]
+    fn nothing_playing_keeps_the_centred_empty_state() {
+        let (mut app, ctx) = app_with_lyrics(true);
+        // Lyrics with no song cannot happen in the app — they arrive together —
+        // so the state has to be cleared as a whole.
+        app.current = None;
+        app.lyrics = Lyrics::empty(LyricsSource::None);
+        let output = frame(&ctx, &mut app, vec![]);
+        assert!(painted(&output, "还没有在播放"));
+        assert!(
+            !painted(&output, "这首歌没有找到歌词"),
+            "no song means no note about its lyrics"
+        );
+    }
+
+    /// 已回退 has to be visible, not just true: the whole promise of the library
+    /// is that a song whose platform copy died keeps playing, and the interface
+    /// says so in the deck and in the row at the same time.
+    #[test]
+    fn a_fallback_is_said_in_the_deck_and_in_the_row() {
+        let (mut app, ctx) = app_with_now_playing();
+        // A fallback needs somewhere to fall back *to*: the same recording on the
+        // other platform, which merges into the one library entry.
+        let mut twin = app
+            .library
+            .entries
+            .first()
+            .expect("the song is in the library")
+            .track
+            .clone();
+        twin.source = crate::api::models::Source::Youtube;
+        twin.bvid = "yt-fallback-visible".to_owned();
+        twin.author = "JVR Music".to_owned();
+        app.library.add(twin);
+
+        let entry = app
+            .library
+            .entries
+            .first()
+            .cloned()
+            .expect("the song is in the library");
+        // The copy that is playing is Bilibili's; marking it dead is what the app
+        // does when a resolve fails for real.
+        app.mark_dead(&entry.track);
+
+        let output = frame(&ctx, &mut app, vec![]);
+        let painted = painted_text(&output);
+        assert!(
+            painted.iter().any(|text| text == "已回退"),
+            "the deck should say the copy is a stand-in: {painted:?}"
+        );
+        // The library row carries the same word in its state column, so the list
+        // and the player cannot disagree about it.
+        assert!(
+            painted.iter().filter(|text| *text == "已回退").count() >= 2,
+            "both the deck tag and the row's state column should say it: {painted:?}"
+        );
     }
 
     /// Enough lyrics that the body scrolls, so there is a scroll bar to grab.
@@ -745,13 +1056,13 @@ mod tests {
 
         app.show_translation = true;
         app.follow_lyrics = true;
-        click(&ctx, &mut app, FOLLOW_PILL);
+        click_label(&ctx, &mut app, "跟随");
         assert!(!app.follow_lyrics, "跟随 should switch off");
         assert!(app.show_translation, "跟随 must not touch 翻译");
 
         app.show_translation = true;
         app.follow_lyrics = true;
-        click(&ctx, &mut app, TRANSLATE_PILL);
+        click_label(&ctx, &mut app, "翻译");
         assert!(!app.show_translation, "翻译 should switch off");
         assert!(app.follow_lyrics, "翻译 must not touch 跟随");
     }
@@ -783,7 +1094,7 @@ mod tests {
         let (mut app, ctx) = app_with_lyrics(false);
         app.show_translation = true;
 
-        click(&ctx, &mut app, TRANSLATE_PILL);
+        click_label(&ctx, &mut app, "翻译");
 
         let status = app.status.as_ref().expect("a click must report itself");
         assert!(
@@ -841,7 +1152,7 @@ mod tests {
     #[test]
     fn follow_stays_off_until_the_user_says_otherwise() {
         let (mut app, ctx) = app_with_lyrics(true);
-        click(&ctx, &mut app, FOLLOW_PILL);
+        click_label(&ctx, &mut app, "跟随");
         assert!(!app.follow_lyrics);
 
         scroll(&ctx, &mut app, LYRIC_BODY, 8);

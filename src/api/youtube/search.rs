@@ -149,6 +149,10 @@ fn video_to_track(video: &Value) -> Option<Track> {
         // URLs carry signing parameters that expire, while `i.ytimg.com` serves
         // this path indefinitely.
         cover: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
+        // A YouTube video has no album and the channel is an uploader, not a
+        // credited performer, so neither field is filled from this response.
+        album: None,
+        artist: None,
     })
 }
 

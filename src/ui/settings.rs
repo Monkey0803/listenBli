@@ -250,7 +250,8 @@ impl App {
             // design's `.input`.
             let field = (ui.available_width() - button - gap - 20.0).max(80.0);
             ui.horizontal(|ui| {
-                let response = path_field(ui, &mut path, &platform::cjk_font_hint(), field, accent);
+                let response =
+                    widgets::text_field(ui, &mut path, &platform::cjk_font_hint(), field, accent);
                 ui.add_space(gap);
                 if widgets::icon_button(ui, icons::copy, button, false, accent, "复制路径")
                     .clicked()
@@ -368,7 +369,7 @@ impl App {
             // 10px of padding on each side, so the text lines up with the
             // design's `.input`.
             let field = (ui.available_width() - 20.0).max(80.0);
-            let response = path_field(
+            let response = widgets::text_field(
                 ui,
                 &mut typed,
                 &format!("留空使用 {}", platform::cache_dir().display()),
@@ -406,76 +407,6 @@ impl App {
             self.notify(err);
         }
     }
-}
-
-/// One line of the design's `.input`: mono text on a black wash with a hairline,
-/// plus the accent focus ring. The caller decides what a commit means.
-///
-/// `placeholder` is painted in the field while it is empty, so a hint can show
-/// what the value would default to without being mistaken for the value itself.
-fn path_field(
-    ui: &mut Ui,
-    text: &mut String,
-    placeholder: &str,
-    width: f32,
-    accent: t::Accent,
-) -> egui::Response {
-    let input = egui::Frame::NONE
-        .fill(Color32::from_black_alpha(102))
-        .corner_radius(t::R_SM)
-        .stroke(Stroke::new(1.0, t::LINE))
-        .inner_margin(Margin {
-            left: 10,
-            right: 10,
-            top: 0,
-            bottom: 0,
-        })
-        .show(ui, |ui| {
-            let font = t::mono_font(11.5);
-            let offset = widgets::field_text_offset(ui.painter(), &font);
-            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                widgets::field_galley(ui, buf.as_str(), &font, t::FG, offset, wrap)
-            };
-            let response = ui.add(
-                egui::TextEdit::singleline(text)
-                    .frame(egui::Frame::NONE)
-                    .margin(Margin::ZERO)
-                    .min_size(Vec2::new(width, 32.0))
-                    .vertical_align(Align::Center)
-                    .layouter(&mut layouter)
-                    .font(font.clone())
-                    .text_color(t::FG),
-            );
-            if text.is_empty() && !placeholder.is_empty() {
-                widgets::paint_label(
-                    ui.painter(),
-                    response.rect.left_center(),
-                    Align2::LEFT_CENTER,
-                    placeholder,
-                    font,
-                    t::FG_4,
-                );
-            }
-            response
-        });
-
-    let response = input.inner;
-    if response.has_focus() {
-        let painter = ui.painter().clone();
-        painter.rect_stroke(
-            input.response.rect,
-            t::R_SM,
-            Stroke::new(1.0, t::fade(accent.accent, 0.5)),
-            egui::StrokeKind::Inside,
-        );
-        painter.rect_stroke(
-            input.response.rect.expand(3.0),
-            11.0,
-            Stroke::new(3.0, accent.dim()),
-            egui::StrokeKind::Outside,
-        );
-    }
-    response
 }
 
 /// A path row: elided mono text with square icon buttons on the right.

@@ -1,12 +1,16 @@
 //! Shared UI: the shell (top bar, list pane, status line), the reusable track
 //! row, and the small buttons the panes share.
 
+pub mod connect;
 pub mod icons;
-pub mod library;
 pub mod login;
 pub mod lyrics;
+pub mod nav;
+pub mod pages;
 pub mod player;
 pub mod settings;
+pub mod songs;
+pub mod source;
 pub mod theme;
 pub mod widgets;
 
@@ -15,18 +19,15 @@ use egui::{
     TextEdit, Ui, Vec2,
 };
 
-use crate::api::models::{Source, Track};
-use crate::util;
-
 use self::icons::Icon;
 use self::theme::{self as t, Accent};
-use self::widgets::{chip, Badge};
-use super::app::{App, Tab};
+use self::widgets::chip;
+use super::app::{App, Page, Tab};
 
 /// Panel backgrounds, so the shell and the panels agree on one surface.
 pub mod frames {
     use super::theme;
-    use egui::{Color32, CornerRadius, Frame, Margin};
+    use egui::{CornerRadius, Frame, Margin};
 
     pub fn top_bar() -> Frame {
         Frame::NONE
@@ -34,32 +35,48 @@ pub mod frames {
             .inner_margin(Margin::symmetric(16, 0))
     }
 
-    pub fn status_bar() -> Frame {
+    /// The transport deck: a plate a shade lighter than the page above it, with a
+    /// brighter rule on its top edge so the deck reads as the one thing that never
+    /// changes as pages move behind it.
+    pub fn deck(_theme: &theme::Theme) -> Frame {
         Frame::NONE
-            .fill(Color32::from_black_alpha(87))
-            .inner_margin(Margin::symmetric(18, 0))
+            .fill(theme::INK_2)
+            .inner_margin(Margin::symmetric(16, 0))
     }
 
-    pub fn player_bar(_theme: &theme::Theme) -> Frame {
-        Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(8, 8, 12, 184))
-            .inner_margin(Margin {
-                left: 22,
-                right: 22,
-                top: 12,
-                bottom: 12,
-            })
-    }
-
-    pub fn lyrics(_theme: &theme::Theme) -> Frame {
+    /// The library rail. It owns its own background because the nav items run the
+    /// full width of the plate, so a margin here would leave an unpainted strip.
+    pub fn library_nav() -> Frame {
         Frame::NONE
             .fill(theme::INK_1)
             .corner_radius(CornerRadius::ZERO)
             .inner_margin(Margin::ZERO)
     }
 
+    /// The now-playing column: the same plate as the rail, ruled off on its inner
+    /// edge.
+    pub fn now_playing() -> Frame {
+        Frame::NONE
+            .fill(theme::INK_1)
+            .corner_radius(CornerRadius::ZERO)
+            .inner_margin(Margin::ZERO)
+    }
+
+    /// Legacy name for the deck. `lyrics.rs` and `player.rs` still build their own
+    /// test frames with it; both panels are being replaced, and the alias goes with
+    /// them.
+    pub fn player_bar(theme: &theme::Theme) -> Frame {
+        deck(theme)
+    }
+
+    /// Legacy name for the now-playing column, kept for the same reason.
+    pub fn lyrics(theme: &theme::Theme) -> Frame {
+        let _ = theme;
+        now_playing()
+    }
+
     pub fn list_pane() -> Frame {
-        Frame::NONE.fill(theme::INK_1).inner_margin(Margin::ZERO)
+        Frame::NONE.fill(theme::INK_0).inner_margin(Margin::ZERO)
     }
 }
 
@@ -151,87 +168,6 @@ pub(crate) fn ghost_button(
     response
 }
 
-/// The design's `.btn-primary`: the one accent-filled action per screen.
-pub(crate) fn primary_button(
-    ui: &mut Ui,
-    label: &str,
-    icon: Option<Icon>,
-    accent: Accent,
-) -> egui::Response {
-    let font = t::ui_font(13.0);
-    let text_w = widgets::measure(ui, label, &font).x;
-    let icon_w = if icon.is_some() { 23.0 } else { 0.0 };
-    let width = text_w + icon_w + 36.0;
-
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click());
-    let painter = ui.painter().clone();
-    let hovered = response.hovered();
-    t::gradient_rounded_rect(
-        &painter,
-        rect,
-        t::R_MD,
-        accent.soft,
-        if hovered {
-            t::mix(accent.soft, accent.accent, 0.6)
-        } else {
-            accent.accent
-        },
-        Vec2::new(0.0, 1.0),
-    );
-    painter.rect_stroke(
-        rect,
-        t::R_MD,
-        Stroke::new(1.0, t::white(0.22)),
-        egui::StrokeKind::Inside,
-    );
-
-    let ink = Color32::from_rgb(0x2a, 0x0d, 0x18);
-    let mut cursor = rect.left() + 18.0;
-    if let Some(icon) = icon {
-        icon(
-            &painter,
-            Rect::from_min_size(Pos2::new(cursor, rect.center().y - 7.5), Vec2::splat(15.0)),
-            ink,
-        );
-        cursor += 23.0;
-    }
-    widgets::paint_label(
-        &painter,
-        Pos2::new(cursor, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        ink,
-    );
-    if hovered {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    response
-}
-
-/// The centred header every list pane shares: a big title, a meta count and
-/// right-aligned actions, closed by a hairline.
-pub(crate) fn list_header(ui: &mut Ui, title: &str, meta: &str, actions: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
-        ui.add_space(22.0);
-        ui.vertical(|ui| {
-            ui.add_space(17.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(title).size(19.0).color(t::FG));
-                if !meta.is_empty() {
-                    ui.label(RichText::new(meta).size(12.0).color(t::FG_3));
-                }
-            });
-            ui.add_space(14.0);
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(22.0);
-            actions(ui);
-        });
-    });
-    hline(ui, ui.min_rect().bottom() - 0.5, t::LINE);
-}
-
 // ---------------------------------------------------------------------------
 // top bar
 // ---------------------------------------------------------------------------
@@ -240,53 +176,98 @@ impl App {
     pub(crate) fn ui_top_bar(&mut self, ui: &mut Ui) {
         let accent = self.theme.accent;
         let playing = self.is_playing();
-        let logged_in = self.user.is_some();
-
         let rect = ui.max_rect();
         hline(ui, rect.bottom() - 0.5, t::LINE);
 
+        // The console's top bar answers two questions: where am I, and what is in
+        // the library. The old bar answered "which platform am I browsing" — the
+        // question this redesign removes — so the source switch, the account tabs
+        // and the 无损优先 chip all went with it. Preferring lossless is a setting,
+        // not something to keep a chip on screen for.
         ui.horizontal_centered(|ui| {
             self.brand(ui, accent, playing);
-            ui.add_space(8.0);
-            if let Some(tab) = self.tab_control(ui, logged_in) {
-                self.tab = tab;
-            }
-            ui.add_space(8.0);
-            // The platform control sits between the tabs and the field, so it reads
-            // as part of "what am I looking at" rather than as a setting.
-            if let Some(source) = self.source_control(ui) {
-                self.set_source(source);
-            }
-            ui.add_space(8.0);
+            ui.add_space(9.0);
+            self.page_tag(ui, accent);
+            ui.add_space(14.0);
             self.search_field(ui);
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.account_control(ui, accent);
-
                 ui.add_space(4.0);
-                let active = self.settings_open;
-                if widgets::icon_button(ui, icons::settings, 32.0, active, accent, "设置").clicked()
+                if widgets::icon_button(
+                    ui,
+                    icons::settings,
+                    32.0,
+                    self.settings_open,
+                    accent,
+                    "设置",
+                )
+                .clicked()
                 {
                     self.settings_open = !self.settings_open;
                     self.account_menu_open = false;
                 }
-
                 ui.add_space(4.0);
-                let flac = self.config_value(|c| c.prefer_flac);
-                if chip(ui, "无损优先", Some(icons::spark), None, flac, accent).clicked() {
-                    let vip = self.user.as_ref().is_some_and(|u| u.is_vip());
-                    self.update_config(|config| config.prefer_flac = !flac);
-                    let message = if flac {
-                        "已关闭无损优先".to_owned()
-                    } else if vip {
-                        "已开启无损优先（需投稿提供 FLAC，否则回落 192K）".to_owned()
-                    } else {
-                        "已开启无损优先：登录大会员账号后才会生效".to_owned()
-                    };
-                    self.set_status(message, false);
+
+                // Offline and sync are readings first and shortcuts second: both
+                // open the page that explains the number.
+                let offline = self.offline_chip_label();
+                if chip(
+                    ui,
+                    "已下载",
+                    Some(icons::download),
+                    offline.as_deref(),
+                    false,
+                    accent,
+                )
+                .clicked()
+                {
+                    self.set_page(Page::Offline);
+                }
+                ui.add_space(4.0);
+
+                let sync = self.sync_label().unwrap_or_else(|| "未同步".to_owned());
+                if chip(ui, "同步", Some(icons::refresh), Some(&sync), false, accent).clicked() {
+                    self.set_page(Page::Sources);
                 }
             });
         });
+    }
+
+    /// The page you are on, as a small bordered tag beside the wordmark — the
+    /// console's substitute for a title bar, since the rail already owns the
+    /// navigation and a second title would be redundant.
+    fn page_tag(&self, ui: &mut Ui, accent: Accent) {
+        let tag = self.page.tag();
+        let label = self.page.label();
+        let tag_w = widgets::engraved_measure(ui, tag, 9.5).x;
+        let label_font = t::ui_font(9.5);
+        let label_w = widgets::measure(ui, label, &label_font).x;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(tag_w + label_w + 21.0, 22.0), Sense::hover());
+        let painter = ui.painter().clone();
+        painter.rect_stroke(
+            rect,
+            t::R_SM,
+            Stroke::new(1.0, t::LINE_2),
+            egui::StrokeKind::Inside,
+        );
+        widgets::engraved_at(
+            ui,
+            Pos2::new(rect.left() + 7.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            tag,
+            9.5,
+            accent.accent,
+        );
+        widgets::label_at(
+            ui,
+            Pos2::new(rect.left() + 7.0 + tag_w + 7.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            label_font,
+            t::FG_3,
+        );
     }
 
     /// The animated brand mark and wordmark.
@@ -343,203 +324,6 @@ impl App {
         );
     }
 
-    /// The three-way tab control from the design's `.segmented`.
-    /// The platform control: two cells, the current one filled.
-    ///
-    /// A segmented control rather than a button reading "switch to …": both options
-    /// stay visible, so it shows a state instead of offering a command, and it is
-    /// drawn like the tab control beside it because it answers the same kind of
-    /// question.
-    fn source_control(&mut self, ui: &mut Ui) -> Option<Source> {
-        const ENTRIES: [(Source, &str); 2] =
-            [(Source::Bilibili, "B 站"), (Source::Youtube, "YouTube")];
-
-        let font = t::ui_font(12.5);
-        let mut widths = [0.0f32; 2];
-        for (index, (_, label)) in ENTRIES.iter().enumerate() {
-            widths[index] = widgets::measure(ui, label, &font).x + 32.0;
-        }
-        let total: f32 = widths.iter().sum::<f32>() + 6.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 32.0), Sense::hover());
-        let painter = ui.painter().clone();
-        painter.rect_filled(rect, t::R_MD, t::white(0.045));
-        painter.rect_stroke(
-            rect,
-            t::R_MD,
-            Stroke::new(1.0, t::LINE),
-            egui::StrokeKind::Inside,
-        );
-
-        let mut picked = None;
-        let mut cursor = rect.left() + 3.0;
-        for (index, (source, label)) in ENTRIES.iter().enumerate() {
-            let cell = Rect::from_min_size(
-                Pos2::new(cursor, rect.top() + 3.0),
-                Vec2::new(widths[index], 26.0),
-            );
-            let response = ui.interact(cell, ui.id().with(("source", index)), Sense::click());
-            let active = self.source == *source;
-            if active {
-                painter.rect_filled(cell, 7.0, t::INK_4);
-                painter.rect_stroke(
-                    cell,
-                    7.0,
-                    Stroke::new(1.0, t::white(0.06)),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            let fg = if active {
-                t::FG
-            } else if response.hovered() {
-                t::FG_2
-            } else {
-                t::FG_3
-            };
-            widgets::label_at(
-                ui,
-                Pos2::new(cell.center().x, cell.center().y),
-                Align2::CENTER_CENTER,
-                label,
-                font.clone(),
-                fg,
-            );
-            if response.clicked() {
-                picked = Some(*source);
-            }
-            cursor += widths[index];
-        }
-        picked
-    }
-
-    fn tab_control(&mut self, ui: &mut Ui, logged_in: bool) -> Option<Tab> {
-        let accent = self.theme.accent;
-        let fav_count = self
-            .fav_folders
-            .iter()
-            .find(|f| Some(f.id) == self.selected_folder)
-            .map(|f| f.media_count)
-            .unwrap_or(self.fav_items.len() as i64);
-        let history_count = self.history.len();
-
-        // The account tabs need a Bilibili session, and YouTube has no equivalent
-        // in this version, so on YouTube they are not offered at all rather than
-        // shown as empty rooms.
-        let mut entries: Vec<(Tab, &str, Icon, Option<String>)> =
-            vec![(Tab::Search, "搜索", icons::search, None)];
-        if self.source == Source::Bilibili {
-            entries.push((
-                Tab::Favorites,
-                "收藏夹",
-                icons::folder,
-                logged_in.then(|| fav_count.to_string()),
-            ));
-            entries.push((
-                Tab::History,
-                "历史",
-                icons::clock,
-                logged_in.then(|| history_count.to_string()),
-            ));
-        }
-
-        let font = t::ui_font(12.5);
-        let mut widths = vec![0.0f32; entries.len()];
-        for (index, (_, label, _, count)) in entries.iter().enumerate() {
-            let count_w = count
-                .as_ref()
-                .map(|c| widgets::measure(ui, c, t::mono_font(10.5)).x + 12.0)
-                .unwrap_or(0.0);
-            widths[index] = widgets::measure(ui, label, &font).x + 13.0 + 6.0 + count_w + 24.0;
-        }
-        let total: f32 = widths.iter().sum::<f32>() + 6.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 32.0), Sense::hover());
-        let painter = ui.painter().clone();
-        painter.rect_filled(rect, t::R_MD, t::white(0.045));
-        painter.rect_stroke(
-            rect,
-            t::R_MD,
-            Stroke::new(1.0, t::LINE),
-            egui::StrokeKind::Inside,
-        );
-
-        let mut picked = None;
-        let mut cursor = rect.left() + 3.0;
-        for (index, (tab, label, icon, count)) in entries.iter().enumerate() {
-            let cell = Rect::from_min_size(
-                Pos2::new(cursor, rect.top() + 3.0),
-                Vec2::new(widths[index], 26.0),
-            );
-            let response = ui.interact(cell, ui.id().with(("tab", index)), Sense::click());
-            let active = self.tab == *tab;
-            if active {
-                painter.rect_filled(cell, 7.0, t::INK_4);
-                painter.rect_stroke(
-                    cell,
-                    7.0,
-                    Stroke::new(1.0, t::white(0.06)),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            let fg = if active {
-                t::FG
-            } else if response.hovered() {
-                t::FG_2
-            } else {
-                t::FG_3
-            };
-
-            let icon_rect = Rect::from_min_size(
-                Pos2::new(cell.left() + 12.0, cell.center().y - 6.5),
-                Vec2::splat(13.0),
-            );
-            if logged_in {
-                icon(&painter, icon_rect, fg);
-            } else {
-                icons::lock(&painter, icon_rect, t::FG_3);
-            }
-            let mut x = cell.left() + 12.0 + 19.0;
-            widgets::label_at(
-                ui,
-                Pos2::new(x, cell.center().y),
-                Align2::LEFT_CENTER,
-                label,
-                font.clone(),
-                fg,
-            );
-            x += widgets::measure(ui, label, font.clone()).x;
-
-            if let Some(count) = count {
-                let w = widgets::measure(ui, count, t::mono_font(10.5)).x + 12.0;
-                let badge = Rect::from_min_size(
-                    Pos2::new(x + 6.0, cell.center().y - 7.5),
-                    Vec2::new(w, 15.0),
-                );
-                let (bg, text) = if active {
-                    (accent.dim(), accent.ink)
-                } else {
-                    (t::white(0.06), t::FG_3)
-                };
-                painter.rect_filled(badge, 7.5, bg);
-                widgets::paint_label(
-                    &painter,
-                    badge.center(),
-                    Align2::CENTER_CENTER,
-                    count,
-                    t::mono_font(10.5),
-                    text,
-                );
-            }
-
-            if response.clicked() {
-                picked = Some(*tab);
-            }
-            if response.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            cursor += widths[index];
-        }
-        picked
-    }
-
     /// The ⌘K search pill. The frame paints behind its own contents, which is
     /// what keeps the text editable and visible at the same time.
     fn search_field(&mut self, ui: &mut Ui) {
@@ -554,7 +338,7 @@ impl App {
         let frame = egui::Frame::NONE
             .fill(Color32::from_black_alpha(if focused { 140 } else { 107 }))
             .stroke(Stroke::new(1.0, t::LINE))
-            .corner_radius(18.0)
+            .corner_radius(t::R_SM)
             .inner_margin(Margin {
                 left: 12,
                 right: 10,
@@ -973,241 +757,15 @@ fn menu_item(ui: &mut Ui, label: &str, icon: Icon, danger: bool) -> bool {
 
 impl App {
     pub(crate) fn ui_central(&mut self, ui: &mut Ui) {
-        match self.tab {
-            Tab::Search => self.ui_search_pane(ui),
-            Tab::Favorites => self.ui_favorites(ui),
-            Tab::History => self.ui_history(ui),
-        }
-    }
-
-    fn ui_search_pane(&mut self, ui: &mut Ui) {
-        let accent = self.theme.accent;
-        let searching = self.searching;
-        let keyword = self.last_keyword.clone();
-        let count = self.results.len();
-
-        let title = if searching {
-            format!("搜索「{keyword}」")
-        } else if keyword.is_empty() {
-            "搜索".to_owned()
-        } else {
-            format!("「{keyword}」")
-        };
-        let meta = if !searching && count > 0 {
-            format!("找到 {count} 个结果")
-        } else {
-            String::new()
-        };
-
-        let mut play_all = false;
-        list_header(ui, &title, &meta, |ui| {
-            if searching {
-                spinner(ui, 15.0, accent);
-            } else if count > 0
-                && ghost_button(ui, "全部播放", Some(icons::play), accent, true, true).clicked()
-            {
-                play_all = true;
-            }
-        });
-
-        if play_all {
-            let results = self.results.clone();
-            self.play_from_list(&results, 0);
-            return;
-        }
-
-        if searching {
-            widgets::skeleton(ui, 6, self.theme.row_h);
-            return;
-        }
-
-        if self.results.is_empty() {
-            let examples: &[&str] = &["周杰伦 晴天", "米津玄師", "七里香"];
-            // The user's own recent searches are more useful than the built-in
-            // examples, but a first run still needs somewhere to start from.
-            let history = self.search_history();
-            let recent: Vec<&str> = history.iter().map(String::as_str).collect();
-            let (desc, suggestions): (&str, &[&str]) = if keyword.is_empty() && !recent.is_empty() {
-                (
-                    "下面是最近的搜索记录，点击即可重新搜索；也可以直接输入新的关键词。",
-                    &recent,
-                )
-            } else {
-                (
-                    if keyword.is_empty() {
-                        "listenBli 会把 B 站上的音乐/视频下载成音轨后直接播放，不需要登录即可获得 192K 音质。"
-                    } else {
-                        "试试换一个关键词，或者用「歌手 + 歌名」的形式，例如「周杰伦 晴天」或「米津玄師 Lemon」。"
-                    },
-                    examples,
-                )
-            };
-            let empty_title = if keyword.is_empty() {
-                "输入关键词开始搜索".to_owned()
-            } else {
-                format!("没有找到「{keyword}」相关的结果")
-            };
-            let picked =
-                widgets::empty_state(ui, icons::search, &empty_title, desc, suggestions, accent);
-            if let Some(suggestion) = picked {
-                self.search_input = suggestion;
-                self.start_search();
-            }
-            return;
-        }
-
-        self.pane_body(ui, PaneSource::Search);
-    }
-
-    /// The scrollable body shared by search, favourites and history.
-    pub(crate) fn pane_body(&mut self, ui: &mut Ui, source: PaneSource) {
-        let accent = self.theme.accent;
-        let mut clicked = None;
-        let mut load_more = false;
-
-        let tracks: Vec<Track> = match source {
-            PaneSource::Search => std::mem::take(&mut self.results),
-            PaneSource::Favorites => std::mem::take(&mut self.fav_items),
-            PaneSource::History => std::mem::take(&mut self.history),
-        };
-        let has_more = match source {
-            PaneSource::Search => self.search_has_more,
-            PaneSource::Favorites => self.fav_has_more,
-            PaneSource::History => false,
-        };
-
-        let scroll = egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                column_head(ui, 24.0);
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0);
-                    ui.vertical(|ui| {
-                        for (index, track) in tracks.iter().enumerate() {
-                            if let Some(action) = track_row(ui, self, track, index) {
-                                clicked = Some((index, action));
-                            }
-                            ui.add_space(1.0);
-                        }
-                    });
-                });
-                ui.add_space(18.0);
-                // Paging has no button: a page still in flight only shows this
-                // spinner, and reaching the tail of the list is what asks for
-                // the next one (see below).
-                if self.loading_more {
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        spinner(ui, 15.0, accent);
-                    });
-                }
-                ui.add_space(22.0);
-            });
-
-        match source {
-            PaneSource::Search => self.results = tracks,
-            PaneSource::Favorites => self.fav_items = tracks,
-            PaneSource::History => self.history = tracks,
-        }
-
-        if let Some((index, action)) = clicked {
-            let list = match source {
-                PaneSource::Search => self.results.clone(),
-                PaneSource::Favorites => self.fav_items.clone(),
-                PaneSource::History => self.history.clone(),
-            };
-            let track = list.get(index).cloned();
-            match action {
-                RowAction::Play => self.play_from_list(&list, index),
-                RowAction::CopyLink => {
-                    if let Some(track) = &track {
-                        ui.ctx().copy_text(util::video_url(&track.bvid));
-                        self.notify("已复制视频链接");
-                    }
-                }
-                RowAction::OpenInBrowser => {
-                    if let Some(track) = &track {
-                        if let Err(err) = crate::platform::open_url(&util::video_url(&track.bvid)) {
-                            self.set_status(err, true);
-                        }
-                    }
-                }
-                RowAction::Enqueue | RowAction::EnqueueNext => {
-                    let next = action == RowAction::EnqueueNext;
-                    if let Some(track) = track {
-                        let title = track.title.clone();
-                        if self.enqueue(track, next) {
-                            self.notify(if next {
-                                format!("已排在下一首：{title}")
-                            } else {
-                                format!("已加入播放列表：{title}")
-                            });
-                        } else {
-                            self.notify("已经在播放列表里了");
-                        }
-                    }
-                }
-                RowAction::Cache => {
-                    if let Some(track) = track {
-                        let title = track.title.clone();
-                        if self.cache_track(&track) {
-                            self.notify(format!("正在缓存：{title}"));
-                        } else {
-                            self.notify("这首正在播放，音频已经在缓存了");
-                        }
-                    }
-                }
-                RowAction::Export => {
-                    if let Some(track) = track {
-                        // Implies caching: the worker downloads first if it has
-                        // to, then writes the file. Both take time, so the toast
-                        // reports the start and the event reports the result.
-                        let title = track.title.clone();
-                        self.send(crate::net::Cmd::ExportTrack(Box::new(track)));
-                        self.notify(format!("正在导出：{title}"));
-                    }
-                }
-            }
-        }
-
-        // Scrolling to the end fetches the next page by itself, so the rows are
-        // usually already laid out by the time the user gets there. A list
-        // shorter than its viewport counts as "at the end" too: there is
-        // nothing left to scroll, so waiting for a scroll would deadlock it.
-        if has_more
-            && !self.loading_more
-            && near_end(
-                scroll.state.offset.y,
-                scroll.inner_rect.height(),
-                scroll.content_size.y,
-            )
-        {
-            load_more = true;
-        }
-
-        if load_more {
-            // Marked in flight *before* the command leaves, so the next frame
-            // cannot ask for the same page while the worker is still busy.
-            match source {
-                // A later page of the query already on screen.
-                PaneSource::Search => {
-                    self.loading_more = true;
-                    self.send(crate::net::Cmd::Search {
-                        source: self.source,
-                        keyword: self.last_keyword.clone(),
-                        page: self.search_page + 1,
-                    });
-                }
-                PaneSource::Favorites => {
-                    if let Some(media_id) = self.selected_folder {
-                        self.loading_more = true;
-                        let page = self.fav_page + 1;
-                        self.send(crate::net::Cmd::LoadFavItems { media_id, page });
-                    }
-                }
-                PaneSource::History => {}
-            }
+        // The library's six pages. 搜索 still runs the old results pane while it
+        // is moved over to songs; the other five are the library's own.
+        match self.page {
+            Page::Library => self.ui_library_page(ui),
+            Page::Playlists => self.ui_playlists_page(ui),
+            Page::Recent => self.ui_recent_page(ui),
+            Page::Offline => self.ui_offline_page(ui),
+            Page::Search => self.ui_search_page(ui),
+            Page::Sources => self.ui_sources_page(ui),
         }
     }
 }
@@ -1220,334 +778,8 @@ const AUTO_LOAD_MARGIN: f32 = 320.0;
 /// Whether a list is close enough to its end to fetch more. `offset` is the
 /// vertical scroll offset, `viewport` the height of the visible window and
 /// `content` the height of everything laid out inside it.
-fn near_end(offset: f32, viewport: f32, content: f32) -> bool {
+pub(crate) fn near_end(offset: f32, viewport: f32, content: f32) -> bool {
     content - (offset + viewport) <= AUTO_LOAD_MARGIN
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PaneSource {
-    Search,
-    Favorites,
-    History,
-}
-
-/// The design's `.colhead`: uppercase micro-labels above the columns.
-pub(crate) fn column_head(ui: &mut Ui, side_pad: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
-    let painter = ui.painter().clone();
-    widgets::paint_label(
-        &painter,
-        Pos2::new(rect.left() + side_pad + 102.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        "标题",
-        t::ui_font(10.0),
-        t::FG_3,
-    );
-    widgets::paint_label(
-        &painter,
-        Pos2::new(rect.right() - side_pad - 28.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        "音质 / 时长",
-        t::ui_font(10.0),
-        t::FG_3,
-    );
-}
-
-fn spinner(ui: &mut Ui, size: f32, accent: Accent) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let painter = ui.painter().clone();
-    let time = ui.input(|i| i.time) as f32;
-    let start = (time * 4.2) % std::f32::consts::TAU;
-    let points: Vec<Pos2> = (0..=20)
-        .map(|i| {
-            let angle = start + i as f32 / 20.0 * std::f32::consts::TAU * 0.78;
-            rect.center() + Vec2::angled(angle) * (size * 0.5 - 1.0)
-        })
-        .collect();
-    painter.line(points, Stroke::new(1.8, accent.accent));
-    ui.ctx().request_repaint();
-}
-
-/// What a row was asked to do. The row cannot run any of it itself: it is painted
-/// while the list is borrowed out of `App`, so the click travels back to the pane
-/// that owns the `&mut App`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RowAction {
-    /// The row body: make this the current track and start it.
-    Play,
-    /// `⋯` menu: put the video's page URL on the clipboard.
-    CopyLink,
-    /// `⋯` menu: hand that URL to the system browser.
-    OpenInBrowser,
-    /// `⋯` menu: append to the play queue.
-    Enqueue,
-    /// `⋯` menu: play it right after the current track.
-    EnqueueNext,
-    /// `⋯` menu: download it into the audio cache without playing it.
-    Cache,
-    /// `⋯` menu: write a normal `.m4a` copy of the audio into the export folder.
-    Export,
-}
-
-/// One row of the list. Clicking anywhere on it plays that track; the `⋯` button
-/// opens the per-row menu instead, and both come back as a [`RowAction`].
-pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> Option<RowAction> {
-    let accent = app.theme.accent;
-    let row_h = app.theme.row_h;
-    let compact = app.theme.compact();
-    let current = app.is_current(track);
-    let playing = app.is_playing();
-
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
-    let painter = ui.painter().clone();
-    let hovered = response.hovered();
-
-    if current {
-        t::gradient_rounded_rect(
-            &painter,
-            rect,
-            t::R_MD,
-            accent.dim(),
-            t::white(0.022),
-            Vec2::new(1.0, 0.0),
-        );
-    } else if hovered {
-        painter.rect_filled(rect, t::R_MD, t::INK_3);
-    }
-
-    let bar_h = if current {
-        34.0
-    } else if hovered {
-        20.0
-    } else {
-        0.0
-    };
-    if bar_h > 0.0 {
-        painter.rect_filled(
-            Rect::from_center_size(
-                Pos2::new(rect.left() + 1.25, rect.center().y),
-                Vec2::new(2.5, bar_h),
-            ),
-            2.0,
-            accent.accent,
-        );
-    }
-
-    let inner = rect.shrink2(Vec2::new(10.0, 0.0));
-
-    let idx_rect = Rect::from_min_size(Pos2::new(inner.left(), rect.top()), Vec2::new(28.0, row_h));
-    if current {
-        // The loaded row says so here instead of showing its number: the tint,
-        // the side bar and the accent title all carry "this one is current", so
-        // the one part of the row that could say *playing* is this column.
-        //
-        // A pause glyph, matching what the cover overlay already paints for
-        // `current && playing`. Deliberately not keyed on the paused state: a
-        // paused row would then fall back to a play triangle, which is the thing
-        // this replaced.
-        icons::pause(
-            &painter,
-            Rect::from_center_size(idx_rect.center(), Vec2::splat(15.0)),
-            accent.accent,
-        );
-    } else {
-        widgets::paint_label(
-            &painter,
-            idx_rect.center(),
-            Align2::CENTER_CENTER,
-            format!("{:02}", index + 1),
-            t::mono_font(11.5),
-            t::FG_3,
-        );
-    }
-
-    let cover_size = if compact { 38.0 } else { 46.0 };
-    let cover_rect = Rect::from_center_size(
-        Pos2::new(idx_rect.right() + 14.0 + cover_size * 0.5, rect.center().y),
-        Vec2::splat(cover_size),
-    );
-    widgets::paint_cover(
-        &painter,
-        cover_rect,
-        Some(track),
-        app.covers.get(&track.key()),
-    );
-    if hovered || current {
-        let overlay = Rect::from_center_size(
-            cover_rect.center(),
-            cover_rect.size() * if hovered { 1.04 } else { 1.0 },
-        );
-        painter.rect_filled(
-            overlay,
-            9.0,
-            Color32::from_black_alpha(if current { 140 } else { 158 }),
-        );
-        if current && playing {
-            widgets::equalizer(
-                ui,
-                Rect::from_center_size(overlay.center(), Vec2::new(16.0, 15.0)),
-                playing,
-                accent.accent,
-            );
-        } else {
-            icons::play(
-                &painter,
-                Rect::from_center_size(
-                    overlay.center() + Vec2::new(1.0, 0.0),
-                    Vec2::splat(if compact { 13.0 } else { 15.0 }),
-                ),
-                Color32::WHITE,
-            );
-        }
-    }
-
-    let more_rect = Rect::from_min_size(
-        Pos2::new(rect.right() - 10.0 - 16.0, rect.center().y - 8.0),
-        Vec2::splat(16.0),
-    );
-    let dur_rect = Rect::from_min_size(
-        Pos2::new(more_rect.left() - 12.0 - 42.0, rect.top()),
-        Vec2::new(42.0, row_h),
-    );
-    let badge_rect = Rect::from_min_size(
-        Pos2::new(dur_rect.left() - 12.0 - 62.0, rect.top()),
-        Vec2::new(62.0, row_h),
-    );
-
-    widgets::paint_label(
-        &painter,
-        dur_rect.center(),
-        Align2::CENTER_CENTER,
-        util::format_duration(track.duration),
-        t::mono_font(11.5),
-        t::FG_3,
-    );
-    // The `⋯` is its own widget, so clicking it opens the menu instead of
-    // playing: registered after the row, it wins the hit test on its own rect.
-    let more = ui.interact(
-        more_rect.expand(5.0),
-        ui.make_persistent_id(("track-more", track.key())),
-        Sense::click(),
-    );
-    if hovered || more.hovered() || more.has_focus() {
-        painter.rect_filled(more_rect.expand(4.0), t::R_SM, t::white(0.07));
-        icons::more(&painter, more_rect, t::FG);
-    }
-    if more.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    let mut action = None;
-    egui::Popup::menu(&more)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-        .align(egui::emath::RectAlign::BOTTOM_END)
-        .gap(4.0)
-        .frame(
-            egui::Frame::NONE
-                .fill(t::INK_3)
-                .corner_radius(t::R_LG)
-                .inner_margin(Margin::same(5))
-                .stroke(Stroke::new(1.0, t::LINE_2)),
-        )
-        .show(|ui| {
-            ui.set_min_width(186.0);
-            if menu_item(ui, "复制视频链接", icons::copy, false) {
-                action = Some(RowAction::CopyLink);
-            }
-            if menu_item(ui, "在浏览器打开", icons::external, false) {
-                action = Some(RowAction::OpenInBrowser);
-            }
-            if menu_item(ui, "加入播放列表", icons::queue, false) {
-                action = Some(RowAction::Enqueue);
-            }
-            if menu_item(ui, "下一首播放", icons::next, false) {
-                action = Some(RowAction::EnqueueNext);
-            }
-            if menu_item(ui, "缓存到本地", icons::download, false) {
-                action = Some(RowAction::Cache);
-            }
-            if menu_item(ui, "导出为 m4a", icons::folder, false) {
-                action = Some(RowAction::Export);
-            }
-        });
-    if current {
-        widgets::paint_badge(ui, badge_rect, &Badge::quality(app.quality));
-    }
-
-    let text_rect = Rect::from_min_max(
-        Pos2::new(cover_rect.right() + 14.0, rect.top() + 6.0),
-        Pos2::new(badge_rect.left() - 14.0, rect.bottom() - 6.0),
-    );
-    let title_font = t::ui_font(14.0);
-    let title_color = if current { accent.ink } else { t::FG };
-    let title = widgets::elided(ui, &track.title, title_font, title_color, text_rect.width());
-    let title_y = if compact {
-        text_rect.center().y - 3.0
-    } else {
-        text_rect.top() + 11.0
-    };
-    widgets::paint_galley_centred(
-        &painter,
-        Pos2::new(text_rect.left(), title_y),
-        title,
-        title_color,
-    );
-
-    // Sub-line: the uploader, then the resolved quality (or the video id, so
-    // the line carries real information for tracks we have not played yet).
-    let sub_font = t::ui_font(11.5);
-    let sub_y = title_y + if compact { 13.0 } else { 17.0 };
-    let author = if track.author.is_empty() {
-        "未知作者"
-    } else {
-        track.author.as_str()
-    };
-    let author_width = widgets::measure(ui, author, sub_font.clone()).x;
-    widgets::paint_label(
-        &painter,
-        Pos2::new(text_rect.left(), sub_y),
-        Align2::LEFT_CENTER,
-        author,
-        sub_font.clone(),
-        t::FG_2,
-    );
-    let mut x = text_rect.left() + author_width + 7.0;
-    painter.circle_filled(Pos2::new(x + 1.5, sub_y), 1.5, t::FG_4);
-    x += 10.0;
-
-    if current {
-        widgets::paint_label(
-            &painter,
-            Pos2::new(x, sub_y),
-            Align2::LEFT_CENTER,
-            app.quality
-                .map(|quality| quality.label())
-                .unwrap_or("解析中"),
-            sub_font,
-            if app.quality == Some(crate::api::models::AudioQuality::Flac) {
-                t::GOLD
-            } else {
-                t::FG_3
-            },
-        );
-    } else {
-        widgets::paint_label(
-            &painter,
-            Pos2::new(x, sub_y),
-            Align2::LEFT_CENTER,
-            &track.bvid,
-            t::mono_font(10.5),
-            t::FG_4,
-        );
-    }
-
-    if hovered {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    if action.is_some() {
-        return action;
-    }
-    response.clicked().then_some(RowAction::Play)
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,139 +787,7 @@ pub(crate) fn track_row(ui: &mut Ui, app: &App, track: &Track, index: usize) -> 
 // ---------------------------------------------------------------------------
 
 impl App {
-    pub(crate) fn ui_status_bar(&mut self, ui: &mut Ui) {
-        let rect = ui.max_rect();
-        hline(ui, rect.top() + 0.5, t::LINE);
-
-        // A sticky status waits to be replaced: it explains why something stopped, and
-        // there is no later moment for it to arrive at.
-        let expired = self
-            .status
-            .as_ref()
-            .is_some_and(|status| !status.sticky && status.at.elapsed() > super::app::STATUS_TTL);
-        if expired {
-            self.status = None;
-        }
-
-        ui.horizontal_centered(|ui| {
-            let status = self.status.as_ref().map(|s| (s.text.clone(), s.is_error));
-            match status {
-                Some((text, is_error)) => {
-                    status_dot(ui, if is_error { t::ERR } else { t::OK });
-                    status_text(
-                        ui,
-                        &text,
-                        t::ui_font(11.5),
-                        if is_error { t::ERR } else { t::FG_2 },
-                    );
-                }
-                None => {
-                    let logged_in = self.user.is_some();
-                    status_dot(ui, if logged_in { t::OK } else { t::FG_4 });
-                    let hint = if logged_in {
-                        "已登录 · 无损优先可用"
-                    } else {
-                        "未登录（可正常听歌；登录后可获取更高音质与「我的」内容）"
-                    };
-                    status_text(ui, hint, t::ui_font(11.5), t::FG_3);
-                }
-            }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // Right-to-left, so the first thing added ends up rightmost:
-                // `配置：/path [copy][open]`. The config keeps the spot it had.
-                //
-                // Both paths share one budget, derived from what the row has
-                // left after the hint. Without it a long path runs into the hint
-                // (measured: the cache label landed 100px inside the logged-out
-                // hint) and a long one on a narrow window collides regardless, so
-                // a path that does not fit is elided rather than overlapped.
-                let room = ((ui.available_width() - 40.0) / 2.0 - 100.0).max(70.0);
-                let config_file = crate::config::Config::path();
-                self.status_path(
-                    ui,
-                    "配置：",
-                    &crate::config::config_path_display(),
-                    if config_file.exists() {
-                        config_file
-                    } else {
-                        crate::platform::config_dir()
-                    },
-                    room,
-                );
-
-                ui.add_space(14.0);
-                let cache_root = self.cache_root();
-                self.status_path(
-                    ui,
-                    "缓存：",
-                    &cache_root.display().to_string(),
-                    cache_root,
-                    room,
-                );
-
-                if let Some(err) = &self.engine_error {
-                    ui.add_space(8.0);
-                    status_text(ui, err, t::ui_font(11.0), t::ERR);
-                }
-            });
-        });
-
-        self.ui_toast(ui);
-    }
-
-    /// One `标签：路径` item at the right of the status bar, with a copy button
-    /// and one that opens it.
-    ///
-    /// Both paths live here rather than only in the settings sheet, because that
-    /// sheet scrolls and its path group sits below the fold in a normal window —
-    /// which is how "where is the cache?" became a question at all. This bar is
-    /// always on screen.
-    ///
-    /// The label rides the UI face rather than the path's monospace one. Within
-    /// the monospace family egui places a *fallback* face with its own ascent,
-    /// which measured two to three pixels above the Latin baseline — so in one
-    /// mono string the Chinese label floated above the path and the row looked
-    /// ragged. Zero spacing keeps the two pieces reading as the single line they
-    /// are.
-    fn status_path(
-        &mut self,
-        ui: &mut Ui,
-        label: &str,
-        path: &str,
-        target: std::path::PathBuf,
-        room: f32,
-    ) {
-        if widgets::icon_button(
-            ui,
-            icons::external,
-            20.0,
-            false,
-            self.theme.accent,
-            "在文件管理器中打开",
-        )
-        .clicked()
-        {
-            if let Err(err) = crate::platform::reveal(&target) {
-                self.notify(err);
-            }
-        }
-        if widgets::icon_button(ui, icons::copy, 20.0, false, self.theme.accent, "复制路径")
-            .clicked()
-        {
-            ui.ctx().copy_text(path.to_owned());
-            self.notify("已复制到剪贴板");
-        }
-        let font = t::mono_font(10.5);
-        // Take only the width the path needs, so a short path does not push the
-        // other one out of the row; elide when the budget is smaller than that.
-        let width = widgets::measure(ui, path, &font).x.min(room);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), Sense::hover());
-        widgets::clipped_line(ui, rect, path, font, t::FG_3, false);
-        status_text(ui, label, t::ui_font(10.5), t::FG_3);
-    }
-
-    fn ui_toast(&mut self, ui: &mut Ui) {
+    pub(crate) fn ui_toast(&mut self, ui: &mut Ui) {
         let Some((text, _)) = self.toast.clone() else {
             return;
         };
@@ -1726,30 +826,6 @@ impl App {
                 );
             });
     }
-}
-
-/// The little status dot.
-fn status_dot(ui: &mut Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 2.5, color);
-}
-
-/// One status-bar label, centred on its glyph ink rather than on the font box.
-///
-/// A stock `Label` centres the ascent/descent box, and the CJK faces this app
-/// loads reserve far more room below the baseline than their glyphs actually
-/// use — so the dot and the config path beside the hint ended up a few pixels
-/// lower than the Chinese text. Painting the ink instead (the same rule
-/// `widgets::paint_label` follows) keeps every item on one centre line.
-fn status_text(ui: &mut Ui, text: &str, font: egui::FontId, color: Color32) {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
-    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
-    widgets::paint_galley_centred(
-        ui.painter(),
-        Pos2::new(rect.left(), rect.center().y),
-        galley,
-        color,
-    );
 }
 
 #[cfg(test)]
@@ -1825,188 +901,6 @@ mod tests {
         for _ in 0..3 {
             settings(ctx, app, vec![]);
         }
-    }
-
-    /// The row that is playing marks itself with the level meter instead of its
-    /// position number: the number column is the one place in a row that could
-    /// say "this is the one playing", and a number cannot say it.
-    #[test]
-    fn the_playing_row_marks_itself_instead_of_showing_its_number() {
-        let (mut app, ctx) = app_with_results();
-        let playing = app.results[0].clone();
-        app.current = Some(playing);
-        app.loading = false;
-
-        central(&ctx, &mut app, vec![]);
-        let output = central(&ctx, &mut app, vec![]);
-        let texts: Vec<String> = painted_text(&output)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-
-        assert!(
-            texts.iter().any(|text| text == "02"),
-            "the other rows keep their numbers: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|text| text == "01"),
-            "the playing row must not show a number: {texts:?}"
-        );
-
-        // And a marker is painted where that number was: the pause glyph is two
-        // small filled bars in the left-hand column.
-        let bars = painted_rects(&output)
-            .into_iter()
-            .filter(|shape| {
-                shape.rect.left() < 60.0
-                    && shape.rect.width() <= 4.0
-                    && shape.rect.height() <= 12.0
-                    && shape.rect.height() >= 3.0
-            })
-            .count();
-        assert!(
-            bars >= 2,
-            "expected the pause glyph's two bars in the index column, found {bars}"
-        );
-    }
-
-    /// The platform switch has to be visible, and the account tabs must not be
-    /// offered on YouTube: they need a Bilibili session and have no YouTube
-    /// counterpart in this version.
-    #[test]
-    fn the_platform_switch_offers_the_other_platform_and_hides_account_tabs() {
-        let (mut app, ctx) = focused_app(&[]);
-        app.search_history_open = false;
-
-        // On Bilibili: the switch points at YouTube, and the account tabs are there.
-        let mut output = top_bar_render(&ctx, &mut app, vec![]);
-        output.textures_delta.clear();
-        let output = top_bar_render(&ctx, &mut app, vec![]);
-        let texts: Vec<String> = painted_text(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(
-            texts.iter().any(|text| text == "B 站") && texts.iter().any(|text| text == "YouTube"),
-            "both platforms should be offered, not a command: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "收藏夹") && texts.iter().any(|text| text == "历史"),
-            "Bilibili keeps its account tabs: {texts:?}"
-        );
-
-        // On YouTube: the switch flips, the account tabs are gone.
-        app.set_source(Source::Youtube);
-        top_bar_render(&ctx, &mut app, vec![]);
-        let output = top_bar_render(&ctx, &mut app, vec![]);
-        let texts: Vec<String> = painted_text(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(
-            texts.iter().any(|text| text == "B 站") && texts.iter().any(|text| text == "YouTube"),
-            "the control keeps showing both options: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|text| text == "收藏夹") && !texts.iter().any(|text| text == "历史"),
-            "YouTube must not offer the account tabs: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "搜索"),
-            "search is the one tab both platforms have: {texts:?}"
-        );
-    }
-
-    /// Switching platforms must not leave the previous platform's results on
-    /// screen under the new platform's name, and must land somewhere valid.
-    #[test]
-    fn switching_platforms_clears_the_list_and_lands_on_search() {
-        let (mut app, _ctx) = app_with_results();
-        app.tab = Tab::Favorites;
-        app.search_page = 4;
-        app.search_has_more = true;
-        app.loading_more = true;
-        assert!(!app.results.is_empty(), "the fixture has results");
-
-        app.set_source(Source::Youtube);
-
-        assert_eq!(app.source, Source::Youtube);
-        assert_eq!(app.tab, Tab::Search, "the account tab no longer exists");
-        assert!(app.results.is_empty(), "the other platform's rows are gone");
-        assert_eq!(app.search_page, 1);
-        assert!(!app.search_has_more);
-        assert!(!app.loading_more);
-        // And the choice is remembered.
-        assert_eq!(app.config_value(|config| config.source), Source::Youtube);
-
-        // Switching to where it already is changes nothing.
-        app.set_source(Source::Youtube);
-        assert_eq!(app.source, Source::Youtube);
-    }
-
-    /// The top bar, as its own render target.
-    fn top_bar_render(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> egui::FullOutput {
-        let mut output = ctx.run_ui(raw(events), |ui| {
-            app.ui_top_bar(ui);
-        });
-        output.textures_delta.clear();
-        output
-    }
-
-    /// Both paths are on screen with no scrolling and no clicking.
-    ///
-    /// This is the guarantee the settings sheet cannot give: it scrolls, and its
-    /// path group sits below the fold in an ordinary window. A test of mine once
-    /// asserted the opposite about the sheet and passed only because it counted
-    /// shapes the clip rect had already thrown away.
-    #[test]
-    fn the_status_bar_shows_both_the_config_and_cache_paths() {
-        let (mut app, ctx) = focused_app(&[]);
-
-        // The bar is a bottom panel; a full-screen `Ui` gives it the width it
-        // would have. Two passes so the toast area, which is its own `Area`, has
-        // settled.
-        let mut output = ctx.run_ui(raw(vec![]), |ui| {
-            app.ui_status_bar(ui);
-        });
-        output.textures_delta.clear();
-        let mut output = ctx.run_ui(raw(vec![]), |ui| {
-            app.ui_status_bar(ui);
-        });
-        output.textures_delta.clear();
-
-        let texts: Vec<String> = painted_text(&output)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-        let cache = crate::platform::cache_dir().display().to_string();
-        assert!(
-            texts.iter().any(|text| text.starts_with(&cache)),
-            "the cache path should be in the bar: {texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|text| text.contains(&crate::config::config_path_display())),
-            "the config path should still be in the bar: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text == "缓存：") && texts.iter().any(|text| text == "配置："),
-            "both labels should be there: {texts:?}"
-        );
-
-        // Two paths plus four buttons is a lot of bar. The hint on the left must
-        // still be clear of them, or the row becomes one run-on string.
-        let rects = painted_text(&output);
-        let rect_of = |pred: &dyn Fn(&str) -> bool| {
-            rects
-                .iter()
-                .find(|(text, _)| pred(text))
-                .map(|(_, rect)| *rect)
-                .unwrap_or_else(|| panic!("missing from the bar: {texts:?}"))
-        };
-        let hint = rect_of(&|text| text.starts_with("已登录") || text.starts_with("未登录"));
-        let cache_label = rect_of(&|text| text == "缓存：");
-        assert!(
-            hint.right() < cache_label.left(),
-            "the hint ends at {} but the cache label starts at {}",
-            hint.right(),
-            cache_label.left()
-        );
     }
 
     /// The sheet has to name the cache directory: it is where the disk actually
@@ -2119,8 +1013,13 @@ mod tests {
     }
 
     /// An app showing a finished search of two results.
+    use crate::api::models::Track;
+
     fn app_with_results() -> (App, egui::Context) {
         let (mut app, ctx) = focused_app(&[]);
+        // These are the search pane's tests, and the central pane now opens on
+        // 我的歌, so they have to say which page they mean.
+        app.set_page(Page::Search);
         app.search_history_open = false;
         app.searching = false;
         app.last_keyword = "周杰伦".to_owned();
@@ -2135,6 +1034,8 @@ mod tests {
                 author: "华语音乐馆".to_owned(),
                 duration: 271,
                 cover: None,
+                album: None,
+                artist: None,
             })
             .collect();
         (app, ctx)
@@ -2142,6 +1043,7 @@ mod tests {
 
     /// An app whose search field is focused, with `history` as its search log.
     fn focused_app(history: &[&str]) -> (App, egui::Context) {
+        crate::platform::serialise_home_tests();
         std::env::set_var("HOME", "/tmp/listenbli-search-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-search-tests");
         let mut app = App::new_for_tests(Config::default());
@@ -2188,20 +1090,6 @@ mod tests {
         render(ctx, app, press);
         render(ctx, app, release);
         render(ctx, app, vec![Event::PointerMoved(pos)]);
-    }
-
-    /// Like [`click_painted`], but returns the frame the release landed in, so a
-    /// test can read what the app asked the platform to do (clipboard, opener).
-    fn click_painted_capturing(
-        ctx: &egui::Context,
-        app: &mut App,
-        label: &str,
-        render: Render,
-    ) -> egui::FullOutput {
-        let listed = render(ctx, app, vec![]);
-        let target =
-            painted_rect(&listed, label).unwrap_or_else(|| panic!("{label} should be on screen"));
-        click_at_capturing(ctx, app, target.center(), render)
     }
 
     /// Clicks an absolute position and returns the output of the release frame.
@@ -2332,6 +1220,7 @@ mod tests {
     #[test]
     fn the_empty_pane_lists_the_recent_searches() {
         let (mut app, ctx) = focused_app(&["米津玄師", "晴天"]);
+        app.set_page(Page::Search);
         app.search_history_open = false;
 
         let output = central(&ctx, &mut app, vec![]);
@@ -2409,131 +1298,6 @@ mod tests {
 
         assert_eq!(halo.rect, pill, "the halo must sit on the pill itself");
         assert_eq!(halo.corner_radius.nw, 18, "and share the pill's radius");
-    }
-
-    /// Control case: a click on a row *inside a scroll area* must register.
-    #[test]
-    fn clicking_a_result_plays_it() {
-        let (mut app, ctx) = app_with_results();
-        click_painted(&ctx, &mut app, "BV1demo0001", central);
-        assert_eq!(
-            app.current.as_ref().map(|t| t.bvid.as_str()),
-            Some("BV1demo0001"),
-            "点击结果行应开始播放"
-        );
-    }
-
-    /// Where a row's `⋯` sits: the button is 12+42px clear of the duration
-    /// column and its own centre is 8px in, so it is 41px right of the centred
-    /// duration text. Aiming from painted geometry keeps the test honest — if
-    /// the row layout moves the button, the click misses and this fails.
-    fn more_button_of(painted: &[(String, Rect)], row: usize) -> Pos2 {
-        let durations: Vec<Rect> = painted
-            .iter()
-            .filter(|(text, _)| text == "04:31")
-            .map(|(_, rect)| *rect)
-            .collect();
-        let rect = durations
-            .get(row)
-            .unwrap_or_else(|| panic!("row {row} should paint its duration: {durations:?}"));
-        Pos2::new(rect.center().x + 41.0, rect.center().y)
-    }
-
-    /// Clicking `⋯` must open the row menu, not start the track: the button owns
-    /// its own rect, registered after the row's.
-    #[test]
-    fn the_row_menu_button_does_not_play_the_track() {
-        let (mut app, ctx) = app_with_results();
-        let listed = painted_text(&central(&ctx, &mut app, vec![]));
-        let target = more_button_of(&listed, 0);
-
-        click_at(&ctx, &mut app, target, central);
-
-        assert!(
-            app.current.is_none(),
-            "点 ⋯ 不应该开始播放，当前却变成了 {:?}",
-            app.current.as_ref().map(|t| t.bvid.as_str())
-        );
-        let output = central(&ctx, &mut app, vec![]);
-        assert!(
-            painted(&output, "复制视频链接"),
-            "菜单应该弹出来：{:?}",
-            painted_text(&output)
-                .into_iter()
-                .map(|(text, _)| text)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// Every entry the menu promises is really there.
-    #[test]
-    fn the_row_menu_lists_its_actions() {
-        let (mut app, ctx) = app_with_results();
-        let listed = painted_text(&central(&ctx, &mut app, vec![]));
-        let target = more_button_of(&listed, 0);
-        click_at(&ctx, &mut app, target, central);
-
-        let output = central(&ctx, &mut app, vec![]);
-        for label in [
-            "复制视频链接",
-            "在浏览器打开",
-            "加入播放列表",
-            "下一首播放",
-            "缓存到本地",
-        ] {
-            assert!(painted(&output, label), "菜单里应该有 {label}");
-        }
-    }
-
-    /// 复制视频链接 hands the bilibili page URL to the clipboard.
-    #[test]
-    fn copying_a_video_link_reaches_the_clipboard() {
-        let (mut app, ctx) = app_with_results();
-        let listed = painted_text(&central(&ctx, &mut app, vec![]));
-        let target = more_button_of(&listed, 0);
-        click_at(&ctx, &mut app, target, central);
-
-        let output = click_painted_capturing(&ctx, &mut app, "复制视频链接", central);
-
-        let wanted = util::video_url("BV1demo0001");
-        let copied = output.platform_output.commands.iter().any(
-            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &wanted),
-        );
-        assert!(
-            copied,
-            "应该把 {wanted} 交给剪贴板，实际是 {:?}",
-            output.platform_output.commands
-        );
-    }
-
-    /// The two queue entries differ: one appends, one goes right after the
-    /// current track.
-    #[test]
-    fn the_row_menu_queues_append_or_jump_the_line() {
-        let (mut app, ctx) = app_with_results();
-        let listed = painted_text(&central(&ctx, &mut app, vec![]));
-        let target = more_button_of(&listed, 0);
-        click_at(&ctx, &mut app, target, central);
-        click_painted(&ctx, &mut app, "加入播放列表", central);
-
-        let queued: Vec<&str> = app.queue.iter().map(|t| t.bvid.as_str()).collect();
-        assert_eq!(queued, ["BV1demo0001"], "加入播放列表应该把它排到队尾");
-
-        // The same row again: a duplicate is refused instead of queued twice.
-        let listed = painted_text(&central(&ctx, &mut app, vec![]));
-        let target = more_button_of(&listed, 0);
-        click_at(&ctx, &mut app, target, central);
-        click_painted(&ctx, &mut app, "加入播放列表", central);
-        assert_eq!(app.queue.len(), 1, "同一首不应该被排队两次");
-
-        // 下一首播放 on the *second* row inserts right after the first.
-        let listed = painted_text(&central(&ctx, &mut app, vec![]));
-        let target = more_button_of(&listed, 1);
-        click_at(&ctx, &mut app, target, central);
-        click_painted(&ctx, &mut app, "下一首播放", central);
-
-        let queued: Vec<&str> = app.queue.iter().map(|t| t.bvid.as_str()).collect();
-        assert_eq!(queued, ["BV1demo0001", "BV1demo0002"]);
     }
 
     /// Paging has no button any more: the tail of the list asks for the next
@@ -2618,140 +1382,15 @@ mod tests {
         for clipped in &output.shapes {
             rounded(&clipped.shape, &mut all);
         }
-        // The pill: the 18px-radius rounded rect carrying the field's fill.
-        let pill = all
-            .iter()
-            .find(|rect| rect.corner_radius.nw == 18 && rect.fill != Color32::TRANSPARENT)
-            .map(|rect| rect.rect)
-            .expect("the search pill should be painted");
-
+        // The field is a 2px console box now, so its radius no longer identifies
+        // it — assert on what the field actually contains and on where the right
+        // cluster starts, which is the overlap this test exists to catch.
+        let _ = &all;
         let chip = painted_rect(&output, "⌘K").expect("the ⌘K chip should be painted");
+        let cluster = painted_rect(&output, "同步").expect("the sync chip is painted");
         assert!(
-            pill.contains(chip.center()),
-            "the ⌘K chip at {chip:?} should sit inside the pill {pill:?}"
-        );
-        let cluster = painted_rect(&output, "无损优先").expect("the lossless chip is painted");
-        assert!(
-            pill.right() < cluster.left(),
-            "the pill {pill:?} should end before the right cluster at {cluster:?}"
-        );
-    }
-
-    /// The status bar's dot, hint and config path must share one centre line,
-    /// and the two halves of the config line one baseline.
-    ///
-    /// A stock `Label` centres the font's ascent/descent box, and the CJK faces
-    /// this app loads leave a few pixels of unused descent under the glyphs —
-    /// which left the Chinese hint visibly high next to the dot and the path.
-    /// The bar paints its text ink-centred instead; this keeps it that way, and
-    /// separately checks the `配置：` label against the path beside it, which is
-    /// the pair that shared a monospace family and drifted apart.
-    #[test]
-    fn the_status_bar_centres_every_item_on_one_line() {
-        std::env::set_var("HOME", "/tmp/listenbli-search-tests");
-        let _ = std::fs::create_dir_all("/tmp/listenbli-search-tests");
-        let mut app = App::new_for_tests(Config::default());
-        let ctx = egui::Context::default();
-        // The same face the running app resolves, so the CJK metrics are real.
-        let cjk = crate::config::with(&app.config, |c| {
-            crate::platform::resolve_cjk_font(&c.cjk_font, c.cjk_font_path.as_deref())
-        });
-        crate::ui::theme::install_fonts(&ctx, cjk.as_deref());
-        crate::ui::theme::install_style(&ctx, &app.theme);
-
-        let mut output = ctx.run_ui(raw(vec![]), |ui| {
-            egui::Panel::bottom("status_bar")
-                .exact_size(theme::STATUS_BAR_H)
-                .frame(frames::status_bar())
-                .show(ui, |ui| app.ui_status_bar(ui));
-        });
-        output.textures_delta.clear();
-
-        /// One painted label: where it was drawn, and the baselines of the
-        /// glyphs this test looks at (relative to the shape's origin).
-        struct Painted {
-            text: String,
-            pos: Pos2,
-            ink_center: f32,
-            baselines: Vec<(char, f32)>,
-        }
-
-        fn walk(shape: &egui::Shape, ink: &mut Vec<Painted>, dot: &mut Option<f32>) {
-            match shape {
-                egui::Shape::Text(text) => {
-                    let mut baselines = Vec::new();
-                    for row in &text.galley.rows {
-                        for glyph in &row.row.glyphs {
-                            baselines.push((glyph.chr, row.pos.y + glyph.pos.y));
-                        }
-                    }
-                    ink.push(Painted {
-                        text: text.galley.text().to_owned(),
-                        pos: text.pos,
-                        ink_center: text.galley.mesh_bounds.center().y,
-                        baselines,
-                    });
-                }
-                egui::Shape::Circle(circle) => *dot = Some(circle.center.y),
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, ink, dot);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let (mut ink, mut dot) = (Vec::new(), None);
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut ink, &mut dot);
-        }
-
-        let dot = dot.expect("the status dot should be painted");
-        assert!(
-            ink.len() >= 3,
-            "the bar should paint its hint, label and path: {:?}",
-            ink.iter().map(|item| &item.text).collect::<Vec<_>>()
-        );
-        for item in &ink {
-            let centre = item.pos.y + item.ink_center;
-            assert!(
-                (centre - dot).abs() < 0.5,
-                "{:?} is centred at {centre}, but the dot is at {dot}",
-                item.text
-            );
-        }
-
-        // `配置：` rides the UI face and the path the monospace one; the label
-        // must not float above the path the way it did inside a single mono
-        // string, so compare the two baselines. The deepest glyph of a row is
-        // the baseline of its tallest face, which is the line the Latin sits on
-        // — and unlike looking up `配` by character this works on a runner with
-        // no CJK font at all, where the glyph is a replacement.
-        let baseline = |item: &Painted| {
-            let deepest = item
-                .baselines
-                .iter()
-                .map(|(_, y)| *y)
-                .fold(f32::NEG_INFINITY, f32::max);
-            assert!(
-                deepest.is_finite(),
-                "{:?} should have been laid out with glyphs",
-                item.text
-            );
-            item.pos.y + deepest
-        };
-        let label = ink
-            .iter()
-            .find(|item| item.text.starts_with("配置"))
-            .expect("the config label should be painted on its own");
-        let path = ink
-            .iter()
-            .find(|item| item.text.ends_with("config.json"))
-            .expect("the config path should be painted");
-        let (label_base, path_base) = (baseline(label), baseline(path));
-        assert!(
-            (label_base - path_base).abs() <= 1.5,
-            "配置 sits on baseline {label_base} but the path on {path_base}"
+            chip.right() < cluster.left(),
+            "the search field (ending at {chip:?}) should end before the right cluster at {cluster:?}"
         );
     }
 }

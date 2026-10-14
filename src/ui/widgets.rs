@@ -9,7 +9,10 @@ use egui::{
 };
 
 use super::icons::Icon;
-use super::theme::{self, mono_font, ui_font, Accent};
+use super::theme::{
+    self, fade, mono_font, ui_font, Accent, FG, FG_2, FG_3, FG_4, INK_1, INK_3, INK_4, LINE,
+    LINE_2, LINE_3, R_LG, R_MD, R_SM,
+};
 use crate::api::models::{AudioQuality, Track};
 
 // ---------------------------------------------------------------------------
@@ -165,6 +168,48 @@ pub fn label_at_bold(ui: &Ui, pos: Pos2, anchor: Align2, text: &str, font: FontI
         font,
         color,
     );
+}
+
+/// How much letter spacing a label wants. The console's instrument feel comes
+/// from wide tracking on Latin micro-labels, but the same spacing on Hanzi reads
+/// as broken type — CJK wants almost none.
+pub fn tracking_for(text: &str) -> f32 {
+    if text.chars().any(|c| c as u32 > 0x2E80) {
+        theme::TRACKING_CJK
+    } else {
+        theme::TRACKING
+    }
+}
+
+/// Measures an engraved label. `measure` cannot be used for these: it lays out
+/// without tracking, so anything centred or right-aligned from its result would
+/// sit a few pixels off.
+pub fn engraved_measure(ui: &Ui, text: &str, size: f32) -> Vec2 {
+    theme::tracked_galley(ui.painter(), text, size, theme::FG, tracking_for(text)).size()
+}
+
+/// An engraved micro-label: small, letterspaced, and the console's default way of
+/// naming a block of things.
+pub fn engraved_at(
+    ui: &Ui,
+    pos: Pos2,
+    anchor: Align2,
+    text: &str,
+    size: f32,
+    color: Color32,
+) -> Rect {
+    if text.is_empty() {
+        return Rect::NOTHING;
+    }
+    let galley = theme::tracked_galley(ui.painter(), text, size, color, tracking_for(text));
+    let rect = anchor.anchor_size(pos, galley.size());
+    let top_left = if anchor.y() == Align::Center {
+        Pos2::new(rect.min.x, pos.y - ink_center(&galley))
+    } else {
+        rect.min
+    };
+    ui.painter().galley(top_left, galley, color);
+    rect
 }
 
 /// A single elided line, left- or right-aligned inside `rect`, vertically
@@ -687,7 +732,9 @@ pub fn paint_cover(
     track: Option<&Track>,
     texture: Option<&TextureHandle>,
 ) {
-    let radius = if rect.width() >= 50.0 { 11.0 } else { 9.0 };
+    // The console's corners, not the old pills: a cover is a plate like
+    // everything else.
+    let radius = if rect.width() >= 50.0 { R_LG } else { R_MD };
     if let Some(texture) = texture {
         // Keep the rounded frame painted underneath so corners never flash
         // square while the bitmap is being swapped.
@@ -995,4 +1042,345 @@ mod tests {
             "paragraph leading should be {expected}, got {step}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// console controls
+// ---------------------------------------------------------------------------
+
+/// How much emphasis a console button carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Emphasis {
+    /// A hairline box: the default for anything that is not the point of the page.
+    Ghost,
+    /// The signal colour, for the one action a page is really offering.
+    Primary,
+}
+
+/// The console's button: a square hairline box, or an amber-tinted one.
+///
+/// `ghost_button` predates the redesign and breathes a pill; this is the same
+/// idea on the new grid, so pages get one spelling.
+pub fn console_button(
+    ui: &mut Ui,
+    label: &str,
+    icon: Option<Icon>,
+    emphasis: Emphasis,
+    accent: Accent,
+) -> Response {
+    let font = ui_font(11.5);
+    let text_w = if label.is_empty() {
+        0.0
+    } else {
+        measure(ui, label, &font).x
+    };
+    let icon_w = if icon.is_some() { 18.0 } else { 0.0 };
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(text_w + icon_w + 22.0, 26.0), Sense::click());
+    let painter = ui.painter().clone();
+    let hovered = response.hovered();
+    let (fill, stroke, fg) = match emphasis {
+        Emphasis::Primary => (
+            if hovered {
+                fade(accent.accent, 0.28)
+            } else {
+                accent.dim()
+            },
+            fade(accent.accent, 0.5),
+            accent.ink,
+        ),
+        Emphasis::Ghost => (
+            if hovered { INK_3 } else { Color32::TRANSPARENT },
+            if hovered { LINE_3 } else { LINE_2 },
+            if hovered { FG } else { FG_2 },
+        ),
+    };
+    painter.rect_filled(rect, R_SM, fill);
+    painter.rect_stroke(
+        rect,
+        R_SM,
+        Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let mut x = rect.left() + 11.0;
+    if let Some(icon) = icon {
+        let icon_rect =
+            Rect::from_center_size(Pos2::new(x + 6.0, rect.center().y), Vec2::splat(12.0));
+        icon(&painter, icon_rect, fg);
+        x += 18.0;
+    }
+    paint_label(
+        &painter,
+        Pos2::new(x, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        fg,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// The console's segmented control: square cells in one hairline box, with the
+/// signal colour underlined under the active cell.
+///
+/// Returns the index that was clicked, if any. `segmented` remains the older
+/// pill version, which the settings sheet still uses.
+pub fn segmented_engraved(ui: &mut Ui, options: &[&str], selected: usize) -> Option<usize> {
+    let accent = super::theme::ACCENTS[0];
+    let font = ui_font(11.5);
+    let mut widths = Vec::with_capacity(options.len());
+    for option in options {
+        widths.push(measure(ui, option, &font).x + 22.0);
+    }
+    let total: f32 = widths.iter().sum::<f32>() + 2.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 26.0), Sense::hover());
+    let painter = ui.painter().clone();
+    painter.rect_stroke(
+        rect,
+        R_SM,
+        Stroke::new(1.0, LINE_2),
+        egui::StrokeKind::Inside,
+    );
+
+    let mut clicked = None;
+    let mut x = rect.left() + 1.0;
+    for (index, option) in options.iter().enumerate() {
+        let cell = Rect::from_min_size(
+            Pos2::new(x, rect.top()),
+            Vec2::new(widths[index], rect.height()),
+        );
+        let response = ui.interact(cell, ui.id().with(("seg", index, option)), Sense::click());
+        let active = index == selected;
+        if active {
+            painter.rect_filled(cell, 0.0, INK_4);
+            painter.hline(
+                cell.x_range(),
+                cell.bottom() - 1.5,
+                Stroke::new(2.0, accent.accent),
+            );
+        } else if response.hovered() {
+            painter.rect_filled(cell, 0.0, INK_3);
+        }
+        paint_label(
+            &painter,
+            cell.center(),
+            Align2::CENTER_CENTER,
+            option,
+            font.clone(),
+            if active {
+                FG
+            } else if response.hovered() {
+                FG_2
+            } else {
+                FG_3
+            },
+        );
+        if index + 1 < options.len() {
+            painter.vline(cell.right(), cell.y_range(), Stroke::new(1.0, LINE));
+        }
+        if response.clicked() {
+            clicked = Some(index);
+        }
+        x += widths[index];
+    }
+    clicked
+}
+
+/// How much room a console tag needs.
+///
+/// Split from the painting so a centred row can be measured and placed exactly —
+/// which is what 正在播放's facts row is.
+pub fn tag_size(ui: &Ui, text: &str, icon: Option<Icon>, led: bool) -> Vec2 {
+    let font = ui_font(10.0);
+    let text_w = measure(ui, text, &font).x;
+    let icon_w = if icon.is_some() { 14.0 } else { 0.0 };
+    let led_w = if led { 12.0 } else { 0.0 };
+    Vec2::new(text_w + icon_w + led_w + 14.0, 20.0)
+}
+
+/// Paints a console tag into a rect somebody else measured.
+///
+/// `tint` overrides the ink: the signal colour for a tag that really is saying
+/// "this is the current one", or the red for 已回退, which is a warning rather
+/// than a highlight.
+#[allow(clippy::too_many_arguments)] // a painter's parameters, not a caller's choices
+pub fn tag_at(
+    ui: &Ui,
+    rect: Rect,
+    text: &str,
+    icon: Option<Icon>,
+    led: Option<super::theme::Led>,
+    tint: Option<Color32>,
+    accent: Accent,
+) {
+    let painter = ui.painter();
+    let font = ui_font(10.0);
+    let color = tint.unwrap_or(FG_2);
+    painter.rect_stroke(
+        rect,
+        R_SM,
+        Stroke::new(1.0, fade(color, 0.4)),
+        egui::StrokeKind::Inside,
+    );
+    let mut x = rect.left() + 7.0;
+    if let Some(led) = led {
+        super::theme::led(painter, Pos2::new(x + 4.0, rect.center().y), led, accent);
+        x += 12.0;
+    }
+    if let Some(icon) = icon {
+        icon(
+            painter,
+            Rect::from_center_size(Pos2::new(x + 5.0, rect.center().y), Vec2::splat(11.0)),
+            color,
+        );
+        x += 14.0;
+    }
+    paint_label(
+        painter,
+        Pos2::new(x, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+}
+
+/// A small bordered label — the console's `.a-tag`, laid out in the current row.
+pub fn console_tag(
+    ui: &mut Ui,
+    text: &str,
+    icon: Option<Icon>,
+    tone: bool,
+    accent: Accent,
+) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(tag_size(ui, text, icon, false), Sense::hover());
+    tag_at(
+        ui,
+        rect,
+        text,
+        icon,
+        None,
+        if tone { Some(accent.accent) } else { None },
+        accent,
+    );
+    rect
+}
+
+/// The console's note: a bordered box with an icon and one sentence.
+///
+/// The design reaches for this wherever the interface has to admit something
+/// quietly — no lyrics, a playlist that cannot be edited. The big centred
+/// `empty_state` is for a pane with nothing in it at all, which is a different
+/// thing from a pane that is working and has one thing to say.
+pub fn note(ui: &mut Ui, icon: Icon, text: &str) -> Rect {
+    let font = ui_font(11.5);
+    let full = ui.available_width();
+    let width = (full - 32.0).max(80.0);
+    let text_w = (width - 12.0 - 13.0 - 10.0 - 12.0).max(40.0);
+    let galley = ui.painter().layout(text.to_owned(), font, FG_3, text_w);
+    let height = galley.size().y + 21.0;
+
+    ui.add_space(2.0);
+    let (row, _) = ui.allocate_exact_size(Vec2::new(full, height), Sense::hover());
+    let rect = Rect::from_min_size(
+        Pos2::new(row.left() + 16.0, row.top()),
+        Vec2::new(width, height),
+    );
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, R_SM, INK_1);
+    painter.rect_stroke(rect, R_SM, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+    icon(
+        &painter,
+        Rect::from_min_size(
+            Pos2::new(
+                rect.left() + 12.0,
+                rect.top() + 10.0 + (galley.size().y - 13.0).max(0.0) / 2.0,
+            ),
+            Vec2::splat(13.0),
+        ),
+        FG_4,
+    );
+    painter.galley(
+        Pos2::new(rect.left() + 12.0 + 13.0 + 10.0, rect.top() + 10.0),
+        galley,
+        FG_3,
+    );
+    rect
+}
+
+/// One line of the design's `.input`: mono text on a black wash with a hairline,
+/// plus the accent focus ring. The caller decides what a commit means.
+///
+/// `placeholder` is painted in the field while it is empty, so a hint can show
+/// what the value would default to without being mistaken for the value itself.
+pub fn text_field(
+    ui: &mut Ui,
+    text: &mut String,
+    placeholder: &str,
+    width: f32,
+    accent: theme::Accent,
+) -> egui::Response {
+    let input = egui::Frame::NONE
+        .fill(Color32::from_black_alpha(102))
+        .corner_radius(theme::R_SM)
+        .stroke(Stroke::new(1.0, theme::LINE))
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let font = theme::mono_font(11.5);
+            let offset = field_text_offset(ui.painter(), &font);
+            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                field_galley(ui, buf.as_str(), &font, theme::FG, offset, wrap)
+            };
+            let response = ui.add(
+                egui::TextEdit::singleline(text)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    // `min_size` is a floor, not a width: without this the field
+                    // stretches to whatever is left in the row, which is wrong the
+                    // moment two of them share a line.
+                    .desired_width(width)
+                    .min_size(Vec2::new(width, 32.0))
+                    .vertical_align(Align::Center)
+                    .layouter(&mut layouter)
+                    .font(font.clone())
+                    .text_color(theme::FG),
+            );
+            if text.is_empty() && !placeholder.is_empty() {
+                paint_label(
+                    ui.painter(),
+                    response.rect.left_center(),
+                    Align2::LEFT_CENTER,
+                    placeholder,
+                    font,
+                    theme::FG_4,
+                );
+            }
+            response
+        });
+
+    let response = input.inner;
+    if response.has_focus() {
+        let painter = ui.painter().clone();
+        painter.rect_stroke(
+            input.response.rect,
+            theme::R_SM,
+            Stroke::new(1.0, theme::fade(accent.accent, 0.5)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            input.response.rect.expand(3.0),
+            11.0,
+            Stroke::new(3.0, accent.dim()),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response
 }

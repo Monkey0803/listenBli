@@ -43,6 +43,11 @@ pub fn fav_items(api: &Api, media_id: i64, page: u32) -> Result<(Vec<Track>, boo
             author: m.upper.map(|u| u.name).unwrap_or_default(),
             duration: m.duration,
             cover: util::normalize_url(&m.cover),
+            // A favourite entry is a video: the owner is the uploader, and the
+            // folder response carries no album. Both stay empty rather than
+            // guessing from `upper`.
+            album: None,
+            artist: None,
         })
         .collect();
 
@@ -75,6 +80,10 @@ pub fn history(api: &Api, max: i64, view_at: i64) -> Result<Vec<Track>, ApiError
                 author: item.author_name,
                 duration: item.duration,
                 cover: util::normalize_url(&item.cover),
+                // History rows are videos; `author_name` is the uploader and no
+                // album is ever reported.
+                album: None,
+                artist: None,
             })
         })
         .collect())

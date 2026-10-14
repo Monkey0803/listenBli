@@ -156,6 +156,8 @@ mod tests {
             author: "Rick Astley".into(),
             duration,
             cover: None,
+            album: None,
+            artist: None,
         }
     }
 

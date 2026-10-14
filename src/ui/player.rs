@@ -7,12 +7,25 @@ use crate::net::human_bytes;
 use crate::util;
 
 use super::icons;
+use super::songs;
 use super::theme::{self as t};
 use super::widgets;
 use crate::app::App;
 
 impl App {
     pub(crate) fn ui_player_bar(&mut self, ui: &mut Ui) {
+        // A panel's frame reports only the rect its content actually *used*, and
+        // the neighbouring panels are inset by exactly that — so a deck shorter
+        // than its strip silently shrinks the strip, and the rail and the page
+        // then draw over the deck's top. Allocating the whole strip up front is
+        // what makes `exact_size(DECK_H)` true for everyone else too.
+        let strip = ui.available_size();
+        ui.allocate_ui_with_layout(strip, Layout::top_down(Align::Min), |ui| {
+            self.player_bar_body(ui);
+        });
+    }
+
+    fn player_bar_body(&mut self, ui: &mut Ui) {
         let accent = self.theme.accent;
         let total = ui.available_width();
         let gap = 20.0;
@@ -34,6 +47,13 @@ impl App {
             accent.accent,
             if self.current.is_some() { 0.24 } else { 0.06 },
         );
+
+        // The deck is 96px tall and its content is ~79px, so centre it: the layout
+        // would otherwise pin everything to the top edge, which read as a clipped
+        // bar once the plate grew from the old 78px.
+        const CONTENT_H: f32 = 56.0;
+        let slack = (ui.available_height() - CONTENT_H).max(0.0);
+        ui.add_space(slack / 2.0);
 
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
@@ -63,9 +83,6 @@ impl App {
                 },
             );
         });
-
-        ui.add_space(5.0);
-        self.player_sub(ui);
     }
 
     fn now_playing(&mut self, ui: &mut Ui, accent: t::Accent) {
@@ -94,6 +111,7 @@ impl App {
             .unwrap_or_else(|| "未在播放".to_owned());
         let title_color = if current.is_some() { t::FG } else { t::FG_3 };
         let title = widgets::elided(ui, &title_text, title_font, title_color, text_rect.width());
+        let title_w = title.size().x;
         widgets::paint_galley_centred(
             &painter,
             Pos2::new(text_rect.left(), text_rect.center().y - 11.0),
@@ -115,51 +133,72 @@ impl App {
             return;
         };
 
-        let author = if track.author.is_empty() {
-            "未知作者"
-        } else {
-            track.author.as_str()
-        };
-        let author = widgets::elided(
+        // Quality and 已回退 ride on the title's line as tags. The quality used
+        // to be plain text in the sub-line, where it read as a property of the
+        // uploader rather than of the song.
+        let title_cy = text_rect.center().y - 11.0;
+        let mut tag_x = text_rect.left() + title_w + 9.0;
+        if !loading {
+            if let Some(quality) = quality {
+                let size = widgets::tag_size(ui, quality.label(), None, false);
+                let rect = Rect::from_center_size(Pos2::new(tag_x + size.x / 2.0, title_cy), size);
+                widgets::tag_at(ui, rect, quality.label(), None, None, None, accent);
+                tag_x += size.x + 6.0;
+            }
+        }
+        // 已回退 is a warning, so it is the one tag in red: the copy that was meant
+        // to play is gone and another platform's is standing in.
+        if !loading && self.is_fallback(&track) {
+            let size = widgets::tag_size(ui, "已回退", None, false);
+            let rect = Rect::from_center_size(Pos2::new(tag_x + size.x / 2.0, title_cy), size);
+            widgets::tag_at(ui, rect, "已回退", None, None, Some(t::RED), accent);
+        }
+
+        // Sub-line: artist · album, then the way into 来源.
+        let source_size = widgets::tag_size(ui, "来源", None, false);
+        let subtitle = songs::subtitle(&track);
+        let subtitle = widgets::elided(
             ui,
-            author,
+            &subtitle,
             sub_font.clone(),
-            t::FG_2,
-            (text_rect.width() - 70.0).max(40.0),
+            t::FG_3,
+            (text_rect.width() - source_size.x - 16.0).max(40.0),
         );
+        let subtitle_w = subtitle.size().x;
         widgets::paint_galley_centred(
             &painter,
             Pos2::new(text_rect.left(), sub_y),
-            author.clone(),
-            t::FG_2,
-        );
-        let mut x = text_rect.left() + author.size().x + 7.0;
-        painter.circle_filled(Pos2::new(x + 1.5, sub_y), 1.5, t::FG_4);
-        x += 10.0;
-
-        let label = if loading {
-            "下载中…".to_owned()
-        } else {
-            quality
-                .map(|quality| quality.label())
-                .unwrap_or("未知音质")
-                .to_owned()
-        };
-        widgets::paint_label(
-            &painter,
-            Pos2::new(x, sub_y),
-            Align2::LEFT_CENTER,
-            &label,
-            sub_font.clone(),
+            subtitle,
             t::FG_3,
         );
-        if quality == Some(crate::api::models::AudioQuality::Flac) {
-            x += widgets::measure(ui, &label, sub_font).x + 6.0;
-            icons::spark(
-                &painter,
-                Rect::from_min_size(Pos2::new(x, sub_y - 5.5), Vec2::splat(11.0)),
-                t::GOLD,
-            );
+
+        let source_rect = Rect::from_min_size(
+            Pos2::new(text_rect.left() + subtitle_w + 10.0, sub_y - 10.0),
+            source_size,
+        );
+        let response = ui.interact(
+            source_rect,
+            ui.make_persistent_id(("deck-source", track.key())),
+            Sense::click(),
+        );
+        widgets::tag_at(
+            ui,
+            source_rect,
+            "来源",
+            Some(icons::chevron_right),
+            None,
+            if response.hovered() {
+                Some(accent.accent)
+            } else {
+                None
+            },
+            accent,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            self.source_open = true;
         }
         let _ = accent;
     }
@@ -281,6 +320,8 @@ impl App {
 
     fn transport_right(&mut self, ui: &mut Ui, accent: t::Accent) {
         ui.add_space(10.0);
+        self.streaming_box(ui, accent);
+        ui.add_space(12.0);
 
         // -- volume ---------------------------------------------------------
         let muted = self.volume <= 0.0;
@@ -466,70 +507,66 @@ impl App {
     }
 
     /// The line under the transport: cache progress, or the keyboard hint.
-    fn player_sub(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            match self.download.clone() {
-                Some((_, got, total)) => {
-                    let ratio = total
-                        .filter(|total| *total > 0)
-                        .map(|total| (got as f32 / total as f32).clamp(0.0, 1.0));
-                    let width = (ui.available_width() * 0.62).min(520.0);
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
-                    let painter = ui.painter().clone();
-                    let track = Rect::from_min_size(
-                        Pos2::new(rect.left(), rect.center().y - 1.5),
-                        Vec2::new((rect.width() - 160.0).max(60.0), 3.0),
-                    );
-                    painter.rect_filled(track, 1.5, t::white(0.09));
-                    if let Some(ratio) = ratio {
-                        t::gradient_rounded_rect(
-                            &painter,
-                            Rect::from_min_size(
-                                track.min,
-                                Vec2::new(track.width() * ratio, track.height()),
-                            ),
-                            1.5,
-                            t::BLUE,
-                            self.theme.accent.accent,
-                            Vec2::new(1.0, 0.0),
-                        );
-                    }
-                    let text = match ratio {
-                        Some(ratio) => format!(
-                            "缓存音频 {}% · {}{}",
-                            (ratio * 100.0) as u32,
-                            human_bytes(got),
-                            total
-                                .map(|t| format!(" / {}", human_bytes(t)))
-                                .unwrap_or_default()
-                        ),
-                        None => format!("缓存音频 · {}", human_bytes(got)),
-                    };
-                    widgets::paint_label(
-                        &painter,
-                        Pos2::new(track.right() + 10.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        text,
-                        t::mono_font(10.5),
-                        t::FG_3,
-                    );
-                }
-                None => {
-                    let hint = if self.current.is_some() {
-                        "空格 播放 / 暂停 · ← → 快退快进 5 秒 · 点击歌词行跳转"
-                    } else {
-                        "音频会先缓存到本地再播放，通常 1–7 MB"
-                    };
-                    ui.label(RichText::new(hint).size(11.0).color(t::FG_3));
-                }
-            }
+    /// The design's small streaming box: how much of the track is on its way.
+    ///
+    /// This is where the cache readout lives now. The old bar drew it as a
+    /// full-width row underneath itself, which made the deck's content taller than
+    /// the deck — and because a panel reports only the height its content used,
+    /// the overflow pushed the panel's own rect down and the page beside it drew
+    /// over the deck's top edge. Folding it into the right group keeps the
+    /// information and the 96px strip.
+    fn streaming_box(&mut self, ui: &mut Ui, _accent: t::Accent) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(150.0, 44.0), Sense::hover());
+        let painter = ui.painter().clone();
+        painter.rect_filled(rect, t::R_SM, t::INK_1);
+        painter.rect_stroke(
+            rect,
+            t::R_SM,
+            Stroke::new(1.0, t::LINE),
+            egui::StrokeKind::Inside,
+        );
+        widgets::engraved_at(
+            ui,
+            Pos2::new(rect.left() + 10.0, rect.top() + 14.0),
+            Align2::LEFT_CENTER,
+            "STREAMING",
+            9.0,
+            t::FG_4,
+        );
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(err) = &self.engine_error {
-                    ui.label(RichText::new(err).size(11.0).color(t::ERR));
-                }
-            });
-        });
+        let (text, ratio) = match self.download.clone() {
+            Some((_, got, total)) => {
+                let ratio = total
+                    .filter(|total| *total > 0)
+                    .map(|total| (got as f32 / total as f32).clamp(0.0, 1.0));
+                let text = match (ratio, total) {
+                    (Some(ratio), Some(total)) => format!(
+                        "{}% · {} / {}",
+                        (ratio * 100.0) as u32,
+                        human_bytes(got),
+                        human_bytes(total)
+                    ),
+                    _ => human_bytes(got),
+                };
+                (text, ratio.unwrap_or(0.0))
+            }
+            None if self.current.is_some() => ("已就绪".to_owned(), 1.0),
+            None => ("—".to_owned(), 0.0),
+        };
+        widgets::label_at(
+            ui,
+            Pos2::new(rect.right() - 10.0, rect.top() + 14.0),
+            Align2::RIGHT_CENTER,
+            &text,
+            t::mono_font(10.0),
+            t::FG_2,
+        );
+
+        let track = Rect::from_min_size(
+            Pos2::new(rect.left() + 10.0, rect.bottom() - 13.0),
+            Vec2::new(rect.width() - 20.0, 3.0),
+        );
+        t::level_bar(&painter, track, ratio, self.theme.accent.accent);
     }
 
     fn persist_volume(&self) {
@@ -725,6 +762,7 @@ mod tests {
     /// App a queue and render the player bar with the popup open, then report
     /// what is visible: the header's y and every queue row's y.
     fn queue_popup(count: usize) -> (Vec<(String, f32)>, f32, f32, Vec<egui::epaint::RectShape>) {
+        crate::platform::serialise_home_tests();
         std::env::set_var("HOME", "/tmp/listenbli-queue-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-queue-tests");
 
@@ -739,6 +777,8 @@ mod tests {
                 author: "上传者".into(),
                 duration: 200,
                 cover: None,
+                album: None,
+                artist: None,
             })
             .collect();
         app.queue_pos = 0;
@@ -904,6 +944,7 @@ mod tests {
     /// sinks the digits below the line.
     #[test]
     fn the_queue_header_shares_one_centre_line() {
+        crate::platform::serialise_home_tests();
         std::env::set_var("HOME", "/tmp/listenbli-queue-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-queue-tests");
         let app = App::new_for_tests(Config::default());

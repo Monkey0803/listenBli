@@ -1,8 +1,12 @@
-//! Design tokens for the "深夜电台 / Midnight Broadcast" look.
+//! Design tokens for the console look.
 //!
-//! Everything the UI paints itself goes through these constants, so the palette
-//! lives in exactly one place. The accent colour is the only token the user can
-//! change; the four derived values (`deep`/`soft`/`ink`/`dim`) follow it.
+//! The engine is an instrument panel: warm graphite panels, hairline rules, and
+//! one signal colour that always means "current" — the playing row, the selected
+//! key, the on-air button. Everything the UI paints itself goes through these
+//! constants, so the palette lives in exactly one place.
+//!
+//! The signal colour is the only token the user can change; the three derived
+//! values (`deep`/`soft`/`ink`) follow it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,41 +22,67 @@ use crate::platform;
 // palette
 // ---------------------------------------------------------------------------
 
-/// Layered charcoal, coldest at the back.
-pub const INK_0: Color32 = Color32::from_rgb(0x06, 0x06, 0x0a);
-pub const INK_1: Color32 = Color32::from_rgb(0x0c, 0x0c, 0x11);
-pub const INK_2: Color32 = Color32::from_rgb(0x11, 0x11, 0x17);
-pub const INK_3: Color32 = Color32::from_rgb(0x17, 0x17, 0x1f);
-pub const INK_4: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x28);
-pub const INK_5: Color32 = Color32::from_rgb(0x28, 0x28, 0x33);
+/// Layered warm graphite, coldest at the back. Not flat black: the panels need
+/// to read as separate plates stacked in a dark room.
+pub const INK_0: Color32 = Color32::from_rgb(0x08, 0x08, 0x0a);
+pub const INK_1: Color32 = Color32::from_rgb(0x0e, 0x0e, 0x11);
+pub const INK_2: Color32 = Color32::from_rgb(0x14, 0x14, 0x18);
+pub const INK_3: Color32 = Color32::from_rgb(0x1b, 0x1b, 0x20);
+pub const INK_4: Color32 = Color32::from_rgb(0x23, 0x23, 0x29);
+pub const INK_5: Color32 = Color32::from_rgb(0x2d, 0x2d, 0x34);
 
 pub const LINE: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 17);
-pub const LINE_2: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 29);
-pub const LINE_3: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 46);
+pub const LINE_2: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 31);
+pub const LINE_3: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 51);
 
-pub const FG: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 241);
-pub const FG_2: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 168);
-pub const FG_3: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 122);
-pub const FG_4: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 82);
+pub const FG: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 240);
+pub const FG_2: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 163);
+pub const FG_3: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 112);
+pub const FG_4: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 71);
 
-/// Bilibili blue — translations and quality badges.
-pub const BLUE: Color32 = Color32::from_rgb(0x35, 0xb6, 0xe4);
-pub const BLUE_INK: Color32 = Color32::from_rgb(0x8f, 0xd6, 0xf2);
-pub const GOLD: Color32 = Color32::from_rgb(0xe8, 0xc0, 0x7d);
-pub const OK: Color32 = Color32::from_rgb(0x4f, 0xd3, 0x9b);
-pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xa5, 0x5c);
-pub const ERR: Color32 = Color32::from_rgb(0xfb, 0x71, 0x85);
+/// Signal colour. Amber is "on air" and nothing else; the LED colours below are
+/// deliberately different hues so a lit amber LED can never be mistaken for a
+/// green one.
+pub const AMBER: Color32 = Color32::from_rgb(0xff, 0xb4, 0x54);
+pub const AMBER_DEEP: Color32 = Color32::from_rgb(0xc8, 0x84, 0x2c);
 
-// radii
-pub const R_SM: f32 = 8.0;
-pub const R_MD: f32 = 10.0;
-pub const R_LG: f32 = 14.0;
-pub const R_XL: f32 = 18.0;
+/// Ready / already downloaded.
+pub const GREEN: Color32 = Color32::from_rgb(0x5f, 0xd3, 0x9a);
+/// Something is wrong: a dead edition, a part-downloaded file.
+pub const RED: Color32 = Color32::from_rgb(0xf2, 0x63, 0x5f);
 
-/// Height of the top bar, player bar and status bar. The central row takes the
-/// rest, mirroring the design's `58px / 1fr / auto / 30px` grid.
-pub const TOP_BAR_H: f32 = 58.0;
-pub const STATUS_BAR_H: f32 = 30.0;
+// The older semantic names are kept as aliases: the lyrics panel still draws
+// translations in blue and the cache meters still draw a "settled" fill, and
+// both should follow the console palette rather than introduce a fourth hue.
+pub const BLUE: Color32 = Color32::from_rgb(0x7f, 0xb8, 0xd8);
+pub const BLUE_INK: Color32 = Color32::from_rgb(0xb6, 0xd8, 0xec);
+pub const GOLD: Color32 = AMBER;
+pub const OK: Color32 = GREEN;
+pub const WARN: Color32 = AMBER;
+pub const ERR: Color32 = RED;
+
+// radii — the console is built from plates, not cards
+pub const R_SM: f32 = 2.0;
+pub const R_MD: f32 = 2.0;
+pub const R_LG: f32 = 3.0;
+pub const R_XL: f32 = 3.0;
+
+/// Top bar, left library rail, right now-playing column and transport deck.
+/// The shell is a four-part plate: `56 / 214 | 1fr | 336 / 96`.
+pub const TOP_BAR_H: f32 = 56.0;
+pub const RAIL_W: f32 = 214.0;
+pub const NOW_W: f32 = 336.0;
+pub const DECK_H: f32 = 96.0;
+
+/// Rows in a song list, and the taller row a merged pair uses.
+pub const ROW_H: f32 = 52.0;
+
+/// Letter spacing for the engraved uppercase micro-labels ("MY LIBRARY",
+/// "NOW PLAYING"). The design gets its instrument feel from these, and egui can
+/// only produce them as a laid-out job, not from a bare `FontId`.
+pub const TRACKING: f32 = 0.17;
+/// Tracking for a label that is mostly CJK, where wide spacing looks broken.
+pub const TRACKING_CJK: f32 = 0.06;
 
 pub fn hairline() -> Stroke {
     Stroke::new(1.0, LINE)
@@ -99,33 +129,38 @@ pub struct Accent {
     pub ink: Color32,
 }
 
+/// Amber leads because it is the console's own colour; the other two exist
+/// because the setting already did, and each still keeps the rule that only one
+/// hue means "current".
 pub const ACCENTS: [Accent; 3] = [
     Accent {
-        id: "pink",
-        name: "信号粉",
-        accent: Color32::from_rgb(0xfb, 0x72, 0x99),
-        deep: Color32::from_rgb(0xd9, 0x57, 0x8a),
-        soft: Color32::from_rgb(0xff, 0x9d, 0xb8),
-        ink: Color32::from_rgb(0xff, 0xc8, 0xd8),
+        id: "amber",
+        name: "信号琥珀",
+        accent: AMBER,
+        deep: AMBER_DEEP,
+        soft: Color32::from_rgb(0xff, 0xc8, 0x84),
+        ink: Color32::from_rgb(0xff, 0xe0, 0xb8),
     },
     Accent {
-        id: "cyan",
-        name: "霓虹青",
-        accent: Color32::from_rgb(0x35, 0xb6, 0xe4),
-        deep: Color32::from_rgb(0x1d, 0x86, 0xad),
-        soft: Color32::from_rgb(0x7f, 0xd6, 0xf0),
-        ink: Color32::from_rgb(0xb7, 0xe9, 0xf8),
+        id: "magenta",
+        name: "品红",
+        accent: Color32::from_rgb(0xf2, 0x63, 0x9f),
+        deep: Color32::from_rgb(0xc9, 0x43, 0x7c),
+        soft: Color32::from_rgb(0xff, 0x8f, 0xbd),
+        ink: Color32::from_rgb(0xff, 0xc6, 0xdd),
     },
     Accent {
-        id: "violet",
-        name: "夜紫",
-        accent: Color32::from_rgb(0xa7, 0x8b, 0xfa),
-        deep: Color32::from_rgb(0x7c, 0x5c, 0xf0),
-        soft: Color32::from_rgb(0xc4, 0xb0, 0xfd),
-        ink: Color32::from_rgb(0xdd, 0xd2, 0xfe),
+        id: "azure",
+        name: "天青",
+        accent: Color32::from_rgb(0x6f, 0xb4, 0xff),
+        deep: Color32::from_rgb(0x4a, 0x8a, 0xd4),
+        soft: Color32::from_rgb(0x9e, 0xcb, 0xff),
+        ink: Color32::from_rgb(0xcd, 0xe4, 0xff),
     },
 ];
 
+/// Configs written before the redesign name an accent that no longer exists;
+/// they land on the default rather than on a wrong-looking panel.
 pub fn accent_by_id(id: &str) -> Accent {
     ACCENTS
         .iter()
@@ -135,13 +170,13 @@ pub fn accent_by_id(id: &str) -> Accent {
 }
 
 impl Accent {
-    /// The accent at `alpha` — used for the 22% "dim" fills and glows.
+    /// The accent at `alpha` — used for the 15% "dim" fills and glows.
     pub fn dim(self) -> Color32 {
-        fade(self.accent, 0.22)
+        fade(self.accent, 0.15)
     }
 
     pub fn glow(self) -> Color32 {
-        fade(self.accent, 0.55)
+        fade(self.accent, 0.5)
     }
 
     /// A gradient brush for the play button and other accent surfaces.
@@ -167,15 +202,15 @@ impl Theme {
             accent: accent_by_id(&config.accent),
             lyric_size: config.lyric_size.clamp(13.0, 22.0),
             row_h: if config.density == "compact" {
-                52.0
+                46.0
             } else {
-                62.0
+                ROW_H
             },
         }
     }
 
     pub fn compact(&self) -> bool {
-        self.row_h < 60.0
+        self.row_h < 50.0
     }
 }
 
@@ -184,7 +219,7 @@ impl Default for Theme {
         Self {
             accent: ACCENTS[0],
             lyric_size: 15.5,
-            row_h: 62.0,
+            row_h: ROW_H,
         }
     }
 }
@@ -469,14 +504,111 @@ pub fn bloom(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32,
     painter.add(Shape::mesh(mesh));
 }
 
+/// A laid-out uppercase micro-label with the console's letter tracking.
+///
+/// `extra_letter_spacing` can only be expressed through a `LayoutJob`, so the
+/// engraved labels cannot come from a bare `FontId`.
+pub fn tracked_galley(
+    painter: &egui::Painter,
+    text: &str,
+    size: f32,
+    color: Color32,
+    tracking: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: ui_font(size),
+            color,
+            extra_letter_spacing: tracking,
+            ..Default::default()
+        },
+    );
+    painter.layout_job(job)
+}
+
+/// Which state an LED is showing. The hue carries the meaning, so callers never
+/// pass a colour — that is what keeps amber meaning "current" everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Led {
+    /// Playing / selected.
+    On,
+    /// Ready, cached, declared.
+    Ok,
+    /// Degraded: fell back, part-downloaded.
+    Warn,
+    /// Dead.
+    Bad,
+    /// Nothing to say.
+    Idle,
+}
+
+pub fn led_color(state: Led, accent: Accent) -> Color32 {
+    match state {
+        Led::On => accent.accent,
+        Led::Ok => GREEN,
+        Led::Warn => AMBER,
+        Led::Bad => RED,
+        Led::Idle => Color32::from_rgb(0x3a, 0x3a, 0x42),
+    }
+}
+
+/// A 6px indicator lamp with a soft bloom when it is lit. The console's whole
+/// state vocabulary is this plus a label.
+pub fn led(painter: &egui::Painter, center: Pos2, state: Led, accent: Accent) {
+    let color = led_color(state, accent);
+    let radius = 3.0;
+    if state != Led::Idle {
+        bloom(painter, center, radius * 3.0, color, 0.28);
+    }
+    painter.circle_filled(center, radius, color);
+}
+
+/// A thin level/segment bar: `fraction` of `rect` filled, the rest left as the
+/// empty track. Used for cache metres, session buffers and download progress.
+pub fn level_bar(painter: &egui::Painter, rect: Rect, fraction: f32, color: Color32) {
+    let fraction = fraction.clamp(0.0, 1.0);
+    painter.rect_filled(rect, CornerRadius::same(1), INK_4);
+    if fraction <= 0.0 {
+        return;
+    }
+    let mut filled = rect;
+    filled.set_width(rect.width() * fraction);
+    painter.rect_filled(filled, CornerRadius::same(1), color);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn accent_lookup_falls_back_to_the_default() {
-        assert_eq!(accent_by_id("pink").id, "pink");
+        assert_eq!(accent_by_id("amber").id, "amber");
+        // A config written before the redesign names an accent that is gone.
+        assert_eq!(accent_by_id("pink").id, ACCENTS[0].id);
         assert_eq!(accent_by_id("does-not-exist").id, ACCENTS[0].id);
+    }
+
+    #[test]
+    fn the_console_keeps_amber_as_the_signal_colour() {
+        assert_eq!(ACCENTS[0].accent, AMBER);
+        // Green must never be confusable with the signal colour.
+        assert_ne!(
+            led_color(Led::On, ACCENTS[0]),
+            led_color(Led::Ok, ACCENTS[0])
+        );
+        assert_eq!(led_color(Led::Ok, ACCENTS[0]), GREEN);
+    }
+
+    #[test]
+    fn level_bar_survives_a_fraction_outside_zero_to_one() {
+        // Just the arithmetic: the painter is not available in a unit test.
+        let cases: [(f32, f32); 4] = [(0.0, 0.0), (0.42, 0.42), (1.7, 1.0), (-3.0, 0.0)];
+        for (fraction, expected) in cases {
+            assert!((fraction.clamp(0.0, 1.0) - expected).abs() < f32::EPSILON);
+        }
     }
 
     #[test]

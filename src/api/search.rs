@@ -98,6 +98,10 @@ fn item_to_track(item: SearchItem) -> Track {
         author: util::strip_html(&item.author),
         duration: util::parse_duration(&item.duration),
         cover: util::normalize_url(&item.pic).filter(|s| !s.is_empty()),
+        // A search hit is a video: no album, and `author` stays the uploader
+        // rather than being promoted to the performer.
+        album: None,
+        artist: None,
     }
 }
 
@@ -115,6 +119,8 @@ mod tests {
             author: String::new(),
             duration: 1,
             cover: None,
+            album: None,
+            artist: None,
         }
     }
 

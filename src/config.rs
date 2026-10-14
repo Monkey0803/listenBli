@@ -11,6 +11,107 @@ use crate::platform;
 /// How many recent search keywords are kept.
 pub const MAX_SEARCH_HISTORY: usize = 8;
 
+/// A source somebody declared by hand, and what it said it can do.
+///
+/// The design's idea is that a source *is* its declaration, and the interface
+/// grows whatever the declaration asks for. The keys are the ones in
+/// [`crate::api::models::CAPABILITIES`], so a renamed label in the interface does
+/// not silently change what an old file means.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Declaration {
+    /// Stable id, made from the name.
+    pub id: String,
+    pub name: String,
+    /// The single letter lists badge this source's items with.
+    pub channel: String,
+    /// The capability keys that are on.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// How it would hold a session.
+    #[serde(default)]
+    pub session: Session,
+}
+
+/// How a declared source would sign in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Session {
+    /// No account at all.
+    #[default]
+    Anonymous,
+    /// A session the user would sign into.
+    Account,
+}
+
+impl Session {
+    pub fn label(self) -> &'static str {
+        match self {
+            Session::Anonymous => "匿名",
+            Session::Account => "账号登录",
+        }
+    }
+
+    /// The one line the form shows under each choice.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Session::Anonymous => "不需要账号，随时能用；能拿到的东西也止步于此",
+            Session::Account => "需要一个会话；登录后才能读收藏、用无损",
+        }
+    }
+}
+
+impl Declaration {
+    /// An id made from a name: lowercase ASCII words joined by `-`.
+    ///
+    /// Ids are how a declaration is found again, so they are made once here and
+    /// kept. A name with nothing ASCII-mappable in it becomes `source`, and a
+    /// second one of the same name gets a number rather than replacing the first.
+    pub fn id_for(name: &str, existing: &[String]) -> String {
+        let mut slug: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        while slug.contains("--") {
+            slug = slug.replace("--", "-");
+        }
+        let slug = slug.trim_matches('-').to_owned();
+        let base = if slug.is_empty() {
+            "source".to_owned()
+        } else {
+            slug
+        };
+        if !existing.contains(&base) {
+            return base;
+        }
+        let mut n = 2;
+        loop {
+            let candidate = format!("{base}-{n}");
+            if !existing.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Whether this declaration asks for a capability.
+    pub fn declares(&self, key: &str) -> bool {
+        self.capabilities.iter().any(|declared| declared == key)
+    }
+
+    /// How many of the known capabilities are on.
+    pub fn declared_count(&self) -> usize {
+        crate::api::models::CAPABILITIES
+            .iter()
+            .filter(|capability| self.declares(capability.key))
+            .count()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_version")]
@@ -42,8 +143,24 @@ pub struct Config {
     #[serde(default = "default_density")]
     pub density: String,
     /// The platform the app is browsing: `bilibili` (the default) or `youtube`.
+    ///
+    /// Legacy: the library has no "current platform" any more. Kept so an old
+    /// config still loads, and so a resolve still has a default.
     #[serde(default)]
     pub source: crate::api::models::Source,
+    /// Sources whose collections are *not* synced, by id (`bilibili`, `youtube`).
+    ///
+    /// Empty means both. 来源与同步's switches write here, and it gates the sync
+    /// only: songs already in the library stay playable either way.
+    #[serde(default)]
+    pub sync_disabled: Vec<String>,
+    /// Sources somebody declared by hand in 接入来源.
+    ///
+    /// A declaration is a promise about the interface, not an implementation: the
+    /// app has no way to fetch from one yet, so 来源与同步 shows it as declared and
+    /// says plainly that it provides nothing.
+    #[serde(default)]
+    pub declared: Vec<Declaration>,
     /// Where cached audio and lyrics live, when the user wants them somewhere
     /// other than the platform's cache directory.
     ///
@@ -97,6 +214,8 @@ impl Default for Config {
             lyric_size: default_lyric_size(),
             density: default_density(),
             source: crate::api::models::Source::Bilibili,
+            sync_disabled: Vec::new(),
+            declared: Vec::new(),
             cache_dir: None,
             cookies: CookieJar::default(),
         }
@@ -169,6 +288,35 @@ pub fn config_path_display() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ids are how a declaration is found again, so they have to be stable,
+    /// unique, and survivable through a name with no ASCII in it.
+    #[test]
+    fn a_declaration_id_comes_from_its_name() {
+        assert_eq!(
+            Declaration::id_for("Internet Archive", &[]),
+            "internet-archive"
+        );
+        assert_eq!(
+            Declaration::id_for("  Weird   Spaces  ", &[]),
+            "weird-spaces"
+        );
+        assert_eq!(
+            Declaration::id_for("网易云音乐", &[]),
+            "source",
+            "a name with nothing ASCII-mappable still gets an id"
+        );
+
+        // A second one of the same name is numbered rather than replacing the
+        // first, which is the whole reason ids are assigned here and not by hand.
+        let taken = vec!["internet-archive".to_owned()];
+        assert_eq!(
+            Declaration::id_for("Internet Archive", &taken),
+            "internet-archive-2"
+        );
+        let taken = vec!["source".to_owned(), "source-2".to_owned()];
+        assert_eq!(Declaration::id_for("网易云音乐", &taken), "source-3");
+    }
 
     #[test]
     fn cache_dir_defaults_to_unset_and_round_trips() {
@@ -275,6 +423,9 @@ mod tests {
     #[test]
     fn config_path_lives_under_the_platform_config_dir() {
         let path = Config::path();
+        // The same directory, read once: `HOME` moves under the tests that
+        // isolate their own files, and this is a claim about the layout rather
+        // than about the environment holding still.
         assert!(path.starts_with(platform::config_dir()));
         assert!(path.is_absolute());
     }

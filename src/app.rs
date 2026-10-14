@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use crate::api::client::Api;
-use crate::api::models::{AudioQuality, FavFolder, Track, UserInfo};
+use crate::api::models::{AudioQuality, FavFolder, Source, Track, UserInfo};
 use crate::audio::{AudioEngine, SeekOutcome};
-use crate::config::{Config, SharedConfig};
+use crate::config::{Config, Session, SharedConfig};
+use crate::library::LocalLibrary;
 use crate::lyrics::Lyrics;
 use crate::net::{self, Cmd, Evt, Worker};
 use crate::platform;
@@ -28,6 +29,157 @@ pub enum Tab {
     Search,
     Favorites,
     History,
+}
+
+/// The 接入来源 form's draft, kept between frames while the sheet is up.
+pub struct ConnectDraft {
+    pub open: bool,
+    pub name: String,
+    pub channel: String,
+    /// Capability keys that are switched on, from
+    /// [`CAPABILITIES`](crate::api::models::CAPABILITIES).
+    pub capabilities: Vec<String>,
+    pub session: Session,
+}
+
+impl Default for ConnectDraft {
+    fn default() -> Self {
+        // The design's starting set: enough to search and play, and no account
+        // needed for any of it.
+        Self {
+            open: false,
+            name: String::new(),
+            channel: String::new(),
+            capabilities: ["search", "paging", "stream", "quality", "anon", "captions"]
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect(),
+            session: Session::Anonymous,
+        }
+    }
+}
+
+/// The 我的歌 filter row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryFilter {
+    All,
+    Downloaded,
+    Stream,
+    Issues,
+}
+
+impl LibraryFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            LibraryFilter::All => "全部",
+            LibraryFilter::Downloaded => "已下载",
+            LibraryFilter::Stream => "未下载",
+            LibraryFilter::Issues => "有问题的",
+        }
+    }
+
+    pub const ALL: [LibraryFilter; 4] = [
+        LibraryFilter::All,
+        LibraryFilter::Downloaded,
+        LibraryFilter::Stream,
+        LibraryFilter::Issues,
+    ];
+}
+
+/// What is on disk for a song.
+///
+/// Indexed rather than probed while painting: the list is the main screen, and a
+/// `stat` per quality tag per row per frame is not something to do 60 times a
+/// second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cached {
+    None,
+    /// Started but not complete — the state the design labels 仅前半.
+    Partial,
+    Complete,
+}
+
+/// What is on disk for one song, and how much of it there is.
+///
+/// The size travels with the state because both come from the same `stat`, and
+/// 来源详情 shows both (`已下载 4.2 MB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheInfo {
+    pub state: Cached,
+    pub bytes: u64,
+}
+
+/// Every quality tag the app ever writes a cache file under.
+///
+/// `AudioQuality` has no iterator, and this is the one place that needs all of
+/// them at once.
+pub(crate) const QUALITY_TAGS: [u32; 6] = [0, 30280, 30232, 30216, 140, 139];
+
+/// Which page the central pane is showing.
+///
+/// Replaces the old organisation (one platform's search / favourites / history).
+/// A library has no platform: 我的歌 is the merged result of every source, and
+/// the platforms only appear at all on 来源与同步 and in a song's 来源 sheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// The landing page: every song you have, from every source.
+    Library,
+    Playlists,
+    Recent,
+    Offline,
+    Search,
+    /// Where the platforms live: collections, read/write modes, sync.
+    Sources,
+}
+
+impl Page {
+    /// Nav label, and the tag the top bar shows instead of a page title.
+    pub fn label(self) -> &'static str {
+        match self {
+            Page::Library => "我的歌",
+            Page::Playlists => "歌单",
+            Page::Recent => "最近播放",
+            Page::Offline => "已下载",
+            Page::Search => "搜索",
+            Page::Sources => "来源与同步",
+        }
+    }
+
+    /// The rail's icon for each place. 我的歌 borrows the lyrics glyph because a
+    /// song's own page is a page of text; 来源与同步 borrows the plug.
+    pub fn icon(self) -> crate::ui::icons::Icon {
+        use crate::ui::icons;
+        match self {
+            Page::Library => icons::lyrics,
+            Page::Playlists => icons::folder,
+            Page::Recent => icons::clock,
+            Page::Offline => icons::download,
+            Page::Search => icons::search,
+            Page::Sources => icons::plug,
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Page::Library => "LIBRARY",
+            Page::Playlists => "PLAYLISTS",
+            Page::Recent => "RECENT",
+            Page::Offline => "OFFLINE",
+            Page::Search => "SEARCH",
+            Page::Sources => "SOURCES",
+        }
+    }
+
+    /// Keyboard order for the rail's page keys: `1`–`5` walk the library, and
+    /// 来源与同步 is deliberately not on a number — it is a place you visit
+    /// rarely, not part of listening.
+    pub const KEYS: [Page; 5] = [
+        Page::Library,
+        Page::Playlists,
+        Page::Recent,
+        Page::Offline,
+        Page::Search,
+    ];
 }
 
 /// What the player going empty means.
@@ -55,6 +207,9 @@ fn ending_of(finished: bool, failure: Option<String>) -> Option<EndOfTrack> {
     })
 }
 
+/// Cloneable because the library nav reads the current message to draw its
+/// status line without holding a borrow of the app.
+#[derive(Clone)]
 pub struct Status {
     pub text: String,
     pub is_error: bool,
@@ -86,6 +241,33 @@ pub struct App {
     pub(crate) engine_error: Option<String>,
 
     pub(crate) tab: Tab,
+    /// Which library page the central pane is showing.
+    pub(crate) page: Page,
+    /// Your music, with every source merged into it.
+    ///
+    /// The platforms are read-only feeds into this file: a favourite folder read
+    /// back from Bilibili becomes a playlist here that the app will not write to,
+    /// because the next sync would undo any edit. The only collection this app
+    /// ever writes is the local one.
+    pub(crate) library: LocalLibrary,
+    /// Which 我的歌 filter is selected.
+    pub(crate) library_filter: LibraryFilter,
+    /// Which playlist 歌单 is showing, if it has been opened.
+    pub(crate) open_playlist: Option<String>,
+    /// The 接入来源 form's draft.
+    pub(crate) connect: ConnectDraft,
+    /// Whether 来源详情 is open for the playing song.
+    ///
+    /// The one place the app says which platform a song is on — and only because
+    /// somebody asked.
+    pub(crate) source_open: bool,
+    /// Local copies, refreshed when the cache changes (see [`Cached`]).
+    pub(crate) cache_index: HashMap<String, CacheInfo>,
+    /// Tracks whose resolve has already failed this session, by `Track::key`.
+    ///
+    /// The only evidence of a dead edition the app has. It is what lets a song
+    /// whose preferred copy is gone show 已回退 instead of failing when pressed.
+    pub(crate) dead: HashSet<String>,
     /// Which platform the list is showing. Persisted, because a user who came for
     /// YouTube should not have to say so again on every launch.
     pub(crate) source: crate::api::models::Source,
@@ -181,6 +363,15 @@ impl App {
         Self::build(config, false)
     }
 
+    /// The app without an audio output device.
+    ///
+    /// For anything that only renders: opening an output device is a real side
+    /// effect, and a tool whose whole job is to draw one frame should not have
+    /// one.
+    pub fn new_silent(config: Config) -> Self {
+        Self::build(config, false)
+    }
+
     fn build(config: Config, with_audio: bool) -> Self {
         let volume = config.volume;
         let show_translation = config.prefer_translation;
@@ -220,12 +411,20 @@ impl App {
         // Ask the worker who we are; it also refreshes the WBI keys.
         let _ = worker.cmd_tx.send(Cmd::RefreshLogin);
 
-        Self {
+        let mut app = Self {
             worker,
             config: shared,
             engine,
             engine_error,
             tab: Tab::Search,
+            page: Page::Library,
+            library: LocalLibrary::load(),
+            library_filter: LibraryFilter::All,
+            open_playlist: None,
+            source_open: false,
+            connect: ConnectDraft::default(),
+            cache_index: HashMap::new(),
+            dead: HashSet::new(),
             source,
             search_input: String::new(),
             searching: false,
@@ -271,7 +470,11 @@ impl App {
             cjk_path_input: config_path_input,
             cache_bytes: None,
             cache_path_input,
-        }
+        };
+        // The index reads the filesystem, so it is built once here rather than
+        // probed while the library page paints.
+        app.refresh_cache_index();
+        app
     }
 
     // -- helpers -----------------------------------------------------------
@@ -421,6 +624,40 @@ impl App {
             "settings" => self.settings_open = true,
             "queue" => self.queue_open = true,
             "login" => self.open_login(),
+            // The pages are not overlays, but this is the one hook the snapshot
+            // example has for saying what to show, and a page is what it wants.
+            "library" => self.set_page(Page::Library),
+            "playlists" => self.set_page(Page::Playlists),
+            "recent" => self.set_page(Page::Recent),
+            "offline" => self.set_page(Page::Offline),
+            "search" => self.set_page(Page::Search),
+            "sources" => self.set_page(Page::Sources),
+            "source" => {
+                if self.current.is_some() {
+                    self.source_open = true;
+                }
+            }
+            "connect" => self.open_connect_sheet(),
+            // `playlist:writable` / `playlist:platform` open one playlist, so the
+            // read-only banner can be reviewed without a click.
+            "playlist:writable" => {
+                self.set_page(Page::Playlists);
+                self.open_playlist = self
+                    .library
+                    .playlists
+                    .iter()
+                    .find(|playlist| !playlist.readonly)
+                    .map(|playlist| playlist.id.clone());
+            }
+            "playlist:platform" => {
+                self.set_page(Page::Playlists);
+                self.open_playlist = self
+                    .library
+                    .playlists
+                    .iter()
+                    .find(|playlist| playlist.readonly)
+                    .map(|playlist| playlist.id.clone());
+            }
             _ => {}
         }
     }
@@ -429,6 +666,110 @@ impl App {
         if let Some(engine) = &self.engine {
             engine.toggle_pause();
         }
+    }
+
+    /// Replaces a platform collection with what the platform just returned.
+    ///
+    /// The library counts the difference, because that is the only honest source
+    /// for 来源与同步's 新增 / 移除 meters: nothing else remembers what used to be
+    /// in somebody else's favourites folder.
+    fn sync_playlist(&mut self, id: &str, title: &str, source: Source, entries: Vec<String>) {
+        self.library.sync_playlist(id, title, source, entries);
+        self.save_library();
+    }
+
+    /// Writes the library out, reporting the failure rather than swallowing it.
+    ///
+    /// Losing a favourites list silently would be worse than a message about it.
+    pub(crate) fn save_library(&mut self) {
+        if let Err(err) = self.library.save() {
+            eprintln!("saving the library failed: {err}");
+        }
+    }
+
+    /// Puts a song in the player without starting a load.
+    ///
+    /// For the snapshot example and the tests: reviewing 正在播放 needs a song in
+    /// it, and a real load would need a network round trip that a screenshot
+    /// cannot wait for. Nothing in the interface calls this.
+    pub fn show_as_playing(&mut self, track: Track, quality: Option<AudioQuality>) {
+        self.current = Some(track);
+        self.loading = false;
+        self.quality = quality;
+    }
+
+    /// Puts search results on screen without a network round trip.
+    ///
+    /// For the snapshot example and the tests, like [`show_as_playing`]: reviewing
+    /// 搜索 needs results, and a real search cannot run in either.
+    pub fn show_search_results(&mut self, keyword: &str, results: Vec<Track>) {
+        self.last_keyword = keyword.to_owned();
+        self.search_input = keyword.to_owned();
+        self.results = results;
+        self.searching = false;
+        self.search_has_more = false;
+        self.set_page(Page::Search);
+    }
+
+    /// The library, for the interface.
+    pub fn library(&self) -> &LocalLibrary {
+        &self.library
+    }
+
+    /// The library, mutably.
+    ///
+    /// Exposed so the snapshot example and the tests can seed a library without a
+    /// network round trip — and clear it again, which is how the empty first-run
+    /// state gets drawn. The interface itself only ever reads it.
+    pub fn library_mut(&mut self) -> &mut LocalLibrary {
+        &mut self.library
+    }
+
+    /// Switches the central page.
+    ///
+    /// Kept as one funnel rather than assigning `self.page` at each call site so
+    /// that anything a page needs on entry (loading a list, clearing a selection)
+    /// has exactly one place to happen later.
+    pub(crate) fn set_page(&mut self, page: Page) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+    }
+
+    /// Opens the 接入来源 sheet.
+    /// Asks to add a source.
+    ///
+    /// There is no third-party source mechanism yet, so this says so rather than
+    /// opening a form whose 创建 button could not create anything. The design's
+    /// flow — name, channel letter, capability declaration — is what it would
+    /// open once a source can actually be plugged in.
+    /// Opens 接入来源, with an empty form.
+    ///
+    /// A fresh draft every time: the button means "start a new declaration", and
+    /// leaving the last attempt half-filled would be a trap.
+    pub(crate) fn open_connect_sheet(&mut self) {
+        self.connect = ConnectDraft {
+            open: true,
+            ..ConnectDraft::default()
+        };
+    }
+
+    /// How much audio is on disk, for the top bar's 已下载 chip.
+    ///
+    /// `None` until the cache can report its own size cheaply; the byte count is
+    /// currently measured only when the settings sheet opens, and a made-up number
+    /// beside a real icon would be worse than no number.
+    pub(crate) fn offline_chip_label(&self) -> Option<String> {
+        self.cache_bytes.map(crate::net::human_bytes)
+    }
+
+    /// When the library was last reconciled with the platforms.
+    ///
+    /// `None` until syncing exists; see `App::sync_line` in `ui::nav` for why
+    /// this refuses to guess.
+    pub(crate) fn sync_label(&self) -> Option<String> {
+        None
     }
 
     pub(crate) fn set_status(&mut self, text: impl Into<String>, is_error: bool) {
@@ -460,7 +801,13 @@ impl App {
         self.start_current(track);
     }
 
-    fn start_current(&mut self, track: Track) {
+    pub(crate) fn start_current(&mut self, track: Track) {
+        // 最近播放 is what you have listened to *here*, so it is recorded at the one
+        // place playback begins — not when a platform's history is read back.
+        let key = LocalLibrary::key_of(&track);
+        self.library.record_play(&key);
+        self.save_library();
+
         // Picking a song is an answer to whatever the last message said, including the
         // sticky one about why playback stopped.
         self.status = None;
@@ -522,12 +869,6 @@ impl App {
             self.requested_covers.insert(key.clone());
             self.worker.fetch_cover(key, url);
         }
-    }
-
-    pub(crate) fn is_current(&self, track: &Track) -> bool {
-        self.current
-            .as_ref()
-            .is_some_and(|c| c.key() == track.key())
     }
 
     /// Queue a whole list (search results / favourites / history) starting at
@@ -804,12 +1145,47 @@ impl App {
                 self.fav_page = page.max(1);
                 self.fav_has_more = has_more;
                 self.fav_loaded = true;
+
+                // A favourite folder is somebody else's list. Read it in, mark it
+                // read-only, and let the local library be where edits go.
+                let title = self
+                    .fav_folders
+                    .iter()
+                    .find(|folder| folder.id == media_id)
+                    .map(|folder| folder.title.clone())
+                    .unwrap_or_else(|| format!("收藏夹 {media_id}"));
+                let mut keys: Vec<String> = self
+                    .fav_items
+                    .iter()
+                    .map(|track| {
+                        self.library.add(track.clone());
+                        LocalLibrary::key_of(track)
+                    })
+                    .collect();
+                keys.dedup();
+                self.sync_playlist(
+                    &format!("platform:bilibili:{media_id}"),
+                    &title,
+                    Source::Bilibili,
+                    keys,
+                );
                 let snapshot = self.fav_items.clone();
                 for track in &snapshot {
                     self.request_cover(track);
                 }
             }
             Evt::History(tracks) => {
+                // Bilibili's watch history is a collection on their side: it is
+                // read in, shown beside your own playlists, and never written to.
+                let mut keys: Vec<String> = tracks
+                    .iter()
+                    .map(|track| {
+                        self.library.add(track.clone());
+                        LocalLibrary::key_of(track)
+                    })
+                    .collect();
+                keys.dedup();
+                self.sync_playlist("platform:history", "观看历史", Source::Bilibili, keys);
                 self.history = tracks;
                 self.history_loaded = true;
                 let snapshot = self.history.clone();
@@ -823,6 +1199,9 @@ impl App {
                 self.notify(format!("已导出 {title}：{}", path.display()));
             }
             Evt::Cached { title, already } => {
+                // A cache-only download just landed, so what is "downloaded" in
+                // the library changed.
+                self.refresh_cache_index();
                 // A cache-only download finished in the background: nothing on
                 // screen depended on it, so a toast is the whole reaction.
                 self.notify(if already {
@@ -836,7 +1215,21 @@ impl App {
                 self.searching = false;
                 self.loading_more = false;
                 self.download = None;
-                self.set_status(format!("{context}：{message}"), true);
+
+                // A track that failed to resolve is how the app learns a copy is
+                // dead — the only way it can, short of probing every URL. Marking
+                // it is what lets the library prefer another platform's copy and
+                // show 已回退 instead of failing again the next time it is picked.
+                if self.loading_failed(&context) {
+                    if let Some(track) = self.current.clone() {
+                        self.mark_dead(&track);
+                        self.fallback_after_failure(&track, &context, &message);
+                    } else {
+                        self.set_status(format!("{context}：{message}"), true);
+                    }
+                } else {
+                    self.set_status(format!("{context}：{message}"), true);
+                }
             }
             Evt::Info(message) => {
                 self.set_status(message, false);
@@ -844,11 +1237,84 @@ impl App {
         }
     }
 
-    fn refresh_library(&mut self) {
-        if let Some(user) = &self.user {
-            self.send(Cmd::LoadFavFolders { mid: user.mid });
-            self.send(Cmd::LoadHistory);
+    /// Whether an error was the failure to *resolve or stream a track*, as opposed
+    /// to a search, a login or a cache write.
+    ///
+    /// The distinction matters because only the first kind says anything about
+    /// whether a platform copy still exists.
+    fn loading_failed(&self, context: &str) -> bool {
+        self.current.is_some()
+            && (context.contains("播放")
+                || context.contains("获取视频信息")
+                || context.contains("获取音频地址"))
+    }
+
+    /// Tries another platform's copy when the one that was playing turns out to
+    /// be gone.
+    ///
+    /// This is what makes 已回退 a promise rather than a label. The copy that
+    /// failed is marked dead first, so the next pick cannot choose it again and a
+    /// chain of failures is bounded by the number of versions; when there is
+    /// nothing left, the error is all there is to show.
+    fn fallback_after_failure(&mut self, failed: &Track, context: &str, message: &str) {
+        let key = LocalLibrary::key_of(failed);
+        let alternative = self
+            .library
+            .find(&key)
+            .and_then(|entry| {
+                LocalLibrary::preferred(
+                    entry,
+                    |track| self.cached_state_of(track) == Cached::Complete,
+                    |track| !self.dead.contains(&track.key()),
+                )
+            })
+            .filter(|next| next.key() != failed.key())
+            .cloned();
+
+        match alternative {
+            Some(next) => {
+                let from = failed.source.label();
+                let to = next.source.label();
+                // Started first: `start_current` clears the message line, so a
+                // status set before it would be wiped by the very thing it is
+                // describing.
+                self.start_current(next);
+                self.set_status(
+                    format!("{from} 那一版失效了，已自动改用 {to} 继续播放"),
+                    false,
+                );
+            }
+            None => self.set_status(format!("{context}：{message}"), true),
         }
+    }
+
+    /// Asks every source that should be synced for its collections.
+    ///
+    /// Returns who was asked, so the decision can be seen rather than only the
+    /// channel it goes down. Only the sync is gated: switching a source off stops
+    /// the app asking for its collections, it does not take songs out of the
+    /// library.
+    pub(crate) fn refresh_library(&mut self) -> Vec<Source> {
+        let mut asked = Vec::new();
+        let user = self.user.as_ref().map(|user| user.mid);
+        if let (Some(mid), true) = (user, self.syncs(Source::Bilibili)) {
+            self.send(Cmd::LoadFavFolders { mid });
+            self.send(Cmd::LoadHistory);
+            asked.push(Source::Bilibili);
+        }
+        asked
+    }
+
+    /// Whether a sync right now should ask this source for its collections.
+    ///
+    /// Needs an account *and* the switch, and the source has to declare that its
+    /// collections can be read at all — YouTube does not, so it is excluded by its
+    /// own capability declaration rather than by a special case here. Split out
+    /// from [`refresh_library`](Self::refresh_library) so the decision can be
+    /// tested without a worker: a switch that only looked like it stopped the
+    /// reading would be worse than no switch.
+    pub(crate) fn syncs(&self, source: Source) -> bool {
+        self.user.is_some() && source.capabilities().read_favorites && self.source_synced(source)
     }
 
     /// Drive auto-advance and QR polling.
@@ -915,29 +1381,6 @@ impl App {
         } else {
             self.cache_bytes = None;
         }
-    }
-
-    /// Switch platforms.
-    ///
-    /// The list, the query and the page are dropped: results from one platform are
-    /// not results from the other, and the account-only tabs make no sense on
-    /// YouTube, so a switch lands on search.
-    pub(crate) fn set_source(&mut self, source: crate::api::models::Source) {
-        if self.source == source {
-            return;
-        }
-        self.source = source;
-        self.update_config(|config| config.source = source);
-        self.tab = Tab::Search;
-        self.results.clear();
-        self.search_page = 1;
-        self.search_has_more = false;
-        self.loading_more = false;
-        self.searching = false;
-        self.notify(match source {
-            crate::api::models::Source::Bilibili => "已切换到 B 站".to_owned(),
-            crate::api::models::Source::Youtube => "已切换到 YouTube".to_owned(),
-        });
     }
 
     /// Global shortcuts: `空格` play/pause, `←`/`→` ±5s, `⌘K` focus search,
@@ -1018,40 +1461,70 @@ impl eframe::App for App {
             self.style_key = style_key;
         }
 
-        // Panels are applied outermost-first: the first bottom panel added sits
-        // at the very bottom of the window.
+        self.ui_shell(ui);
+        self.ui_overlays(&ctx);
+
+        // Keeps the progress bar, equalizer and lyric highlight moving while
+        // the app is otherwise idle.
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+impl App {
+    /// Draws the console: the four fixed parts and the page between them.
+    ///
+    /// `eframe::App::ui` is a thin wrapper over this, so a renderer with no
+    /// eframe window — the headless snapshot example — draws exactly what the app
+    /// draws rather than a copy of it.
+    ///
+    /// Panels are applied outermost-first — the first bottom panel added sits at
+    /// the very bottom — so the deck is declared before the two side columns,
+    /// which is what makes it span the full width underneath them.
+    pub fn ui_shell(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top_bar")
             .exact_size(crate::ui::theme::TOP_BAR_H)
+            .resizable(false)
             .frame(crate::ui::frames::top_bar())
             .show(ui, |ui| self.ui_top_bar(ui));
-        egui::Panel::bottom("status_bar")
-            .exact_size(crate::ui::theme::STATUS_BAR_H)
-            .frame(crate::ui::frames::status_bar())
-            .show(ui, |ui| self.ui_status_bar(ui));
-        egui::Panel::bottom("player_bar")
-            .frame(crate::ui::frames::player_bar(&self.theme))
+        egui::Panel::bottom("deck")
+            .exact_size(crate::ui::theme::DECK_H)
+            .resizable(false)
+            .frame(crate::ui::frames::deck(&self.theme))
             .show(ui, |ui| self.ui_player_bar(ui));
-        egui::Panel::right("lyrics_panel")
-            .resizable(true)
-            .default_size(388.0)
-            .min_size(260.0)
-            .max_size(620.0)
-            .frame(crate::ui::frames::lyrics(&self.theme))
+        egui::Panel::left("library_nav")
+            .exact_size(crate::ui::theme::RAIL_W)
+            .resizable(false)
+            .frame(crate::ui::frames::library_nav())
+            .show(ui, |ui| self.ui_library_nav(ui));
+        egui::Panel::right("now_playing")
+            .exact_size(crate::ui::theme::NOW_W)
+            .resizable(false)
+            .frame(crate::ui::frames::now_playing())
             .show(ui, |ui| self.ui_lyrics_panel(ui));
         egui::CentralPanel::default()
             .frame(crate::ui::frames::list_pane())
             .show(ui, |ui| self.ui_central(ui));
 
+        // The toast used to be drawn by the status strip. It is an `Area`, so it
+        // only needs a call from somewhere that runs every frame.
+        self.ui_toast(ui);
+    }
+
+    /// Draws what floats above the console: the login dialog, 来源详情 and the
+    /// settings sheet.
+    pub fn ui_overlays(&mut self, ctx: &egui::Context) {
         if self.qr.is_some() {
-            self.ui_login_dialog(&ctx);
+            self.ui_login_dialog(ctx);
+        }
+        if self.source_open {
+            self.ui_source_sheet(ctx);
+        }
+        if self.connect.open {
+            self.ui_connect_sheet(ctx);
         }
         if self.settings_open {
-            self.ui_settings_sheet(&ctx);
+            self.ui_settings_sheet(ctx);
         }
-
-        // Keeps the progress bar, equalizer and lyric highlight moving while
-        // the app is otherwise idle.
-        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
@@ -1064,12 +1537,218 @@ mod tests {
     use crate::net::Evt;
 
     fn an_app() -> (App, egui::Context) {
+        crate::platform::serialise_home_tests();
         std::env::set_var("HOME", "/tmp/listenbli-paging-tests");
         let _ = std::fs::create_dir_all("/tmp/listenbli-paging-tests");
         (
             App::new_for_tests(Config::default()),
             egui::Context::default(),
         )
+    }
+
+    /// An app with an *empty* library, whatever happens to be on disk.
+    ///
+    /// `HOME` is process-global and the tests set it in parallel, so a test that
+    /// needs a known library has to say so rather than trusting the file the app
+    /// happened to load.
+    fn an_app_with_a_clean_library() -> (App, egui::Context) {
+        let (mut app, ctx) = an_app();
+        app.library = LocalLibrary::default();
+        (app, ctx)
+    }
+
+    fn a_track(bvid: &str, source: Source, title: &str) -> Track {
+        Track {
+            bvid: bvid.to_owned(),
+            source,
+            aid: 1,
+            cid: 2,
+            title: title.to_owned(),
+            author: "杰威尔音乐".to_owned(),
+            duration: 269,
+            cover: None,
+            album: Some("叶惠美".to_owned()),
+            artist: Some("周杰伦".to_owned()),
+        }
+    }
+
+    /// 来源与同步's switches have to do something: off means the app stops asking
+    /// that platform for its collections, and only that.
+    #[test]
+    fn a_source_switch_stops_the_reading_and_nothing_else() {
+        let (mut app, _ctx) = an_app_with_a_clean_library();
+        let bili = a_track("BV1switch", Source::Bilibili, "晴天");
+        app.library.add(bili.clone());
+        let key = LocalLibrary::key_of(&bili);
+
+        // No account, so there is nothing to sync from either platform.
+        assert!(!app.syncs(Source::Bilibili));
+        app.user = Some(crate::api::models::UserInfo {
+            mid: 42,
+            uname: "start_hu".to_owned(),
+            face: String::new(),
+            vip_status: 0,
+        });
+        assert!(
+            app.syncs(Source::Bilibili),
+            "an account and the switch means read"
+        );
+
+        app.set_source_synced(Source::Bilibili, false);
+        assert!(!app.syncs(Source::Bilibili), "the switch alone stops it");
+        assert!(
+            app.refresh_library().is_empty(),
+            "and a sync asks nobody for anything"
+        );
+        assert!(
+            app.library.find(&key).is_some(),
+            "and takes nothing out of the library"
+        );
+        // It is a setting, not session state.
+        assert!(
+            crate::config::with(&app.config, |config| config
+                .sync_disabled
+                .iter()
+                .any(|id| id == "bilibili")),
+            "the switch is written to the config"
+        );
+        assert!(
+            Config::load()
+                .sync_disabled
+                .iter()
+                .any(|id| id == "bilibili"),
+            "and survives a restart"
+        );
+
+        // YouTube declares that it has no readable collections, so no switch could
+        // make it sync — which is why the page does not draw one for it.
+        assert!(!Source::Youtube.capabilities().read_favorites);
+        assert!(!app.syncs(Source::Youtube));
+
+        app.set_source_synced(Source::Bilibili, true);
+        assert!(app.syncs(Source::Bilibili), "and switching it back resumes");
+        assert_eq!(
+            app.refresh_library(),
+            vec![Source::Bilibili],
+            "with the switch back on, Bilibili is asked again"
+        );
+    }
+
+    /// Playback failure is reported as an event, so the test drives the same path
+    /// the worker does rather than calling the fallback directly.
+    fn a_failed_load(app: &mut App, ctx: &egui::Context, context: &str) {
+        app.handle_event(
+            ctx,
+            Evt::Error {
+                context: context.to_owned(),
+                message: "该视频没有可播放的音频流".to_owned(),
+            },
+        );
+    }
+
+    /// 已回退 is a promise: the song keeps playing on another platform's copy
+    /// instead of turning into an error, and the copy that failed is remembered
+    /// so nothing offers it again.
+    #[test]
+    fn a_dead_edition_hands_playback_to_another_platform() {
+        let (mut app, ctx) = an_app_with_a_clean_library();
+        let bili = a_track("BV1fallback", Source::Bilibili, "晴天");
+        let youtube = a_track("yt-fallback", Source::Youtube, "晴天");
+        app.library.add(bili.clone());
+        app.library.add(youtube.clone());
+        app.start_current(bili.clone());
+
+        a_failed_load(&mut app, &ctx, "播放失败");
+
+        assert!(
+            app.dead.contains(&bili.key()),
+            "the copy that failed is dead"
+        );
+        assert_eq!(
+            app.current.as_ref().map(|track| track.source),
+            Some(Source::Youtube),
+            "and the other platform's copy took over"
+        );
+        let status = app.status.as_ref().expect("the swap is reported");
+        assert!(
+            status.text.contains("自动改用"),
+            "unexpected status: {}",
+            status.text
+        );
+        assert!(!status.is_error, "a swap that worked is not an error");
+    }
+
+    /// With nothing else to try the failure is all there is to show — and the
+    /// song stays put rather than disappearing from the player.
+    #[test]
+    fn a_failure_with_no_other_edition_reports_itself() {
+        let (mut app, ctx) = an_app_with_a_clean_library();
+        let bili = a_track("BV1alone", Source::Bilibili, "晴天");
+        app.library.add(bili.clone());
+        app.start_current(bili.clone());
+
+        a_failed_load(&mut app, &ctx, "播放失败");
+
+        assert!(app.dead.contains(&bili.key()));
+        assert_eq!(
+            app.current.as_ref().map(|track| track.key()),
+            Some(bili.key())
+        );
+        let status = app.status.as_ref().expect("the failure is reported");
+        assert!(status.is_error, "nothing worked, so it is an error");
+        assert!(status.text.contains("播放失败"));
+    }
+
+    /// Two dead editions must not loop: each failure takes one out of the running,
+    /// and the third report is the error.
+    #[test]
+    fn a_chain_of_failures_ends() {
+        let (mut app, ctx) = an_app_with_a_clean_library();
+        let bili = a_track("BV1chain", Source::Bilibili, "晴天");
+        let youtube = a_track("yt-chain", Source::Youtube, "晴天");
+        app.library.add(bili.clone());
+        app.library.add(youtube.clone());
+        app.start_current(bili.clone());
+
+        a_failed_load(&mut app, &ctx, "播放失败");
+        assert_eq!(
+            app.current.as_ref().map(|track| track.source),
+            Some(Source::Youtube)
+        );
+
+        a_failed_load(&mut app, &ctx, "播放失败");
+        assert!(app.dead.contains(&youtube.key()));
+        let status = app.status.as_ref().expect("reported");
+        assert!(
+            status.is_error,
+            "with both editions dead there is nothing left"
+        );
+        assert_eq!(
+            app.dead.len(),
+            2,
+            "both copies are marked, so neither is offered again"
+        );
+    }
+
+    /// A cache download that fails says nothing about whether the video exists —
+    /// it is the network or the disk — so it must not mark an edition dead.
+    #[test]
+    fn a_failed_download_does_not_condemn_an_edition() {
+        let (mut app, ctx) = an_app_with_a_clean_library();
+        let bili = a_track("BV1cache", Source::Bilibili, "晴天");
+        app.library.add(bili.clone());
+        app.start_current(bili.clone());
+
+        a_failed_load(&mut app, &ctx, "下载音频失败：晴天");
+
+        assert!(
+            app.dead.is_empty(),
+            "a failed download is not evidence that a copy is gone"
+        );
+        assert_eq!(
+            app.current.as_ref().map(|track| track.key()),
+            Some(bili.key())
+        );
     }
 
     /// The point of the setting: the workers actually follow it, and a location
@@ -1137,6 +1816,8 @@ mod tests {
             author: "音乐无限".to_owned(),
             duration: 200,
             cover: None,
+            album: None,
+            artist: None,
         }
     }
 

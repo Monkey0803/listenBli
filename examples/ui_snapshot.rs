@@ -21,6 +21,8 @@ use listenbli::config::Config;
 use listenbli::platform;
 use listenbli::ui::theme;
 
+mod common;
+
 /// How many frames to let the UI settle before asking for the capture.
 const SETTLE_FRAMES: u32 = 30;
 
@@ -81,6 +83,8 @@ impl eframe::App for Snapshot {
 }
 
 fn main() -> eframe::Result<()> {
+    common::isolate_home();
+
     let mut args = std::env::args().skip(1);
     let output = PathBuf::from(args.next().unwrap_or_else(|| "listenbli.png".to_owned()));
     let width: f32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(1280.0);
@@ -101,8 +105,13 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx, font.as_deref());
+            let mut app = App::new_silent(config);
+            if std::env::var("LISTENBLI_SEED").is_ok() {
+                let page = std::env::var("LISTENBLI_OPEN").unwrap_or_default();
+                common::seed_library(&mut app, &page);
+            }
             Ok(Box::new(Snapshot {
-                app: App::new(config),
+                app,
                 output,
                 frame: 0,
                 requested: false,

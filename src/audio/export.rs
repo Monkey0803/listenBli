@@ -1167,6 +1167,8 @@ mod tests {
             author: "Rick Astley".to_owned(),
             duration: 213,
             cover: Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".to_owned()),
+            album: None,
+            artist: None,
         };
         let tags = TrackTags::from_track(&track);
         assert_eq!(tags.title, "Never Gonna Give You Up");

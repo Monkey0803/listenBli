@@ -185,6 +185,8 @@ fn youtubes_own_captions_parse_into_timed_lines() {
         author: "Rick Astley".to_owned(),
         duration: 213,
         cover: None,
+        album: None,
+        artist: None,
     };
     let (lyrics, machine) =
         captions::fetch_for(&youtube, &track).expect("the provider should find a document");
@@ -218,6 +220,8 @@ fn lrclib_serves_a_track_from_either_platform() {
             author: "Rick Astley".to_owned(),
             duration: 213,
             cover: None,
+            album: None,
+            artist: None,
         };
         let lyrics = listenbli::lyrics::lrclib::fetch(&api, &track)
             .expect("the request should succeed")
@@ -384,6 +388,8 @@ fn a_youtube_track_downloads_into_the_cache_and_becomes_playable() {
         author: String::new(),
         duration: 0,
         cover: None,
+        album: None,
+        artist: None,
     };
     let start = Instant::now();
     worker
@@ -509,6 +515,8 @@ fn a_long_video_downloads_in_full() {
         author: String::new(),
         duration: 0,
         cover: None,
+        album: None,
+        artist: None,
     };
     worker
         .cmd_tx

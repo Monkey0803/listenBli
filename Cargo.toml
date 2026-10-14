@@ -51,6 +51,18 @@ url = "2"
 thiserror = "2"
 anyhow = "1"
 
+[target.'cfg(unix)'.dependencies]
+# One `localtime_r` call, to know which calendar day a date stamp is in. Already
+# in the tree through the audio stack, so this adds no build cost.
+libc = "0.2"
+
+[dev-dependencies]
+# Headless rendering for the snapshot tests: `examples/ui_snapshot` needs a real
+# window, which a locked screen or a CI box does not have. This renders the same
+# UI to a texture instead, so the per-page screenshots do not depend on the
+# display being awake.
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

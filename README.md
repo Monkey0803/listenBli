@@ -275,7 +275,7 @@ open dist/ListenBli.app
 ### 离线单元测试（默认，CI 运行）
 
 ```bash
-cargo test          # 260 个测试，不联网
+cargo test          # 262 个测试，不联网
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
@@ -335,6 +335,55 @@ cargo check --target x86_64-pc-windows-msvc --all-targets
 可在 macOS 上完成 Windows 目标的类型级校验。**运行时行为（出声、扫码、字体渲染）
 仍需在 Windows 上实测**，`.github/workflows/ci.yml` 已配置 macOS + Windows 矩阵。
 
+### 待办：Windows 的本地时区偏移（需在 Windows 上完成）
+
+`src/platform.rs::local_utc_offset()` 在 **unix 上已有实现**（`localtime_r` 的
+`tm_gmtoff`），Windows 分支目前**如实返回 `None`**，于是日期戳回退为 UTC。影响不是分组
+（`最近播放` 的今天/昨天两边同一条时间线，分组一直是对的），而是**显示的时刻**与
+**「加入」的日期**：UTC+8 机器上凌晨 1 点听的歌会显示 17:00。
+
+这条要在 Windows 上改，因为它的 API 是另一种形状，且必须在那边编译验证。
+
+1. 依赖（`windows-sys` 已在依赖树里是 0.52，别装成第三份）：
+
+   ```toml
+   [target.'cfg(windows)'.dependencies]
+   windows-sys = { version = "0.52", features = ["Win32_System_Time"] }
+   ```
+
+2. 把 `#[cfg(not(unix))]` 那个 `local_utc_offset` 换成 windows 版本。**建议用
+   `SystemTimeToTzSpecificLocalTime`**（把当前 UTC 瞬间转成本地瞬间，再求两者之差），
+   这样不必碰 `Bias` 的符号约定——`GetTimeZoneInformation` 的 `Bias` 是「UTC 以西的分钟
+   数」（美洲为正），把它当东经很容易反号：
+
+   ```rust
+   // 差值就是本地时区偏移，秒，东为正 —— 与 unix 分支同一约定。
+   // `#[cfg(windows)]`，返回 Some(offset)。
+   ```
+
+   若改用 `GetTimeZoneInformation`，取 `TIME_ZONE_ID_DAYLIGHT` 时加 `DaylightBias`、
+   `TIME_ZONE_ID_STANDARD` 时加 `StandardBias`，最后 **取负** 并乘以 60。
+
+3. 约定不要改：`local_utc_offset()` 返回**东为正的秒数**，`None` 表示不知道。日期算术在
+   `src/library/mod.rs`（`local_date_at` / `shift`，纪元处饱和），已经过测试。
+
+4. 在 Windows 上验证（把系统时区设成非 UTC，例如 UTC+8）：
+
+   ```bash
+   cargo fmt --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test                     # 期望 329 通过
+   cargo run --example ui_pages -- /tmp/pages   # 无头渲染，不需要显示器
+   ```
+
+   - `platform::tests::a_machine_offset_is_a_plausible_timezone`：改好后应走**非 None**
+     分支并通过（现在会提前 return）。
+   - `library::tests::a_stamp_uses_the_machine_clock_not_utc`：这是可证伪的回归测试——
+     **改之前它应该在非 UTC 机器上失败**（我用把它改回 UTC 的方式验证过），改好后通过。
+   - `library::tests::a_date_stamp_follows_the_machine_timezone`：钉住纯算术，
+     例如 `2024-02-29T16:00Z` 在 +8 是 `2024-03-01`。
+   - 目视：`ui_pages` 出的 `recent.png` 里时刻应是本地时间；凌晨听的那首要落在「今天」组。
+
 ## 项目结构
 
 ```
@@ -388,6 +437,10 @@ src/
   缓冲完成后（本机约 4 秒、6 MB 的歌曲）任意位置均可跳转。这是为避免 UI 线程
   在解码器定位时阻塞而做的取舍。
 - 缓存为整段保存而非分段稀疏下载，因此一首歌要么完整命中缓存，要么重新下载。
+- **Windows 上的日期戳按 UTC 记录**。`最近播放` 的分组不受影响（两侧时间线一致），但显示的
+  **时刻**和「加入」的**日期**会与本地时间差一个时区：UTC+8 机器上凌晨 1 点听的歌显示 17:00。
+  macOS/Linux 已修好，Windows 的接口是另一种形状、需在那边编译验证，所以现在如实回退 UTC
+  而不是给一个错的偏移；待办与验证步骤见上面「跨平台验证 → 待办：Windows 的本地时区偏移」。
 
 ## 免责声明
 

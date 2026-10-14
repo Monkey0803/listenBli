@@ -160,6 +160,8 @@ fn playurl_offers_a_decodable_aac_lc_stream() {
         author: String::new(),
         duration: 0,
         cover: None,
+        album: None,
+        artist: None,
     };
     video::resolve_track(&api, &mut track).expect("view lookup should succeed");
     assert_ne!(track.cid, 0, "cid must be resolved");
@@ -203,6 +205,8 @@ fn lyrics_fall_back_to_netease() {
         author: String::new(),
         duration: 0,
         cover: None,
+        album: None,
+        artist: None,
     };
     video::resolve_track(&api, &mut track).expect("view lookup should succeed");
 

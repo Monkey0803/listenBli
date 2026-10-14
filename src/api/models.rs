@@ -52,6 +52,22 @@ pub struct Track {
     pub duration: u64,
     #[serde(default)]
     pub cover: Option<String>,
+    /// The release this recording belongs to, when the source actually knows it.
+    ///
+    /// Bilibili and YouTube have no album concept at all: a video is an upload,
+    /// not a record, so this stays `None` for both. It is here because the
+    /// aggregator's design shows an album column and a NetEase-backed lookup can
+    /// fill it later without another schema change.
+    #[serde(default)]
+    pub album: Option<String>,
+    /// The real performer, only when the source actually named one.
+    ///
+    /// Bilibili and YouTube only expose the uploader/channel name, so this is
+    /// often `None`; [`Track::author`] keeps its old meaning (the UP owner or
+    /// channel) and must never be conflated with the performer. Identity
+    /// matching (`crate::library::identity`) treats the two very differently.
+    #[serde(default)]
+    pub artist: Option<String>,
 }
 
 impl Track {
@@ -135,6 +151,289 @@ impl AudioQuality {
             // cache file name and identifies the stream.
             AudioQuality::YtAac128 => 140,
             AudioQuality::YtAac48 => 139,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// capabilities
+// ---------------------------------------------------------------------------
+
+/// One capability, in the vocabulary both the declaration form and the source
+/// pages use.
+///
+/// The keys are what a declaration file stores, so they are stable; the labels
+/// and groups are what a person reads, and they are the design's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capability {
+    /// Stable key, written into a declaration.
+    pub key: &'static str,
+    /// What the interface calls it.
+    pub label: &'static str,
+    /// Which group the declaration form files it under.
+    pub group: &'static str,
+    /// What part of the interface it grows, shown beside the switch.
+    pub surface: &'static str,
+}
+
+/// Every capability the app knows how to declare.
+///
+/// The one list: [`Source::declarations`] reads it, the 接入来源 form offers it,
+/// and a declared source is described by the keys it chose from it.
+pub const CAPABILITIES: [Capability; 14] = [
+    Capability {
+        key: "search",
+        label: "关键词搜索",
+        group: "搜索与浏览",
+        surface: "搜索框与结果列表",
+    },
+    Capability {
+        key: "paging",
+        label: "分页翻页",
+        group: "搜索与浏览",
+        surface: "滚到底自动加载下一页",
+    },
+    Capability {
+        key: "browse",
+        label: "分区 / 榜单浏览",
+        group: "搜索与浏览",
+        surface: "分区与榜单页签",
+    },
+    Capability {
+        key: "stream",
+        label: "直链解析",
+        group: "播放与音质",
+        surface: "播放、队列与缓存",
+    },
+    Capability {
+        key: "quality",
+        label: "多档音质",
+        group: "播放与音质",
+        surface: "音质列与音质优先级",
+    },
+    Capability {
+        key: "lossless",
+        label: "无损音源",
+        group: "播放与音质",
+        surface: "无损徽章与优先开关",
+    },
+    Capability {
+        key: "cache",
+        label: "可完整缓存",
+        group: "播放与音质",
+        surface: "缓存与离线页",
+    },
+    Capability {
+        key: "captions",
+        label: "人工字幕 / CC",
+        group: "文本",
+        surface: "歌词面板出处（人工）",
+    },
+    Capability {
+        key: "asr",
+        label: "机器字幕",
+        group: "文本",
+        surface: "歌词面板出处（机器）",
+    },
+    Capability {
+        key: "lyrics",
+        label: "外部歌词匹配",
+        group: "文本",
+        surface: "网易云 / LRCLIB 回退",
+    },
+    Capability {
+        key: "anon",
+        label: "匿名可用",
+        group: "账号与库",
+        surface: "无账号也能用",
+    },
+    Capability {
+        key: "account",
+        label: "账号登录",
+        group: "账号与库",
+        surface: "会话条与登录流程",
+    },
+    Capability {
+        key: "favorites",
+        label: "收藏夹",
+        group: "账号与库",
+        surface: "收藏夹页签",
+    },
+    Capability {
+        key: "history",
+        label: "历史记录",
+        group: "账号与库",
+        surface: "历史页签",
+    },
+];
+
+/// The capability groups, in the order the declaration form shows them.
+pub const CAPABILITY_GROUPS: [&str; 4] = ["搜索与浏览", "播放与音质", "文本", "账号与库"];
+
+/// What one source can actually do.
+///
+/// The UI design's rule is "declare a capability and the interface grows that
+/// item"; this table is that declaration in code. It replaces the hard-coded
+/// "favourites and history only exist on Bilibili" branches with a fact a
+/// surface can read before it draws a tab that would otherwise be empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub search: bool,
+    /// The interface can offer a browse/ranking page for this source.
+    pub browse: bool,
+    /// Search results can be paged (`pn`/`page`), not just one load.
+    pub paging: bool,
+    /// A bare id/URL can be turned into a playable track.
+    pub resolve: bool,
+    /// The user picks between several bitrates.
+    pub quality_choices: bool,
+    /// Lossless audio is obtainable for an entitled account.
+    pub lossless: bool,
+    /// The uploader shipped human subtitles.
+    pub captions: bool,
+    /// The platform can produce machine speech-to-text lyrics.
+    pub asr: bool,
+    /// A third-party lyric provider (NetEase/LRCLIB) can back it.
+    pub external_lyrics: bool,
+    /// It works with no account at all.
+    pub anonymous: bool,
+    /// Signing in changes what is available.
+    pub account: bool,
+    /// A track can be cached whole, not only streamed.
+    pub cache: bool,
+    /// The user's own favourites can be read.
+    pub read_favorites: bool,
+    /// The platform's favourites are somebody else's data and are never written
+    /// back: a local playlist is the only writable thing. This is false for
+    /// *every* source, including Bilibili where reading is supported.
+    pub write_favorites: bool,
+    /// The user's watch/listen history can be read.
+    pub read_history: bool,
+}
+
+impl Capabilities {
+    /// Whether a capability is declared, by its stable key.
+    ///
+    /// The bridge between a declaration file (keys) and the flags the interface
+    /// reads: an unknown key is not a capability, so it reads as absent rather
+    /// than as a panic.
+    pub fn has(self, key: &str) -> bool {
+        match key {
+            "search" => self.search,
+            "paging" => self.paging,
+            "browse" => self.browse,
+            "stream" => self.resolve,
+            "quality" => self.quality_choices,
+            "lossless" => self.lossless,
+            "cache" => self.cache,
+            "captions" => self.captions,
+            "asr" => self.asr,
+            "lyrics" => self.external_lyrics,
+            "anon" => self.anonymous,
+            "account" => self.account,
+            "favorites" => self.read_favorites,
+            "write_favorites" => self.write_favorites,
+            "history" => self.read_history,
+            _ => false,
+        }
+    }
+}
+
+impl Source {
+    /// The capability declaration for this source.
+    ///
+    /// Filled from observed behaviour, not from hope: Bilibili can do all of the
+    /// above including favourites, history and lossless FLAC; YouTube offers
+    /// search, paging, resolve, quality choices, captions and ASR, but has no
+    /// lossless stream, no account model that changes playback, and no
+    /// favourites or history endpoint we can read.
+    /// Every source the app knows about.
+    ///
+    /// One list, so a new source cannot be added to the navigation and forgotten
+    /// by the counts.
+    pub const ALL: [Source; 2] = [Source::Bilibili, Source::Youtube];
+
+    /// The single letter the design badges a source with in a list.
+    pub fn channel(self) -> &'static str {
+        match self {
+            Source::Bilibili => "B",
+            Source::Youtube => "Y",
+        }
+    }
+
+    /// What a source is, in the words the 来源与同步 page uses.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Source::Bilibili => "收藏夹 · 观看历史 · 搜索",
+            Source::Youtube => "搜索 · 播放 · 字幕",
+        }
+    }
+
+    /// A stable id for config files and switches.
+    pub fn id(self) -> &'static str {
+        match self {
+            Source::Bilibili => "bilibili",
+            Source::Youtube => "youtube",
+        }
+    }
+
+    /// Whether this source's collections are synced by default.
+    /// What this source declares, as the interface lists it: a label and whether
+    /// the capability is there.
+    ///
+    /// Derived from [`CAPABILITIES`] rather than written out again, so the list
+    /// the declaration form offers and the list 来源与同步 shows cannot drift.
+    pub fn declarations(self) -> Vec<(&'static str, bool)> {
+        let caps = self.capabilities();
+        CAPABILITIES
+            .iter()
+            .map(|capability| (capability.label, caps.has(capability.key)))
+            .collect()
+    }
+
+    pub fn capabilities(self) -> Capabilities {
+        match self {
+            Source::Bilibili => Capabilities {
+                search: true,
+                // No browse/ranking page in the interface yet; saying otherwise
+                // would make the declaration lie about what the app shows.
+                browse: false,
+                paging: true,
+                resolve: true,
+                quality_choices: true,
+                lossless: true,
+                captions: true,
+                asr: true,
+                external_lyrics: true,
+                anonymous: true,
+                account: true,
+                read_favorites: true,
+                // Reading someone else's favourite folder is allowed; writing to
+                // it is not. The local library is the only writable collection.
+                write_favorites: false,
+                cache: true,
+                read_history: true,
+            },
+            Source::Youtube => Capabilities {
+                search: true,
+                // No browse/ranking page in the interface yet; saying otherwise
+                // would make the declaration lie about what the app shows.
+                browse: false,
+                paging: true,
+                resolve: true,
+                quality_choices: true,
+                lossless: false,
+                captions: true,
+                asr: true,
+                external_lyrics: true,
+                anonymous: true,
+                account: false,
+                read_favorites: false,
+                write_favorites: false,
+                read_history: false,
+                // Both platforms can be cached whole; only the collections differ.
+                cache: true,
+            },
         }
     }
 }
@@ -580,6 +879,8 @@ mod tests {
             author: "周杰伦".into(),
             duration: 269,
             cover: None,
+            album: None,
+            artist: None,
         }
     }
 
@@ -593,6 +894,8 @@ mod tests {
             author: "Rick Astley".into(),
             duration: 213,
             cover: None,
+            album: None,
+            artist: None,
         }
     }
 
@@ -643,5 +946,41 @@ mod tests {
         // The Bilibili ids are untouched by the new variants.
         assert_eq!(AudioQuality::K192.stream_id(), 30280);
         assert_eq!(AudioQuality::Flac.stream_id(), 0);
+    }
+
+    /// `album`/`artist` arrived with the aggregator data layer. A document
+    /// written before that (a cache, or a `Track` inside a saved config) has
+    /// neither key and must still deserialize.
+    #[test]
+    fn an_older_track_without_album_or_artist_still_loads() {
+        let text = r#"{"bvid":"BV1xx411c7mD","aid":1,"cid":2,"title":"t",
+                       "author":"a","duration":3,"cover":null}"#;
+        let track: Track = serde_json::from_str(text).expect("an older document");
+        assert_eq!(track.album, None);
+        assert_eq!(track.artist, None);
+        assert_eq!(track.author, "a", "author keeps meaning the uploader");
+    }
+
+    /// The declaration is the design's contract, so its two loudest claims are
+    /// pinned: Bilibili knows about favourites/history/lossless, YouTube does
+    /// not, and *neither* can write to a platform collection.
+    #[test]
+    fn capability_declarations_match_what_each_source_can_do() {
+        let bili = Source::Bilibili.capabilities();
+        assert!(bili.search && bili.paging && bili.resolve && bili.quality_choices);
+        assert!(bili.lossless && bili.captions && bili.asr && bili.external_lyrics);
+        assert!(bili.anonymous && bili.account);
+        assert!(bili.read_favorites && bili.read_history);
+
+        let yt = Source::Youtube.capabilities();
+        assert!(yt.search && yt.paging && yt.resolve && yt.quality_choices);
+        assert!(yt.captions && yt.asr && yt.external_lyrics && yt.anonymous);
+        assert!(!yt.lossless, "YouTube tops out at AAC 130K");
+        assert!(!yt.account && !yt.read_favorites && !yt.read_history);
+
+        // The design's central claim: a platform collection is somebody else's
+        // data, so reading may be declared but writing never is.
+        assert!(!bili.write_favorites, "Bilibili favourites are read-only");
+        assert!(!yt.write_favorites, "YouTube favourites are read-only");
     }
 }

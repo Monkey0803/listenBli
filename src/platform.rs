@@ -15,6 +15,36 @@ fn project_dirs() -> Option<ProjectDirs> {
 
 /// `~/Library/Application Support/listenBli` on macOS,
 /// `%APPDATA%\listenBli\config` on Windows.
+/// The machine's UTC offset in seconds east of UTC, when it can be asked.
+///
+/// `None` means the app does not know, and the date stamps fall back to UTC —
+/// which is what they did before this existed, and what Windows still gets: its
+/// API for this is a different shape and is not wired up yet, so it says so
+/// rather than returning a wrong number.
+#[cfg(unix)]
+pub fn local_utc_offset() -> Option<i64> {
+    // `tm_gmtoff` is seconds east of UTC, already resolved for daylight saving at
+    // this instant. `localtime_r` is the reentrant form, so one call at startup
+    // cannot race with anything.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` writes into `tm` and reads only `now`.
+    let filled = unsafe { libc::localtime_r(&now, &mut tm) };
+    if filled.is_null() {
+        return None;
+    }
+    Some(tm.tm_gmtoff as i64)
+}
+
+/// The machine's UTC offset in seconds east of UTC, when it can be asked.
+#[cfg(not(unix))]
+pub fn local_utc_offset() -> Option<i64> {
+    None
+}
+
 pub fn config_dir() -> PathBuf {
     match project_dirs() {
         Some(d) => d.config_dir().to_path_buf(),
@@ -95,6 +125,33 @@ pub fn export_dir() -> PathBuf {
     } else {
         home
     }
+}
+
+/// Keeps `HOME`-moving tests out of each other's way, for the life of the caller's
+/// thread.
+///
+/// `HOME` is process-global and the test harness runs each test on its own thread,
+/// so two tests that isolate their files to *different* directories still race on
+/// the variable itself — one sets it while the other is mid-save, and the file
+/// that comes out belongs to neither. The guard is kept in a thread local so it is
+/// held for exactly as long as the test runs, and the call sites need no changes.
+#[cfg(test)]
+pub(crate) fn serialise_home_tests() {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            // A poisoned lock means another test panicked while holding it. That
+            // is not a reason to stop serialising: take it and carry on.
+            *held = Some(LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        }
+    });
 }
 
 /// Total size of everything under `path`, in bytes.
@@ -470,8 +527,18 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    fs::write(path, contents)?;
-    restrict_permissions(path)?;
+    // Written beside the target and renamed over it, rather than truncated in
+    // place. `fs::write` leaves a window where the file is half written, and both
+    // the settings and the library are saved on paths that matter: a crash, a
+    // kill, or a second writer inside that window leaves a file the loader can
+    // only report as unreadable and replace with defaults — which for the library
+    // means losing it. A rename is atomic on both platforms.
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".tmp");
+    let temp = PathBuf::from(beside);
+    fs::write(&temp, contents)?;
+    restrict_permissions(&temp)?;
+    fs::rename(&temp, path)?;
     Ok(())
 }
 
@@ -615,8 +682,14 @@ mod tests {
         let chosen = PathBuf::from("/Volumes/Big/listenbli");
         assert_eq!(resolve_cache_dir(Some(&chosen)), chosen);
         // A cleared text field means "use the default", not "the cwd".
-        assert_eq!(resolve_cache_dir(Some(Path::new(""))), cache_dir());
-        assert_eq!(resolve_cache_dir(None), cache_dir());
+        // Compared to each other rather than to a second reading of the
+        // environment: `HOME` is process-global and the tests around this one
+        // move it to keep their own files apart, so two separate readings can
+        // legitimately differ mid-test.
+        assert_eq!(
+            resolve_cache_dir(Some(Path::new(""))),
+            resolve_cache_dir(None)
+        );
         assert!(resolve_cache_dir(None).is_absolute());
     }
 

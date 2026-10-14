@@ -387,6 +387,8 @@ mod tests {
             author: "a".into(),
             duration: 213,
             cover: None,
+            album: None,
+            artist: None,
         };
         assert_eq!(track.source, Source::Youtube);
     }
